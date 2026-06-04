@@ -110,8 +110,17 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     let mut compile_entries: Vec<CompileEntry> = Vec::with_capacity(modules.len() * 2);
 
     for m in &modules {
-        let (rewritten_path, object_path, cflags) =
-            compile_one_module(plan, &profile, &prelude_path, &crate_build_dir, m)?;
+        let fragment_path = plan
+            .plugin
+            .map(|_| layout.fragment_path(crate_name, &m.qualified_name));
+        let (rewritten_path, object_path, cflags) = compile_one_module(
+            plan,
+            &profile,
+            &prelude_path,
+            &crate_build_dir,
+            fragment_path.as_deref(),
+            m,
+        )?;
         objects.push(object_path);
 
         // Entry 1: the rewritten file (matches what we actually
@@ -161,6 +170,7 @@ fn compile_one_module(
     profile: &ResolvedProfile,
     prelude: &Path,
     crate_build_dir: &Path,
+    fragment_out: Option<&Path>,
     m: &Module,
 ) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     // Read + scan + rewrite. We always rewrite (even when the
@@ -180,6 +190,17 @@ fn compile_one_module(
 
     let object_path = crate_build_dir.join(format!("{}.o", m.qualified_name));
 
+    // Make sure the fragment-header destination dir exists before
+    // the plugin tries to atomic-rename into it. The plugin can
+    // create it too, but doing it driver-side keeps the per-TU
+    // critical path lean.
+    if let Some(frag) = fragment_out {
+        if let Some(parent) = frag.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating `{}`", parent.display()))?;
+        }
+    }
+
     // Honour `#include "x.h"` from the *original* source location —
     // the rewritten file lives in `target/`, so without -I clang
     // resolves relative includes against `target/` rather than the
@@ -192,6 +213,7 @@ fn compile_one_module(
         &rewritten_path,
         &object_path,
         Some(original_dir),
+        fragment_out,
     );
 
     let status = plan
@@ -221,7 +243,10 @@ fn compile_one_module(
 /// `Some`) becomes `-I<dir>` immediately before the prelude
 /// `-include` so per-module includes resolve against the original
 /// source layout even when we're compiling a rewritten copy from
-/// `target/`.
+/// `target/`. `fragment_out` (when `Some` and a plugin is also
+/// configured) becomes
+/// `-fplugin-arg-cust-fragment-out=<path>` so the plugin emits a
+/// per-module fragment header.
 pub fn build_cflags(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -229,6 +254,7 @@ pub fn build_cflags(
     source: &Path,
     object: &Path,
     extra_include: Option<&Path>,
+    fragment_out: Option<&Path>,
 ) -> Vec<String> {
     let mut flags: Vec<String> = Vec::new();
 
@@ -247,6 +273,9 @@ pub fn build_cflags(
     flags.push("-fvisibility=hidden".to_string());
     if let Some(plugin) = plan.plugin {
         flags.push(plugin.fplugin_flag());
+        if let Some(path) = fragment_out {
+            flags.push(format!("-fplugin-arg-cust-fragment-out={}", path.display()));
+        }
     }
     if let Some(dir) = extra_include {
         flags.push(format!("-I{}", dir.display()));

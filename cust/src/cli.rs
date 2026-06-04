@@ -178,6 +178,8 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
     };
     let dummy_obj = layout.profile_root.join("check.o");
     let source_dir = source.parent().unwrap_or(&crate_root);
+    // `cust check` skips fragment-header emission — we're only
+    // validating syntax, not committing to a build artifact.
     let mut flags = build::build_cflags(
         &plan,
         &profile,
@@ -185,6 +187,7 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
         &rewritten_path,
         &dummy_obj,
         Some(source_dir),
+        None,
     );
     // Strip the trailing `-c -o <obj> <src>` triple (4 args) and
     // re-add `-fsyntax-only <src>`.

@@ -1,5 +1,6 @@
-//! `target/` directory layout, pinned in `docs/design/cust-design.md`
-//! §17 ("`target/` layout in v0.1"):
+//! `target/` directory layout.
+//!
+//! v0.1 (pinned in `docs/design/v0.1.md`):
 //!
 //! ```text
 //! target/
@@ -7,9 +8,16 @@
 //! ├── compile_commands.json
 //! ├── debug/
 //! │   ├── prelude.h
-//! │   ├── build/<crate>/lib.o
+//! │   ├── build/<crate>/<qname>.preprocessed.c
+//! │   ├── build/<crate>/<qname>.o
 //! │   └── lib<name>.a
 //! └── release/  (same shape)
+//! ```
+//!
+//! v0.2 adds (`docs/design/v0.2.md`):
+//!
+//! ```text
+//! target/<profile>/.h-fragments/<crate>/<qname>.cust.h
 //! ```
 
 use std::{fs, path::PathBuf};
@@ -45,5 +53,16 @@ impl TargetLayout {
 
     pub fn prelude_path(&self) -> PathBuf {
         self.profile_root.join("prelude.h")
+    }
+
+    /// Root directory for fragment headers for `crate_name`.
+    pub fn fragments_dir(&self, crate_name: &str) -> PathBuf {
+        self.profile_root.join(".h-fragments").join(crate_name)
+    }
+
+    /// `target/<profile>/.h-fragments/<crate>/<qname>.cust.h`.
+    pub fn fragment_path(&self, crate_name: &str, qualified_name: &str) -> PathBuf {
+        self.fragments_dir(crate_name)
+            .join(format!("{qualified_name}.cust.h"))
     }
 }
