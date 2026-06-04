@@ -47,6 +47,11 @@ pub struct BuildPlan<'a> {
     /// code path still works for single-module / no-cross-import
     /// crates.
     pub plugin: Option<&'a Plugin>,
+    /// When `true`, every TU is compiled with `-fsyntax-only`
+    /// instead of producing an object, and no archive / version
+    /// stamp / `compile_commands.json` is written. This is what
+    /// `cust check` runs.
+    pub syntax_only: bool,
 }
 
 /// Outputs `cust build` writes. `objects` and `compile_commands`
@@ -99,7 +104,27 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     fs::create_dir_all(&crate_build_dir)
         .with_context(|| format!("creating `{}`", crate_build_dir.display()))?;
 
-    // Step 5: per-TU compile.
+    // Step 5a: surface-extraction pass. When the plugin is loaded
+    // and at least one module imports another, we need fragment
+    // headers to exist before the codegen pass — otherwise the
+    // importer would compile against missing forward declarations.
+    // Run clang with -fsyntax-only so the plugin emits fragments
+    // without paying for codegen; tolerate parse errors caused by
+    // unresolved cross-module references, since they're exactly
+    // what the codegen pass will fix.
+    let needs_surface_pass = plan.plugin.is_some() && modules.iter().any(|m| !m.imports.is_empty());
+    if needs_surface_pass {
+        surface_pass(
+            plan,
+            &profile,
+            &prelude_path,
+            &crate_build_dir,
+            &layout,
+            &modules,
+        )?;
+    }
+
+    // Step 5b: per-TU codegen.
     let mut objects: Vec<PathBuf> = Vec::with_capacity(modules.len());
     // Two entries per module: one for the rewritten file (what
     // clang actually compiled) and one paired entry pointing at
@@ -118,6 +143,7 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
             &profile,
             &prelude_path,
             &crate_build_dir,
+            &layout,
             fragment_path.as_deref(),
             m,
         )?;
@@ -147,16 +173,21 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     }
 
     // Step 6: archive.
+    // Step 6: archive. Skipped in syntax-only mode; the caller
+    // gets a stub `archive` path back so the BuildOutputs shape
+    // stays uniform.
     let archive_path = layout.profile_root.join(format!("lib{crate_name}.a"));
-    archive_objects(&objects, &archive_path)?;
-
-    // Step 7: compile_commands.json (always at `target/`, never per-
-    // profile — pinned by the v0.1 layout block).
     let cc_path = layout.target_root.join("compile_commands.json");
-    write_compile_commands(&cc_path, &compile_entries)?;
+    if !plan.syntax_only {
+        archive_objects(&objects, &archive_path)?;
 
-    // Step 8: stamp .cust-version.
-    write_version_stamp(&layout.target_root.join(".cust-version"), plan.clang)?;
+        // Step 7: compile_commands.json (always at `target/`, never
+        // per-profile — pinned by the v0.1 layout block).
+        write_compile_commands(&cc_path, &compile_entries)?;
+
+        // Step 8: stamp .cust-version.
+        write_version_stamp(&layout.target_root.join(".cust-version"), plan.clang)?;
+    }
 
     Ok(BuildOutputs {
         objects,
@@ -170,6 +201,7 @@ fn compile_one_module(
     profile: &ResolvedProfile,
     prelude: &Path,
     crate_build_dir: &Path,
+    layout: &TargetLayout,
     fragment_out: Option<&Path>,
     m: &Module,
 ) -> Result<(PathBuf, PathBuf, Vec<String>)> {
@@ -179,7 +211,20 @@ fn compile_one_module(
     let src_text = fs::read_to_string(&m.source_path)
         .with_context(|| format!("reading `{}`", m.source_path.display()))?;
     let scan = mod_scanner::scan(&src_text, &m.source_path)?;
-    let rewritten = mod_scanner::rewrite(&src_text, &m.source_path, &scan);
+
+    // For `#cust use crate::X;` directives, lower to an `#include`
+    // of X's fragment header so the compiler sees the imported
+    // module's [[cust::pub]] surface. The surface pass (when run)
+    // has already populated the fragments dir.
+    let crate_name = &plan.manifest.package.name;
+    let rewritten = mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| {
+        if let crate::mod_scanner::DirectiveKind::UseCrate { name } = &d.kind {
+            let frag = layout.fragment_path(crate_name, name);
+            Some(format!("#include \"{}\"", frag.display()))
+        } else {
+            None
+        }
+    });
 
     let rewritten_path = crate_build_dir.join(format!("{}.preprocessed.c", m.qualified_name));
     if let Some(parent) = rewritten_path.parent() {
@@ -206,7 +251,7 @@ fn compile_one_module(
     // resolves relative includes against `target/` rather than the
     // user's source layout.
     let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
-    let cflags = build_cflags(
+    let mut cflags = build_cflags(
         plan,
         profile,
         prelude,
@@ -215,6 +260,17 @@ fn compile_one_module(
         Some(original_dir),
         fragment_out,
     );
+
+    // In syntax-only mode (cust check), replace the trailing
+    // `-c -o <obj> <src>` (4 args, last entry of build_cflags)
+    // with `-fsyntax-only <src>` so clang validates without
+    // writing an object.
+    if plan.syntax_only {
+        let new_len = cflags.len().saturating_sub(4);
+        cflags.truncate(new_len);
+        cflags.push("-fsyntax-only".to_string());
+        cflags.push(rewritten_path.display().to_string());
+    }
 
     let status = plan
         .clang
@@ -237,6 +293,97 @@ fn compile_one_module(
     }
 
     Ok((rewritten_path, object_path, cflags))
+}
+
+/// Surface-extraction pass: compile every module with
+/// `-fsyntax-only` so the plugin can populate
+/// `target/<profile>/.h-fragments/<crate>/<qname>.cust.h` before
+/// the codegen pass needs to `#include` them. Tolerant of compile
+/// failures — cross-module references in this pass are *expected*
+/// to be unresolved (that's why we're emitting fragments in the
+/// first place); the codegen pass will fail loudly if any genuine
+/// errors remain.
+///
+/// We deliberately do NOT lower `#cust use crate::X;` to an
+/// `#include` here because the imported fragment may not exist
+/// yet. v0.2 caps at one surface pass; v0.4 may iterate to a
+/// fixed point per cust-design.md §4.
+fn surface_pass(
+    plan: &BuildPlan<'_>,
+    profile: &ResolvedProfile,
+    prelude: &Path,
+    crate_build_dir: &Path,
+    layout: &TargetLayout,
+    modules: &[Module],
+) -> Result<()> {
+    let crate_name = &plan.manifest.package.name;
+    for m in modules {
+        let src_text = fs::read_to_string(&m.source_path)
+            .with_context(|| format!("reading `{}`", m.source_path.display()))?;
+        let scan = mod_scanner::scan(&src_text, &m.source_path)?;
+        // Blank all directives — no fragment includes in surface
+        // pass.
+        let rewritten = mod_scanner::rewrite(&src_text, &m.source_path, &scan);
+
+        let surface_path = crate_build_dir.join(format!("{}.surface.c", m.qualified_name));
+        fs::write(&surface_path, &rewritten)
+            .with_context(|| format!("writing `{}`", surface_path.display()))?;
+
+        let fragment_path = layout.fragment_path(crate_name, &m.qualified_name);
+        if let Some(parent) = fragment_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating `{}`", parent.display()))?;
+        }
+
+        let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
+        // Build flags but adjust: -fsyntax-only instead of `-c -o`.
+        // Demote a couple of errors to warnings so unresolved
+        // cross-module references in this pass don't stop the
+        // plugin from running.
+        let dummy_obj = crate_build_dir.join(format!("{}.surface.o", m.qualified_name));
+        let mut cflags = build_cflags(
+            plan,
+            profile,
+            prelude,
+            &surface_path,
+            &dummy_obj,
+            Some(original_dir),
+            Some(&fragment_path),
+        );
+        // Strip trailing `-c -o <obj> <src>` (4 args), replace
+        // with `-fsyntax-only -Wno-error -Wno-implicit-function-declaration <src>`.
+        let new_len = cflags.len().saturating_sub(4);
+        cflags.truncate(new_len);
+        cflags.push("-fsyntax-only".to_string());
+        cflags.push("-Wno-error".to_string());
+        cflags.push("-Wno-implicit-function-declaration".to_string());
+        cflags.push(surface_path.display().to_string());
+
+        // Run clang. We intentionally DO NOT check the exit
+        // status: a non-zero exit here is the expected case for
+        // any module that imports from a sibling whose fragment
+        // doesn't exist yet. The plugin's HandleTranslationUnit
+        // runs regardless of recoverable parse errors, so the
+        // fragment gets written either way. We send stderr to
+        // /dev/null to avoid drowning the user in expected
+        // diagnostics; real errors will resurface in the codegen
+        // pass against the same source.
+        let _ = plan
+            .clang
+            .command()
+            .args(&cflags)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| {
+                format!(
+                    "invoking `{}` for surface pass on module `{}`",
+                    plan.clang.path.display(),
+                    m.qualified_name
+                )
+            })?;
+    }
+    Ok(())
 }
 
 /// Build the clang argv for a single TU. `extra_include` (when

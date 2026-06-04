@@ -4,10 +4,9 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::{
@@ -16,7 +15,6 @@ use crate::{
     manifest::Manifest,
     new::{self, CrateKind, NewPlan},
     profile::ProfileKind,
-    target_layout::TargetLayout,
 };
 
 /// `cust` — a Cargo-style build system for C (clang-only).
@@ -113,6 +111,7 @@ fn run_build(profile_kind: ProfileKind) -> Result<()> {
         profile_kind,
         clang: &clang,
         plugin: plugin.as_ref(),
+        syntax_only: false,
     };
     let outputs = build::run(&plan)?;
 
@@ -132,42 +131,13 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let (manifest, crate_root, workspace_root) = locate(&cwd)?;
     let clang = Clang::discover()?;
-
-    let profile_override = match profile_kind {
-        ProfileKind::Dev => manifest.profile.dev.as_ref(),
-        ProfileKind::Release => manifest.profile.release.as_ref(),
-    };
-    let profile = crate::profile::ResolvedProfile::resolve(profile_kind, profile_override)?;
-
-    let layout = TargetLayout::for_workspace(&workspace_root, profile_kind);
-    layout.ensure_dirs()?;
-    let prelude = layout.prelude_path();
-    // Materialise the prelude so `-include` resolves. (We call into
-    // the build module via the public `build_cflags` only; the
-    // materialise helper is private and duplicating it here would
-    // drift — instead we redo the same content-stable write inline.)
-    write_prelude(&prelude)?;
-
-    let source = manifest.lib_source(&crate_root);
-    if !source.is_file() {
-        bail!("library source `{}` not found", source.display());
-    }
-
-    // v0.2 `cust check` is still root-only — it does not walk
-    // `#cust mod` (full module-graph check waits for v0.5). But it
-    // does run the root source through the scanner+rewriter so
-    // `#cust mod` lines at the top level don't trip `-fsyntax-only`.
-    let src_text = std::fs::read_to_string(&source)
-        .with_context(|| format!("reading `{}`", source.display()))?;
-    let scan = crate::mod_scanner::scan(&src_text, &source)?;
-    let rewritten = crate::mod_scanner::rewrite(&src_text, &source, &scan);
-    let rewritten_path = layout.profile_root.join("check.preprocessed.c");
-    std::fs::write(&rewritten_path, &rewritten)
-        .with_context(|| format!("writing `{}`", rewritten_path.display()))?;
-
-    // Reuse `build_cflags` for parity with `cust build`, but drop
-    // `-c -o <obj>` and replace with `-fsyntax-only`.
     let plugin = crate::plugin::Plugin::discover();
+
+    // `cust check` delegates to the full build pipeline with
+    // `syntax_only: true`. clang gets `-fsyntax-only` for every
+    // TU; the archive, compile_commands.json, and .cust-version
+    // stamp are skipped. The surface pass + `#cust use crate::`
+    // lowering still run so cross-module imports validate.
     let plan = BuildPlan {
         manifest: &manifest,
         crate_root: &crate_root,
@@ -175,36 +145,9 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
         profile_kind,
         clang: &clang,
         plugin: plugin.as_ref(),
+        syntax_only: true,
     };
-    let dummy_obj = layout.profile_root.join("check.o");
-    let source_dir = source.parent().unwrap_or(&crate_root);
-    // `cust check` skips fragment-header emission — we're only
-    // validating syntax, not committing to a build artifact.
-    let mut flags = build::build_cflags(
-        &plan,
-        &profile,
-        &prelude,
-        &rewritten_path,
-        &dummy_obj,
-        Some(source_dir),
-        None,
-    );
-    // Strip the trailing `-c -o <obj> <src>` triple (4 args) and
-    // re-add `-fsyntax-only <src>`.
-    let new_len = flags.len().saturating_sub(4);
-    flags.truncate(new_len);
-    flags.push("-fsyntax-only".to_string());
-    flags.push(rewritten_path.display().to_string());
-
-    let status = clang
-        .command()
-        .args(&flags)
-        .stdin(Stdio::null())
-        .status()
-        .with_context(|| format!("invoking `{}`", clang.path.display()))?;
-    if !status.success() {
-        bail!("clang -fsyntax-only exited with status {status}");
-    }
+    build::run(&plan)?;
     println!("  Checked {}", manifest.package.name);
     Ok(())
 }
@@ -235,18 +178,5 @@ fn run_new(args: &NewArgs) -> Result<()> {
     };
     let out = new::run(&plan)?;
     println!("  Created library `{}` at {}", out.name, out.root.display());
-    Ok(())
-}
-
-fn write_prelude(dst: &Path) -> Result<()> {
-    const PRELUDE: &str = include_str!("prelude.h");
-    let needs_write = fs::read_to_string(dst).ok().is_none_or(|s| s != PRELUDE);
-    if needs_write {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating `{}`", parent.display()))?;
-        }
-        fs::write(dst, PRELUDE).with_context(|| format!("writing `{}`", dst.display()))?;
-    }
     Ok(())
 }

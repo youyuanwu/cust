@@ -17,13 +17,15 @@
 //! * For a folder-form module (`D/foo/mod.c`), the search
 //!   directory for its own children is `D/foo/`.
 //!
-//! `#cust use crate::<name>;` directives are recognised by the
-//! scanner but rejected at discovery time in v0.2 — cross-module
-//! imports require the fragment-header machinery, which lands with
-//! the plugin later in the milestone.
+//! `#cust use crate::<name>;` is recorded per module as a string
+//! import name. The build pipeline lowers it to an `#include` of
+//! the named module's fragment header (`<name>.cust.h`). v0.2
+//! restricts `crate::` paths to a single identifier — nested
+//! paths like `crate::parser::lexer` parse OK at the scanner
+//! level but are rejected at discovery time below.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -41,6 +43,10 @@ pub struct Module {
     pub qualified_name: String,
     /// Absolute, canonicalised path to the source `.c` file.
     pub source_path: PathBuf,
+    /// Crate-relative names this module imports via
+    /// `#cust use crate::<name>;`. Validated against the
+    /// rest of the graph by `discover`.
+    pub imports: Vec<String>,
 }
 
 /// Walk the module graph rooted at `root_source` (typically
@@ -76,6 +82,7 @@ pub fn discover(crate_root: &Path, root_source: &Path) -> Result<Vec<Module>> {
         // reverse onto the LIFO stack (preserving declaration
         // order in the output), then emit the current module.
         let mut children: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+        let mut imports: Vec<String> = Vec::new();
         for d in &scan.directives {
             match &d.kind {
                 DirectiveKind::Mod { name } => {
@@ -91,10 +98,7 @@ pub fn discover(crate_root: &Path, root_source: &Path) -> Result<Vec<Module>> {
                     children.push((child_qname, child_path, child_search_dir));
                 }
                 DirectiveKind::UseCrate { name } => {
-                    bail!(
-                        "`#cust use crate::{name};` in `{}`: cross-module imports require the cust plugin (lands later in v0.2)",
-                        path.display()
-                    );
+                    imports.push(name.clone());
                 }
             }
         }
@@ -102,11 +106,44 @@ pub fn discover(crate_root: &Path, root_source: &Path) -> Result<Vec<Module>> {
         out.push(Module {
             qualified_name: qname,
             source_path: path,
+            imports,
         });
 
         // Reverse so the first declared child is popped first.
         for c in children.into_iter().rev() {
             stack.push(c);
+        }
+    }
+
+    // Cross-module validation: every `#cust use crate::X;` name
+    // must match the *qualified* name of some other module in
+    // the crate. v0.2 only supports single-identifier imports;
+    // a name containing `.` would have come from a nested
+    // qualified name and is rejected with a clearer message.
+    let known: HashMap<&str, &Path> = out
+        .iter()
+        .map(|m| (m.qualified_name.as_str(), m.source_path.as_path()))
+        .collect();
+    for m in &out {
+        for imp in &m.imports {
+            if imp.contains('.') {
+                bail!(
+                    "`#cust use crate::{imp};` in `{}`: nested crate paths are not supported in v0.2",
+                    m.source_path.display()
+                );
+            }
+            if !known.contains_key(imp.as_str()) {
+                bail!(
+                    "`#cust use crate::{imp};` in `{}`: no module named `{imp}` in this crate",
+                    m.source_path.display()
+                );
+            }
+            if imp == &m.qualified_name {
+                bail!(
+                    "`#cust use crate::{imp};` in `{}`: a module cannot import itself",
+                    m.source_path.display()
+                );
+            }
         }
     }
 
@@ -235,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn use_crate_is_rejected_in_v0_2() {
+    fn use_crate_records_imports() {
         let tmp = tempfile::tempdir().unwrap();
         let crate_root = tmp.path();
         let root = write(
@@ -245,9 +282,33 @@ mod tests {
         );
         let _util = write(crate_root, "src/util.c", "int u = 1;\n");
 
+        let mods = discover(crate_root, &root).unwrap();
+        let lib = mods.iter().find(|m| m.qualified_name == "lib").unwrap();
+        assert_eq!(lib.imports, vec!["util".to_string()]);
+        let util = mods.iter().find(|m| m.qualified_name == "util").unwrap();
+        assert!(util.imports.is_empty());
+    }
+
+    #[test]
+    fn use_crate_with_unknown_module_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crate_root = tmp.path();
+        let root = write(crate_root, "src/lib.c", "#cust use crate::nope;\n");
+
         let e = format!("{:#}", discover(crate_root, &root).unwrap_err());
-        assert!(e.contains("#cust use crate::util"), "{e}");
-        assert!(e.contains("require the cust plugin"), "{e}");
+        assert!(e.contains("no module named `nope`"), "{e}");
+    }
+
+    #[test]
+    fn use_crate_self_import_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crate_root = tmp.path();
+        // Root module is named "lib" — self-import via crate::lib
+        // would otherwise resolve to itself.
+        let root = write(crate_root, "src/lib.c", "#cust use crate::lib;\n");
+
+        let e = format!("{:#}", discover(crate_root, &root).unwrap_err());
+        assert!(e.contains("cannot import itself"), "{e}");
     }
 
     #[test]

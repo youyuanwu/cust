@@ -593,19 +593,31 @@ fn parse_use(tokens: &[Token], file: &Path, line: u32, col: u32) -> Result<Direc
 /// replaced by an empty span, plus `#line N "file"` directives so
 /// clang diagnostics still point at the original source.
 ///
-/// In v0.2 this is the canonical lowering — the multi-module
-/// scheduler hands the rewritten bytes to clang via a `-include`-
-/// style force-include OR (more likely) via a temp file under
-/// `target/<profile>/build/<crate>/<mod>.preprocessed.c`. The
-/// scheduler decides; this helper just produces correct bytes.
-///
-/// Each directive's bytes are replaced with whitespace + a newline
-/// so columns and line counts stay aligned for the *non-directive*
-/// regions, and the emitted `#line N` directives reset clang's
-/// notion of position to the user's source for the post-directive
-/// region. This keeps clang diagnostics on user-written code
-/// pointing at line/column numbers in the original `src`.
+/// Convenience wrapper around `rewrite_with` for callers that
+/// want to blank every directive without substitution.
 pub fn rewrite(src: &str, file: &Path, result: &ScanResult) -> String {
+    rewrite_with(src, file, result, |_| None)
+}
+
+/// Same as `rewrite`, but the caller may supply a per-directive
+/// replacement: `map_fn(&Directive)` returning `Some(text)`
+/// substitutes `text` (verbatim — no trailing newline added) in
+/// place of the directive's bytes; returning `None` blanks the
+/// directive with whitespace as `rewrite` does.
+///
+/// Used by the build pipeline to lower `#cust use crate::foo;`
+/// into `#include "<fragment-of-foo>"` after a surface-extraction
+/// pass has emitted the matching fragment header.
+///
+/// `#line` re-anchoring runs unconditionally after each directive
+/// so user-code diagnostics keep pointing at the original source
+/// regardless of how the directive itself was lowered.
+pub fn rewrite_with(
+    src: &str,
+    file: &Path,
+    result: &ScanResult,
+    mut map_fn: impl FnMut(&Directive) -> Option<String>,
+) -> String {
     let mut out = String::with_capacity(src.len() + 64 * result.directives.len());
     let file_str = file.display().to_string();
     let mut cursor = 0;
@@ -619,14 +631,23 @@ pub fn rewrite(src: &str, file: &Path, result: &ScanResult) -> String {
         // Copy `[cursor .. d.span.byte_start)` verbatim.
         out.push_str(&src[cursor..d.span.byte_start]);
 
-        // Replace the directive with whitespace through to the
-        // terminating `;` (preserves byte count and intra-line
-        // column layout for anything that shares the line).
-        for byte in &src.as_bytes()[d.span.byte_start..d.span.byte_end] {
-            if *byte == b'\n' {
-                out.push('\n');
-            } else {
-                out.push(' ');
+        if let Some(replacement) = map_fn(d) {
+            // Substitute. We don't try to pad to the original
+            // byte width — `#line` directives re-anchor positions
+            // anyway. Padding shorter replacements with spaces
+            // would only matter for shared-line directives, and
+            // v0.2 directives are always on their own line.
+            out.push_str(&replacement);
+        } else {
+            // Blank: replace the directive bytes with spaces
+            // (preserving the trailing newline if any) so that
+            // anything sharing the line keeps its column layout.
+            for byte in &src.as_bytes()[d.span.byte_start..d.span.byte_end] {
+                if *byte == b'\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
             }
         }
 

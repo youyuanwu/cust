@@ -432,11 +432,41 @@ fn reports_missing_module_source() {
 }
 
 #[test]
-fn rejects_use_crate_in_v0_2() {
-    let (_tmp, dir) = stage("use_crate_not_supported");
+fn use_crate_compiles_cross_module_call() {
+    // `lib.c` calls a `cust_pub` function defined in `util.c`
+    // purely via `#cust use crate::util;` — no manual `extern`
+    // declarations. The build pipeline's surface pass + fragment-
+    // header `#include` lowering should make this work.
+    //
+    // Plugin-dependent: skip when not built.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("use_crate_works");
     let out = cust(&dir, ["build"]);
-    assert_failure_with(&out, "#cust use crate::util");
-    assert_failure_with(&out, "require the cust plugin");
+    assert_success(&out);
+
+    // Both `cust_pub` symbols must end up in the archive.
+    let archive = dir.join("target/debug/libuse_crate_works.a");
+    assert!(archive.is_file());
+    let nm = Command::new("nm")
+        .arg("--defined-only")
+        .arg(&archive)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn nm");
+    let syms = String::from_utf8_lossy(&nm.stdout);
+    for sym in ["use_crate_works_total", "use_crate_works_util_get"] {
+        assert!(syms.contains(sym), "archive missing `{sym}`:\n{syms}");
+    }
+}
+
+#[test]
+fn use_crate_unknown_name_is_error() {
+    let (_tmp, dir) = stage("use_crate_unknown");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "no module named `nope`");
 }
 
 #[test]
