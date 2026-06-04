@@ -65,4 +65,12 @@ impl TargetLayout {
         self.fragments_dir(crate_name)
             .join(format!("{qualified_name}.cust.h"))
     }
+
+    /// `target/<profile>/include/<crate>.h` — the user-facing
+    /// concatenated crate header (cust-design.md §5).
+    pub fn crate_header_path(&self, crate_name: &str) -> PathBuf {
+        self.profile_root
+            .join("include")
+            .join(format!("{crate_name}.h"))
+    }
 }

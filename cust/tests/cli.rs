@@ -470,6 +470,97 @@ fn use_crate_unknown_name_is_error() {
 }
 
 #[test]
+fn build_emits_concatenated_crate_header() {
+    // Plugin-dependent: the crate header is only meaningful when
+    // fragment headers exist.
+    let Some(_plugin) = plugin_path() else {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    };
+    let (_tmp, dir) = stage("use_crate_works");
+    assert_success(&cust(&dir, ["build"]));
+
+    let hdr = dir.join("target/debug/include/use_crate_works.h");
+    assert!(hdr.is_file(), "missing crate header at {}", hdr.display());
+
+    let body = fs::read_to_string(&hdr).unwrap();
+    // Standard include-guard + extern-C wrapper.
+    assert!(body.contains("#ifndef USE_CRATE_WORKS_H"), "{body}");
+    assert!(body.contains("#define USE_CRATE_WORKS_H"), "{body}");
+    assert!(body.contains("extern \"C\" {"), "{body}");
+    // Self-contained: pulls in stdint so consumers don't have
+    // to include <stdint.h> first.
+    assert!(body.contains("#include <stdint.h>"), "{body}");
+    // Both modules' public surfaces appear, each banner-tagged.
+    assert!(body.contains("/* --- module `lib` --- */"), "{body}");
+    assert!(body.contains("/* --- module `util` --- */"), "{body}");
+    assert!(
+        body.contains("int32_t use_crate_works_total(void);"),
+        "{body}"
+    );
+    assert!(
+        body.contains("int32_t use_crate_works_util_get(void);"),
+        "{body}"
+    );
+
+    // End-to-end: a non-cust consumer can #include the header,
+    // link the archive, and the resulting binary actually runs.
+    let consumer_src = dir.join("consumer.c");
+    fs::write(
+        &consumer_src,
+        b"#include \"target/debug/include/use_crate_works.h\"\n\
+          int main(void) { return use_crate_works_total() == 42 ? 0 : 1; }\n",
+    )
+    .unwrap();
+    let bin = dir.join("consumer");
+    let compile = Command::new("clang")
+        .args([
+            consumer_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            dir.join("target/debug/libuse_crate_works.a")
+                .to_str()
+                .unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn clang");
+    assert!(
+        compile.status.success(),
+        "consumer build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+    let run = Command::new(&bin)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn consumer");
+    assert!(run.status.success(), "consumer exited with {}", run.status);
+}
+
+#[test]
+fn build_without_plugin_skips_crate_header() {
+    // No plugin => no fragments => no concatenated header.
+    let (_tmp, dir) = stage("hello");
+    let out = Command::new(env!("CARGO_BIN_EXE_cust"))
+        .args(["build"])
+        .env("CUST_PLUGIN", "/definitely/does/not/exist")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn cust");
+    assert_success(&out);
+    let hdr = dir.join("target/debug/include/hello.h");
+    assert!(
+        !hdr.exists(),
+        "expected NO crate header without plugin, but found {}",
+        hdr.display()
+    );
+}
+
+#[test]
 fn check_passes_through_cust_mod_directives() {
     // `cust check` on a root that contains `#cust mod foo;` must
     // not blow up on the directive — the scanner-rewrite path

@@ -954,16 +954,16 @@ Roadmap bullets here are deliberately short:
   `staticlib`. `[[cust::pub]]` is a no-op preprocessor macro (no
   plugin yet). Full locked scope, shipped deltas, and verification
   notes in [v0.1.md](v0.1.md).
-* **v0.2 — module loader & plugin v0.** 🚧 **planning** — see
-  [v0.2.md](v0.2.md). Implement `#cust mod` / `#cust use crate::…`
-  as line-oriented driver pragmas, plus the driver pre-pass for
-  `[[cust::cfg]]` / `[[cust::feature]]` / `[[cust::pub_macro]]`
-  extraction (§9). Bring up the clang plugin minimum: surface-
-  extraction pass that emits per-module `.cust.h` fragments into
-  `target/.h-fragments/`. Two-phase pipeline (surface → codegen)
-  with fragment-header stamping and per-crate `target/` locking
-  (§4). Naive crate-header concatenation from the `[[cust::pub]]`
-  subset. (`cust new` shipped in v0.1.)
+* **v0.2 — module loader & plugin v0.** ✅ **shipped.** Per-module
+  scheduler walks `#cust mod` / `#cust use crate::…` (line-oriented
+  driver pragmas via `mod_scanner`). Plugin v0
+  (`libcust_plugin.so`) emits per-module `.cust.h` fragments into
+  `target/<profile>/.h-fragments/<crate>/`; the build pipeline
+  runs a surface pass then lowers each `#cust use crate::X;` to
+  `#include "<X.cust.h>"` for codegen. Per-crate concatenated
+  header at `target/<profile>/include/<crate>.h`. (`cust new`
+  shipped in v0.1.) Full shipped details, deferrals, and
+  verification in [v0.2.md](v0.2.md).
 * **v0.3 — dependency resolver & registry.** `cust add`, `Cust.lock`,
   source-only dep build, link in. Build-script hang-protection
   timeout (§12) ships here since scripts arrive with deps.
