@@ -11,6 +11,10 @@ mod build;
 mod clang;
 mod cli;
 mod manifest;
+// v0.2 module loader input layer; not yet wired into the build
+// pipeline. The wiring lands in the same release.
+#[allow(dead_code)]
+mod mod_scanner;
 mod new;
 mod profile;
 mod target_layout;
