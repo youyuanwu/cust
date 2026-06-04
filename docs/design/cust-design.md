@@ -945,257 +945,60 @@ Unclassified questions are tracked but not yet triaged.
 ---
 
 ## 17. MVP roadmap
-* **v0.1 — driver skeleton.** Single‑file library crate (`src/lib.c`
-  only, no modules, no deps), system clang, write `staticlib`. No
-  plugin yet; `[[cust::pub]]` is a no‑op preprocessor macro. Detailed
-  v0.1 scope locked in below.
-* **v0.2 — module loader & plugin v0.** Implement `#cust mod` /
-  `#cust use crate::…` as line‑oriented driver pragmas, plus the
-  driver pre‑pass for `[[cust::cfg]]` / `[[cust::feature]]` /
-  `[[cust::pub_macro]]` extraction (§9). Bring up the clang plugin
-  minimum: surface‑extraction pass that emits per‑module `.cust.h`
-  fragments into `target/.h-fragments/`. Two‑phase pipeline (surface
-  → codegen) with fragment‑header stamping and per‑crate `target/`
-  locking (§4). Naive crate‑header concatenation from the
-  `[[cust::pub]]` subset. `cust new` lands here too.
+
+Per-version detail lives in companion docs as it gets written.
+Roadmap bullets here are deliberately short:
+
+* **v0.1 — driver skeleton.** ✅ **shipped.** Single-file library
+  crate (`src/lib.c` only, no modules, no deps), system clang, write
+  `staticlib`. `[[cust::pub]]` is a no-op preprocessor macro (no
+  plugin yet). Full locked scope, shipped deltas, and verification
+  notes in [v0.1.md](v0.1.md).
+* **v0.2 — module loader & plugin v0.** 🚧 **planning** — see
+  [v0.2.md](v0.2.md). Implement `#cust mod` / `#cust use crate::…`
+  as line-oriented driver pragmas, plus the driver pre-pass for
+  `[[cust::cfg]]` / `[[cust::feature]]` / `[[cust::pub_macro]]`
+  extraction (§9). Bring up the clang plugin minimum: surface-
+  extraction pass that emits per-module `.cust.h` fragments into
+  `target/.h-fragments/`. Two-phase pipeline (surface → codegen)
+  with fragment-header stamping and per-crate `target/` locking
+  (§4). Naive crate-header concatenation from the `[[cust::pub]]`
+  subset. (`cust new` shipped in v0.1.)
 * **v0.3 — dependency resolver & registry.** `cust add`, `Cust.lock`,
-  source‑only dep build, link in. Build‑script hang‑protection
+  source-only dep build, link in. Build-script hang-protection
   timeout (§12) ships here since scripts arrive with deps.
-* **v0.4 — plugin v1.** Full AST‑based fragment header synthesis
-  (opaque structs by default, `[[cust::pub(repr)]]` opt‑in), circular
-  dep fixed‑point loop with operational convergence criterion (§4),
-  `[[cust::test]]` collection via ctor‑based registration (§10),
-  fork‑based test process isolation (§11).
+* **v0.4 — plugin v1.** Full AST-based fragment header synthesis
+  (opaque structs by default, `[[cust::pub(repr)]]` opt-in), circular
+  dep fixed-point loop with operational convergence criterion (§4),
+  `[[cust::test]]` collection via ctor-based registration (§10),
+  fork-based test process isolation (§11).
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
 * **v0.6 — ThinLTO across the dep graph, bitcode rlib format with
   `metadata.json` including `rlib_format_version` and `llvm_version`
-  (§7). Toolchain‑swap rlib invalidation.**
+  (§7). Toolchain-swap rlib invalidation.**
 * **v0.7 — `[[cust::derive]]`, `[[cust::must_use]]`, `[[cust::no_panic]]`
-  (per‑TU heuristic) plugin checks; clang‑tidy integration.**
-* **v0.8 — workspaces, `build.cust.c`, generated‑source splicing.**
+  (per-TU heuristic) plugin checks; clang-tidy integration.**
+* **v0.8 — workspaces, `build.cust.c`, generated-source splicing.**
 * **v0.9 — `cust export cmake --consumable` and `--standalone`; also
   `cust export ninja` for our own use.**
-* **v0.10 — close the v1‑blocking open questions (§16 OQ‑3, OQ‑4,
-  OQ‑7, OQ‑8, OQ‑12): allocator policy, panic mode commitments,
+* **v0.10 — close the v1-blocking open questions (§16 OQ-3, OQ-4,
+  OQ-7, OQ-8, OQ-12): allocator policy, panic mode commitments,
   editions semantics, freestanding prelude split, contract
   versioning policy. Each lands as a `docs/spec/<name>.md` doc.**
 * **v1.0 — docs (`cust doc` via libclang), stable plugin ABI, registry
   hosting story.**
-
-### v0.1 implementation scope (locked)
-
-Decisions for the first release. Anything not listed here is **out of
-scope for v0.1**.
-
-#### Toolchain
-
-* **Compiler: system clang.** No vendoring, no `~/.cust/toolchain/`.
-  Discovery order: `$CC` env var → `clang` on `PATH`.
-* **Minimum clang version: 17.0** (released 2023; ships in Debian 13,
-  Ubuntu 24.04, macOS Xcode 15+, current Windows clang releases).
-  Refuse to run if older. Rationale: stable `-fplugin=` (since 13),
-  C23 attribute syntax `[[name]]`, `[[clang::annotate]]`, `_BitInt`,
-  and `#embed` are all present from 17. Dev machines used during v0.x
-  development run clang 21 in practice.
-* **No LLVM version pinning in v0.1.** The driver records the detected
-  `clang --version` in `target/.cust-version` for diagnostic purposes
-  only; bitcode‑compatibility enforcement (§7) arrives with the rlib
-  format in v0.6.
-* **Rust MSRV:** **1.96.0**, pinned via `rust-toolchain.toml` at the
-  repo root. Rustup picks up the pin automatically on any `cargo`
-  invocation; CI uses the same file. Bumping the MSRV is a deliberate
-  PR, not drift — update both `rust-toolchain.toml` and the workspace
-  `rust-version` field.
-
-#### Repository structure
-
-* **Cargo workspace from day 1.** Root `Cargo.toml` is a virtual
-  workspace; `cust/` is the only member in v0.1. New members
-  (`plugin/` in v0.2, `prelude-runtime/` when the C‑side prelude grows
-  beyond a single header, etc.) join the same workspace as they land,
-  with no top‑level Cargo.toml move. This is cheap insurance against
-  the "one‑crate-grew-into-three" refactor pain Cargo projects often
-  hit around the v0.2 mark.
-* Workspace inherits `version`, `edition`, `rust-version`, `license`,
-  `repository`, `authors`, and a baseline lint profile (`clippy`
-  pedantic + nursery, `unsafe_code = deny`); members reference them
-  via `<field>.workspace = true`. Means new crates start consistent
-  without per‑crate boilerplate.
-* `target/` lives at the workspace root (cargo default); the design's
-  `target/.cust-version` lives there too, distinct from `cust`'s own
-  `target/` cache when `cust` is bootstrapping itself in v3+.
-
-#### CLI surface
-
-v0.1 ships exactly five entry points. Anything else is a `cust: 'X'
-is not a known subcommand` error pointing at the v0.1 scope:
-
-* `cust build` — the build pipeline below. Default profile `dev`;
-  `--release` selects `release`. No other flags.
-* `cust check` — `clang -fsyntax-only` over the crate root.
-* `cust clean` — `rm -rf target/`.
-* `cust --version`
-* `cust --help` / `cust <cmd> --help`
-
-`cust new`, `cust add`, `cust run`, `cust test`, `cust fmt`,
-`cust clippy`, `cust doc`, `cust publish`, `cust export` all land in
-later milestones (see the deferred table below).
-
-#### Manifest discovery
-
-The driver walks **up from the current working directory** looking
-for `Cust.toml`, stopping at the filesystem root. Same algorithm as
-cargo. If multiple are encountered (workspace + member), v0.1 picks
-the nearest — workspaces aren't supported until v0.8 so the
-distinction doesn't matter yet.
-
-#### What `cust build` actually does in v0.1
-
-Given a crate of shape `Cust.toml` + `src/lib.c`:
-
-1. Parse `Cust.toml`. Strict mode — unknown fields are errors.
-2. Resolve the active profile (default `dev`; `--release` → `release`).
-3. Materialise the prelude to `target/<profile>/prelude.h` (see
-   “Prelude in v0.1” below).
-4. Invoke system clang with the profile's flags plus `-c
-   -fvisibility=hidden -include <prelude.h>` to produce one `.o`.
-5. Invoke `llvm-ar` (or `ar` if `llvm-ar` is absent) to wrap the `.o`
-   into `target/<profile>/lib<name>.a`.
-6. Emit `target/compile_commands.json` so clangd works.
-7. Stamp `target/.cust-version` with the cust version and detected
-   `clang --version` line for diagnostics.
-
-That's the whole build. No `#cust mod`, no plugin, no fragment
-headers, no rlib, no ThinLTO, no deps, no workspaces.
-
-#### `target/` layout in v0.1
-
-Locked now so v0.2 (modules) extends rather than replaces:
-
-```
-target/
-├── .cust-version              # "cust 0.1.0\nclang 21.1.8\n"
-├── compile_commands.json      # always at target/, never per-profile
-├── debug/                     # profile = dev
-│   ├── prelude.h              # materialised from embedded bytes
-│   ├── build/<crate>/lib.o    # per-TU object output
-│   └── lib<name>.a            # final staticlib
-└── release/                   # profile = release, same shape
-```
-
-v0.2 adds `<profile>/.h-fragments/<crate>/` and
-`<profile>/include/<crate>.h` alongside this layout. v0.6 adds
-`<profile>/deps/`. No v0.1 path is repurposed later.
-
-#### Manifest in v0.1
-
-Only `[package]` with `name` and `version` is required. The full
-schema documented in §3 is *accepted by the parser* (unknown sections
-are an error, but known sections may be empty or absent); fields the
-driver doesn't yet use are ignored with no warning. Specifically:
-
-* `[features]`, `[dependencies]`, `[build-dependencies]`,
-  `[dev-dependencies]`, `[workspace]` — must be absent or empty.
-  Setting them produces a clear `not yet supported in v0.1` error.
-* `[profile.dev]` / `[profile.release]` — only `opt-level`, `debug`,
-  `sanitize`, and `extra-cflags` are honoured; the rest parse and are
-  ignored. Mapping to clang flags:
-
-  | Field | Value | Becomes |
-  |---|---|---|
-  | `opt-level` | `0` / `1` / `2` / `3` / `"s"` / `"z"` | `-O0` / `-O1` / `-O2` / `-O3` / `-Os` / `-Oz` |
-  | `debug` | `"none"` | (nothing) |
-  | `debug` | `"line-tables-only"` | `-gline-tables-only` |
-  | `debug` | `"full"` (default `dev`) | `-g3 -gdwarf-5` |
-  | `sanitize` | `["address", "undefined", …]` | `-fsanitize=address,undefined,…` |
-  | `extra-cflags` | `["-Wall", …]` | appended verbatim after the above |
-
-  Profile defaults v0.1 bakes in: `dev` = `opt-level=0, debug="full",
-  sanitize=[]`; `release` = `opt-level=3, debug="line-tables-only",
-  sanitize=[]`. Users may override either profile in `Cust.toml`.
-* `edition` — accepted as a free‑form string; v0.1 does not validate or
-  act on it. Locked here so that adding edition semantics later (§16
-  OQ‑7) cannot retroactively reject existing manifests.
-* `[clang] std` — honoured (becomes `-std=`). Default: `c23` if clang
-  supports it, else `c17`.
-* `[plugin]` — absent (the plugin doesn't ship until v0.2).
-
-#### Prelude in v0.1
-
-Minimal prelude header (~30 lines), `-include`d into every TU. The
-bytes are **embedded into the cust binary** at compile time via
-`include_str!()` and materialised to `target/<profile>/prelude.h` on
-first build of each profile. No installer, no `~/.cust/` setup, no
-user‑visible files outside `target/`.
-
-```c
-#define cust_pub               __attribute__((visibility("default")))
-#define cust_pub_crate         /* nothing in v0.1 */
-#define cust_must_use          __attribute__((warn_unused_result))
-#define cust_deprecated(msg)   __attribute__((deprecated(msg)))
-/* … the rest are no‑ops until the plugin lands in v0.2 … */
-```
-
-Users can write either `[[cust::pub]]` or `cust_pub` in v0.1; the
-C23 attribute is accepted by clang and silently dropped at the AST
-level (no plugin enforces it). The macro spelling is the form that
-actually does something in v0.1.
-
-#### `cust check`
-
-Runs `clang -fsyntax-only` on the crate root. Single command, no
-plugin invocation, no caching beyond clang's own.
-
-#### Diagnostics
-
-Human‑readable, rustc‑style colored output (`-fcolor-diagnostics`
-when the terminal supports it). SARIF / JSON formats deferred to a
-later milestone when an IDE actually needs them.
-
-#### Platforms
-
-* **Linux only in v0.1.** macOS lands in v0.2 alongside the module
-  loader (fork‑based plumbing works there unchanged). Windows is
-  deferred to v0.5 at the earliest — the build‑script timeout (§12)
-  and per‑test process isolation (§11) need separate
-  `CreateProcess`/`Job object` paths.
-* CI matrix in v0.1: one Linux distro (Ubuntu LTS), one clang version
-  (the minimum). Add coverage in lockstep with the platform list.
-
-#### License & legal
-
-* `MIT OR Apache-2.0` for the cust source tree (matches Rust
-  convention; lets us vendor Cargo crates without license friction).
-* No telemetry, ever. Stated explicitly so reversing it later is a
-  documented breaking change rather than a quiet drift.
-
-#### Explicitly deferred from v0.1
-
-| Item | Lands in | Notes |
-|---|---|---|
-| `cust new` (project scaffold) | v0.2 | Hand‑written `Cust.toml` is fine for the v0.1 smoke test. |
-| `cust add` | v0.3 | No registry yet. |
-| `cust run` / `cust test` | v0.4 | Needs the plugin for `[[cust::test]]` collection. |
-| Driver pre‑pass (`#cust mod`, `[[cust::cfg]]`) | v0.2 | Choice between "sloppy line scanner" and "real preprocessor" deferred to v0.2 design. |
-| Multi‑module `-jN` scheduler | v0.4 | v0.1 builds exactly one TU. |
-| Config file (`~/.cust/config.toml`) | v0.3 | First need is registry auth. |
-| Workspace member discovery | v0.8 | Already on the roadmap. |
-| Plugin (`libcust_plugin.so`) | v0.2 | v0.1 has no need; the prelude macro covers `[[cust::pub]]`'s visibility job. |
-| Fragment headers + `.cust.h` files | v0.2 | Single‑TU crate doesn't need them. |
-| Rlib bitcode tarball + `metadata.json` | v0.6 | v0.1 emits `.a` directly via `llvm-ar`. |
-| ThinLTO across crates | v0.6 | One crate, nothing to thin‑LTO across. |
-| `cust export cmake` | v0.9 | Already on the roadmap. |
 
 ---
 
 ## 18. Risks
 
 * **Clang plugin ABI is unstable** between major LLVM versions. v0.1
-  side‑steps this by using system clang and no plugin (§17 v0.1 lock).
-  Once the plugin lands in v0.2, the pinned‑clang question reopens; if
-  ABI churn proves painful in v0.4–v0.7 we revisit vendoring (`rustup`
-  pattern, separate SECURITY‑PATCH‑POLICY doc). Until then, the
-  minimum clang version (currently 17) is the contract.
+  side‑steps this by using system clang and no plugin (see
+  [v0.1.md](v0.1.md)). Once the plugin lands in v0.2, the
+  pinned‑clang question reopens; if ABI churn proves painful in
+  v0.4–v0.7 we revisit vendoring (`rustup` pattern, separate
+  SECURITY‑PATCH‑POLICY doc). Until then, the minimum clang version
+  (currently 17) is the contract.
 * **Macros vs attributes** — clang attributes can't always attach where
   C programmers expect (e.g., before a `typedef struct { … } X;`
   declaration). The prelude has to provide both attribute and macro
