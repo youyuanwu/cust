@@ -181,12 +181,16 @@ fn compile_commands_json_carries_expected_flags() {
     for needle in [
         "\"-fvisibility=hidden\"",
         "\"-include\"",
-        "\"prelude.h\"".trim_matches('"'), // substring is enough
+        "prelude.h",
         "\"-O0\"",
         "\"-g3\"",
         "\"-Wall\"",
         "\"-c\"",
-        "src/lib.c".trim_matches('"'),
+        // The compiled file is the rewritten copy under target/;
+        // the `-I` argument anchors `#include` resolution back at
+        // the user's `src/` directory.
+        "lib.preprocessed.c",
+        "/src\"",
     ] {
         assert!(
             cc.contains(needle),
@@ -328,4 +332,95 @@ fn new_rejects_invalid_name() {
     assert_failure_with(&out, "invalid package name");
     // The directory should not have been left half-populated.
     assert!(!tmp.path().join("weird/Cust.toml").exists());
+}
+
+// ─── v0.2: multi-module ────────────────────────────────────────────
+
+#[test]
+fn build_multi_module_compiles_all_tus() {
+    let (_tmp, dir) = stage("multi_module");
+    assert_success(&cust(&dir, ["build"]));
+
+    // Each module gets its own rewritten source + object.
+    let bd = dir.join("target/debug/build/multi_module");
+    for name in ["lib", "util", "parser"] {
+        assert!(
+            bd.join(format!("{name}.preprocessed.c")).is_file(),
+            "missing {name}.preprocessed.c"
+        );
+        assert!(bd.join(format!("{name}.o")).is_file(), "missing {name}.o");
+    }
+
+    let archive = dir.join("target/debug/libmulti_module.a");
+    assert!(archive.is_file());
+
+    // All three `cust_pub` symbols should be in the archive.
+    let nm = Command::new("nm")
+        .arg("--defined-only")
+        .arg(&archive)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn nm");
+    let syms = String::from_utf8_lossy(&nm.stdout);
+    for sym in [
+        "multi_module_total",
+        "multi_module_util_get",
+        "multi_module_parser_count",
+    ] {
+        assert!(
+            syms.contains(sym),
+            "archive missing symbol `{sym}`:\n{syms}",
+        );
+    }
+}
+
+#[test]
+fn build_multi_module_emits_one_compile_command_per_tu() {
+    let (_tmp, dir) = stage("multi_module");
+    assert_success(&cust(&dir, ["build"]));
+
+    let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
+    for needle in [
+        "lib.preprocessed.c",
+        "util.preprocessed.c",
+        "parser.preprocessed.c",
+    ] {
+        assert!(
+            cc.contains(needle),
+            "compile_commands.json missing {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_both_file_and_folder_form_module() {
+    let (_tmp, dir) = stage("module_ambiguous");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "ambiguous module `foo`");
+    assert_failure_with(&out, "keep exactly one");
+}
+
+#[test]
+fn reports_missing_module_source() {
+    let (_tmp, dir) = stage("module_missing");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "module `nope` not found");
+}
+
+#[test]
+fn rejects_use_crate_in_v0_2() {
+    let (_tmp, dir) = stage("use_crate_not_supported");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "#cust use crate::util");
+    assert_failure_with(&out, "require the cust plugin");
+}
+
+#[test]
+fn check_passes_through_cust_mod_directives() {
+    // `cust check` on a root that contains `#cust mod foo;` must
+    // not blow up on the directive — the scanner-rewrite path
+    // strips it before clang sees it.
+    let (_tmp, dir) = stage("multi_module");
+    let out = cust(&dir, ["check"]);
+    assert_success(&out);
 }

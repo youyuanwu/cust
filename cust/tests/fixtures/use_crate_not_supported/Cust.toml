@@ -1,0 +1,3 @@
+[package]
+name    = "use_crate_not_supported"
+version = "0.1.0"

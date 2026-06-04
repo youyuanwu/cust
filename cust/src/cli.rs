@@ -148,6 +148,18 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
         bail!("library source `{}` not found", source.display());
     }
 
+    // v0.2 `cust check` is still root-only — it does not walk
+    // `#cust mod` (full module-graph check waits for v0.5). But it
+    // does run the root source through the scanner+rewriter so
+    // `#cust mod` lines at the top level don't trip `-fsyntax-only`.
+    let src_text = std::fs::read_to_string(&source)
+        .with_context(|| format!("reading `{}`", source.display()))?;
+    let scan = crate::mod_scanner::scan(&src_text, &source)?;
+    let rewritten = crate::mod_scanner::rewrite(&src_text, &source, &scan);
+    let rewritten_path = layout.profile_root.join("check.preprocessed.c");
+    std::fs::write(&rewritten_path, &rewritten)
+        .with_context(|| format!("writing `{}`", rewritten_path.display()))?;
+
     // Reuse `build_cflags` for parity with `cust build`, but drop
     // `-c -o <obj>` and replace with `-fsyntax-only`.
     let plan = BuildPlan {
@@ -158,13 +170,21 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
         clang: &clang,
     };
     let dummy_obj = layout.profile_root.join("check.o");
-    let mut flags = build::build_cflags(&plan, &profile, &prelude, &source, &dummy_obj);
+    let source_dir = source.parent().unwrap_or(&crate_root);
+    let mut flags = build::build_cflags(
+        &plan,
+        &profile,
+        &prelude,
+        &rewritten_path,
+        &dummy_obj,
+        Some(source_dir),
+    );
     // Strip the trailing `-c -o <obj> <src>` triple (4 args) and
     // re-add `-fsyntax-only <src>`.
     let new_len = flags.len().saturating_sub(4);
     flags.truncate(new_len);
     flags.push("-fsyntax-only".to_string());
-    flags.push(source.display().to_string());
+    flags.push(rewritten_path.display().to_string());
 
     let status = clang
         .command()
