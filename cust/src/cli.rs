@@ -1,4 +1,4 @@
-//! CLI surface. Five entry points (§17): `build`, `check`, `clean`,
+//! CLI surface. Six entry points: `build`, `check`, `clean`, `new`,
 //! `--version`, `--help`.
 
 use std::{
@@ -14,6 +14,7 @@ use crate::{
     build::{self, BuildPlan},
     clang::Clang,
     manifest::Manifest,
+    new::{self, CrateKind, NewPlan},
     profile::ProfileKind,
     target_layout::TargetLayout,
 };
@@ -34,6 +35,8 @@ pub enum Cmd {
     Check(CheckArgs),
     /// Remove the `target/` directory.
     Clean,
+    /// Scaffold a new cust crate at `<path>`.
+    New(NewArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -50,12 +53,28 @@ pub struct CheckArgs {
     pub release: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct NewArgs {
+    /// Where to place the new crate. The directory will be created
+    /// if it doesn't exist; if it does, it must be empty.
+    pub path: PathBuf,
+    /// Override the package name (defaults to the final path
+    /// component).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Create a library crate (currently the only supported kind;
+    /// `--bin` waits for the binary target story).
+    #[arg(long, default_value_t = true)]
+    pub lib: bool,
+}
+
 impl Cli {
     pub fn dispatch(self) -> Result<()> {
         match self.command {
             Cmd::Build(args) => run_build(profile_kind(args.release)),
             Cmd::Check(args) => run_check(profile_kind(args.release)),
             Cmd::Clean => run_clean(),
+            Cmd::New(args) => run_new(&args),
         }
     }
 }
@@ -170,6 +189,22 @@ fn run_clean() -> Result<()> {
     } else {
         println!("  Nothing to clean ({} does not exist)", target.display());
     }
+    Ok(())
+}
+
+fn run_new(args: &NewArgs) -> Result<()> {
+    // `--lib` is the only supported kind today; the flag exists so
+    // the eventual `--bin` flip is non-breaking. We don't bother
+    // matching it.
+    let _ = args.lib;
+
+    let plan = NewPlan {
+        path: &args.path,
+        name: args.name.as_deref(),
+        kind: CrateKind::Lib,
+    };
+    let out = new::run(&plan)?;
+    println!("  Created library `{}` at {}", out.name, out.root.display());
     Ok(())
 }
 

@@ -219,15 +219,10 @@ impl Manifest {
         // Package name sanity (matches cargo's rule of thumb: ASCII,
         // [A-Za-z0-9_-], non-empty). Strict enough that the name is
         // safe to splice into filenames.
-        let name = &self.package.name;
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
+        if let Err(reason) = validate_package_name(&self.package.name) {
             bail!(
-                "invalid `[package] name = {name:?}` in `{}` — must be \
-                 non-empty ASCII alphanumerics / `_` / `-`",
+                "invalid `[package] name = {:?}` in `{}` — {reason}",
+                self.package.name,
                 path.display()
             );
         }
@@ -244,5 +239,41 @@ impl Manifest {
             .and_then(|l| l.path.as_deref())
             .unwrap_or_else(|| Path::new("src/lib.c"));
         crate_root.join(rel)
+    }
+}
+
+/// Validate a `[package] name` value. Returns `Err(reason)` with a
+/// human-readable explanation when invalid. Shared by `Manifest::load`
+/// (rejecting bad existing manifests) and `cust new` (rejecting bad
+/// new-project names before any files are written).
+pub fn validate_package_name(name: &str) -> std::result::Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("name must not be empty");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("name must be ASCII alphanumerics / `_` / `-`");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_package_name;
+
+    #[test]
+    fn accepts_typical_names() {
+        for name in ["hello", "hello_world", "hello-world", "abc123", "x"] {
+            assert!(validate_package_name(name).is_ok(), "rejected {name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_names() {
+        for name in ["", "has spaces", "unicodé", "a/b", "a.b"] {
+            assert!(validate_package_name(name).is_err(), "accepted {name:?}");
+        }
     }
 }

@@ -11,6 +11,7 @@ mod build;
 mod clang;
 mod cli;
 mod manifest;
+mod new;
 mod profile;
 mod target_layout;
 
