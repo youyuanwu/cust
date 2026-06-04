@@ -1,0 +1,6 @@
+[package]
+name    = "deps_not_supported"
+version = "0.1.0"
+
+[dependencies]
+something = "1.0"
