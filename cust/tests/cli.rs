@@ -393,6 +393,30 @@ fn build_multi_module_emits_one_compile_command_per_tu() {
 }
 
 #[test]
+fn compile_commands_json_carries_paired_entries_for_clangd() {
+    // For each module the driver emits TWO entries: one for the
+    // rewritten `.preprocessed.c` (matches what was actually
+    // compiled) and one for the user's original source (lets
+    // clangd find matching flags when the editor opens src/*.c).
+    let (_tmp, dir) = stage("multi_module");
+    assert_success(&cust(&dir, ["build"]));
+
+    let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
+    // Crude but sufficient: the rewritten path and the original
+    // source path should both appear as the "file" value for each
+    // of the three modules.
+    for original in ["src/lib.c", "src/util.c", "src/parser/mod.c"] {
+        assert!(
+            cc.contains(original),
+            "compile_commands.json missing original source `{original}`:\n{cc}"
+        );
+    }
+    // Six "file": entries (3 modules × 2). Count them.
+    let n = cc.matches("\"file\":").count();
+    assert_eq!(n, 6, "expected 6 file entries, got {n}:\n{cc}");
+}
+
+#[test]
 fn rejects_both_file_and_folder_form_module() {
     let (_tmp, dir) = stage("module_ambiguous");
     let out = cust(&dir, ["build"]);

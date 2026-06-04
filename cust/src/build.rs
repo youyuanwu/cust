@@ -95,16 +95,39 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
 
     // Step 5: per-TU compile.
     let mut objects: Vec<PathBuf> = Vec::with_capacity(modules.len());
-    let mut compile_entries: Vec<CompileEntry> = Vec::with_capacity(modules.len());
+    // Two entries per module: one for the rewritten file (what
+    // clang actually compiled) and one paired entry pointing at
+    // the user's original source with the same flags but the file
+    // path swapped. clangd picks whichever matches the file the
+    // editor opened — so editing src/lib.c sees the real flags,
+    // not the default fallback set.
+    let mut compile_entries: Vec<CompileEntry> = Vec::with_capacity(modules.len() * 2);
 
     for m in &modules {
         let (rewritten_path, object_path, cflags) =
             compile_one_module(plan, &profile, &prelude_path, &crate_build_dir, m)?;
         objects.push(object_path);
+
+        // Entry 1: the rewritten file (matches what we actually
+        // ran). Source argument at the tail is the rewritten path.
         compile_entries.push(CompileEntry {
             directory: plan.crate_root.to_path_buf(),
-            file: rewritten_path,
+            file: rewritten_path.clone(),
             arguments: argv_with_clang(plan, &cflags),
+        });
+
+        // Entry 2: the original source. Swap the trailing source-
+        // file arg for the user's source path so clangd sees the
+        // right file when it parses this entry.
+        let original_args = swap_source_arg(
+            &argv_with_clang(plan, &cflags),
+            &rewritten_path,
+            &m.source_path,
+        );
+        compile_entries.push(CompileEntry {
+            directory: plan.crate_root.to_path_buf(),
+            file: m.source_path.clone(),
+            arguments: original_args,
         });
     }
 
@@ -235,6 +258,26 @@ fn argv_with_clang(plan: &BuildPlan<'_>, flags: &[String]) -> Vec<String> {
     argv.push(plan.clang.path.display().to_string());
     argv.extend(flags.iter().cloned());
     argv
+}
+
+/// Return a copy of `argv` with any occurrence of `old` (as a full
+/// argument string) replaced by `new`. Used to derive the
+/// editor-facing `compile_commands` entry: same flags as the real
+/// compile, but with the source path (last positional argument,
+/// per `build_cflags`) swapped from the rewritten file to the
+/// user's original source so clangd matches the file it opened.
+fn swap_source_arg(argv: &[String], old: &Path, new: &Path) -> Vec<String> {
+    let old_s = old.display().to_string();
+    let new_s = new.display().to_string();
+    argv.iter()
+        .map(|a| {
+            if a == &old_s {
+                new_s.clone()
+            } else {
+                a.clone()
+            }
+        })
+        .collect()
 }
 
 fn materialise_prelude(dst: &Path) -> Result<()> {
