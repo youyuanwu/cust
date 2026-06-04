@@ -104,6 +104,7 @@ fn run_build(profile_kind: ProfileKind) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let (manifest, crate_root, workspace_root) = locate(&cwd)?;
     let clang = Clang::discover()?;
+    let plugin = crate::plugin::Plugin::discover();
 
     let plan = BuildPlan {
         manifest: &manifest,
@@ -111,9 +112,13 @@ fn run_build(profile_kind: ProfileKind) -> Result<()> {
         workspace_root: &workspace_root,
         profile_kind,
         clang: &clang,
+        plugin: plugin.as_ref(),
     };
     let outputs = build::run(&plan)?;
 
+    if let Some(p) = &plugin {
+        eprintln!("  Plugin   {}", p.path.display());
+    }
     println!(
         "  Finished {} [{}] -> {}",
         manifest.package.name,
@@ -162,12 +167,14 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
 
     // Reuse `build_cflags` for parity with `cust build`, but drop
     // `-c -o <obj>` and replace with `-fsyntax-only`.
+    let plugin = crate::plugin::Plugin::discover();
     let plan = BuildPlan {
         manifest: &manifest,
         crate_root: &crate_root,
         workspace_root: &workspace_root,
         profile_kind,
         clang: &clang,
+        plugin: plugin.as_ref(),
     };
     let dummy_obj = layout.profile_root.join("check.o");
     let source_dir = source.parent().unwrap_or(&crate_root);

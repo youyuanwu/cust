@@ -14,6 +14,7 @@ mod manifest;
 mod mod_scanner;
 mod modules;
 mod new;
+mod plugin;
 mod profile;
 mod target_layout;
 

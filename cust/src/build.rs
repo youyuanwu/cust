@@ -30,6 +30,7 @@ use crate::{
     manifest::Manifest,
     mod_scanner,
     modules::{self, Module},
+    plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
     target_layout::TargetLayout,
 };
@@ -41,6 +42,11 @@ pub struct BuildPlan<'a> {
     pub workspace_root: &'a Path,
     pub profile_kind: ProfileKind,
     pub clang: &'a Clang,
+    /// Discovered cust clang plugin, when present. v0.2 treats
+    /// "plugin missing" as a silent skip — the v0.1 plugin-less
+    /// code path still works for single-module / no-cross-import
+    /// crates.
+    pub plugin: Option<&'a Plugin>,
 }
 
 /// Outputs `cust build` writes. `objects` and `compile_commands`
@@ -239,6 +245,9 @@ pub fn build_cflags(
     flags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
 
     flags.push("-fvisibility=hidden".to_string());
+    if let Some(plugin) = plan.plugin {
+        flags.push(plugin.fplugin_flag());
+    }
     if let Some(dir) = extra_include {
         flags.push(format!("-I{}", dir.display()));
     }

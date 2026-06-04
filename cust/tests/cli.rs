@@ -448,3 +448,68 @@ fn check_passes_through_cust_mod_directives() {
     let out = cust(&dir, ["check"]);
     assert_success(&out);
 }
+
+// ─── v0.2: clang plugin ────────────────────────────────────────────
+
+/// Helper: path to the built `libcust_plugin.so` (next to the
+/// `cust` binary itself).
+fn plugin_path() -> Option<PathBuf> {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_cust"));
+    let candidate = exe.parent()?.join("libcust_plugin.so");
+    candidate.is_file().then_some(candidate)
+}
+
+#[test]
+fn build_without_plugin_skips_fplugin_flag() {
+    // Override discovery to point at a nonexistent path — the
+    // driver should silently skip the plugin (v0.2 behaviour:
+    // plugin is opt-in until cross-module imports require it).
+    let (_tmp, dir) = stage("hello");
+    let out = Command::new(env!("CARGO_BIN_EXE_cust"))
+        .args(["build"])
+        .env("CUST_PLUGIN", "/definitely/does/not/exist")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn cust");
+    assert_success(&out);
+
+    let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
+    assert!(
+        !cc.contains("-fplugin="),
+        "expected NO -fplugin flag with CUST_PLUGIN=/definitely/does/not/exist, got:\n{cc}"
+    );
+}
+
+#[test]
+fn build_with_plugin_injects_fplugin_flag() {
+    // Only meaningful when the plugin is built — skip otherwise so
+    // CI without `cargo run -p plugin-build` doesn't choke.
+    let Some(plugin) = plugin_path() else {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    };
+    let (_tmp, dir) = stage("hello");
+    let out = Command::new(env!("CARGO_BIN_EXE_cust"))
+        .args(["build"])
+        .env("CUST_PLUGIN", &plugin)
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn cust");
+    assert_success(&out);
+
+    let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
+    let expected = format!("-fplugin={}", plugin.display());
+    assert!(
+        cc.contains(&expected),
+        "expected `{expected}` in compile_commands.json:\n{cc}"
+    );
+
+    // The plugin's loading remark should appear on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cust plugin loaded"),
+        "expected plugin remark on stderr:\n{stderr}"
+    );
+}
