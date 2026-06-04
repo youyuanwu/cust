@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["cust"]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.96.0"
+license      = "MIT"
+repository   = "https://github.com/youyuanwu/cust"
+authors      = ["youyuanwu"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+# Opinionated allows to keep the noise down at v0.1
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
