@@ -961,26 +961,46 @@ Roadmap bullets here are deliberately short:
   `target/<profile>/.h-fragments/<crate>/`; the build pipeline
   runs a surface pass then lowers each `#cust use crate::X;` to
   `#include "<X.cust.h>"` for codegen. Per-crate concatenated
-  header at `target/<profile>/include/<crate>.h`. (`cust new`
-  shipped in v0.1.) Full shipped details, deferrals, and
-  verification in [v0.2.md](v0.2.md).
-* **v0.3 — dependency resolver & registry.** `cust add`, `Cust.lock`,
-  source-only dep build, link in. Build-script hang-protection
-  timeout (§12) ships here since scripts arrive with deps.
-* **v0.4 — plugin v1.** Full AST-based fragment header synthesis
-  (opaque structs by default, `[[cust::pub(repr)]]` opt-in), circular
-  dep fixed-point loop with operational convergence criterion (§4),
-  `[[cust::test]]` collection via ctor-based registration (§10),
-  fork-based test process isolation (§11).
+  header (path moved under `target/<profile>/build/<crate>/include/`
+  in v0.3). (`cust new` shipped in v0.1.) Full shipped details,
+  deferrals, and verification in [v0.2.md](v0.2.md).
+* **v0.3 — workspaces & path dependencies.** ✅ **shipped.**
+  `[workspace] members = […]` in `Cust.toml`; path deps
+  (`dep = { path = "…" }`) resolved against the workspace member
+  list; topological multi-crate build with `target/<profile>/deps/<name>`
+  symlink farm publishing each member's archive + crate header.
+  New cross-crate import directive `#cust use <name>;` lowered
+  by the driver to an `#include` of the dep's public header.
+  `Cust.lock` (v1 schema, path-only form) emitted at the
+  workspace root — contract documented in
+  [../spec/cust-lock.md](../spec/cust-lock.md). `cust build -p`
+  / `--package` scopes to one member + transitive deps. Per-member
+  outputs moved to `target/<profile>/build/<member>/`. Full
+  shipped details, locked V3D-N decisions, deferrals, and
+  verification in [v0.3.md](v0.3.md).
+* **v0.4 — dependency resolver, registry, plugin v1, tests.**
+  Brings the *network* half of dep work that v0.3 deferred:
+  initial registry wire protocol (`Index` trait, `file://` first
+  per V3D-1's deferral), `cust add`, semver version resolution,
+  `Cust.lock` source hashes, `[workspace.dependencies]`
+  inheritance (OQ-6). Plus build scripts (`build.cust.c`) with
+  the §12 hang-protection timeout, plugin v1 (full AST-based
+  fragment header synthesis, `[[cust::pub(repr)]]` opt-in body
+  export), circular-dep fixed-point loop with the convergence
+  criterion (§4), `[[cust::test]]` collection via ctor-based
+  registration (§10), fork-based test process isolation (§11),
+  and `-jN` parallelism (within and across crates).
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
 * **v0.6 — ThinLTO across the dep graph, bitcode rlib format with
   `metadata.json` including `rlib_format_version` and `llvm_version`
   (§7). Toolchain-swap rlib invalidation.**
 * **v0.7 — `[[cust::derive]]`, `[[cust::must_use]]`, `[[cust::no_panic]]`
   (per-TU heuristic) plugin checks; clang-tidy integration.**
-* **v0.8 — workspaces, `build.cust.c`, generated-source splicing.**
-* **v0.9 — `cust export cmake --consumable` and `--standalone`; also
-  `cust export ninja` for our own use.**
+* **v0.8 — `cust export cmake --consumable` and generated-source
+  splicing beyond `include_generated!`.** (Workspaces shipped in
+  v0.3, build scripts in v0.4.)
+* **v0.9 — `cust export ninja` for our own use** plus any deferred
+  cmake-export polish from v0.8.
 * **v0.10 — close the v1-blocking open questions (§16 OQ-3, OQ-4,
   OQ-7, OQ-8, OQ-12): allocator policy, panic mode commitments,
   editions semantics, freestanding prelude split, contract
