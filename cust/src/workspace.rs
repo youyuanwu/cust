@@ -557,6 +557,14 @@ pub struct WorkspaceBuildOptions<'a> {
     /// `true` runs every member with `cust check` semantics
     /// (`-fsyntax-only`, no archive, no `compile_commands.json`).
     pub syntax_only: bool,
+    /// `true` runs every member through the v0.3.2 test-build
+    /// pipeline (V32D-2 through V32D-7): the lib half is
+    /// compiled with `-DCUST_TEST_BUILD=1` into a fresh
+    /// `target/<profile>/test/<crate>/` tree, the bin half is
+    /// skipped (V32D-11), and the resulting test executable is
+    /// at `target/<profile>/test/<crate>/<crate>`. Mutually
+    /// exclusive with `syntax_only`.
+    pub test_build: bool,
     /// If `Some(name)`, build only `name` and its transitive deps.
     /// `None` builds every member. Used by `cust build -p <member>`
     /// (Slice E).
@@ -641,6 +649,7 @@ pub fn build_workspace(
             deps: &dep_strs,
             link_deps: &link_deps,
             kind,
+            test_build: opts.test_build,
         };
         let outputs = build::run(&plan).with_context(|| format!("building member `{name}`"))?;
 
@@ -652,8 +661,18 @@ pub fn build_workspace(
         // resolves through this symlink. Bin-only members get a
         // symlink too; it's harmless since (per V31D-6, enforced
         // in Slice C) no one will resolve through it for a bin.
-        refresh_dep_symlink(&layout, &m.name, &m.root)
-            .with_context(|| format!("publishing dep view for `{name}`"))?;
+        //
+        // Skipped in test-build mode (v0.3.2 V32D-4): the test
+        // pipeline doesn't populate `target/<profile>/build/<name>/`
+        // so there'd be nothing to point at. Test code that
+        // imports a sibling dep via `#cust use <dep>;` still
+        // resolves through whatever the dep's normal `cust build`
+        // last produced — if that was never run, the test
+        // compile fails with a clear missing-header error.
+        if !opts.test_build {
+            refresh_dep_symlink(&layout, &m.name, &m.root)
+                .with_context(|| format!("publishing dep view for `{name}`"))?;
+        }
 
         per_member.push((name.clone(), outputs));
     }
@@ -661,9 +680,10 @@ pub fn build_workspace(
     // After all members built successfully, emit Cust.lock at the
     // workspace root. Skipped for single-crate (non-workspace)
     // projects — they have no edges to record — and skipped in
-    // syntax-only mode (cust check shouldn't churn the lockfile;
-    // any lock changes are committed by the user via `cust build`).
-    if !opts.syntax_only {
+    // syntax-only and test-build modes (cust check / cust test
+    // shouldn't churn the lockfile; lock changes are committed
+    // by the user via `cust build`).
+    if !opts.syntax_only && !opts.test_build {
         crate::lock::write_lock(ws).context("writing Cust.lock")?;
     }
 

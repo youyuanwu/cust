@@ -18,6 +18,7 @@ mod new;
 mod plugin;
 mod profile;
 mod target_layout;
+mod test_runner;
 mod test_scanner;
 mod workspace;
 

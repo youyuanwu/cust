@@ -95,4 +95,28 @@ impl TargetLayout {
     pub fn build_dir(&self, member_name: &str) -> PathBuf {
         self.profile_root.join("build").join(member_name)
     }
+
+    /// Test-build directory for a member —
+    /// `target/<profile>/test/<member>/`. v0.3.2 V32D-4: the test
+    /// build is a fully fresh build tree per member, never
+    /// colocated with the normal lib build, so objects produced
+    /// with `-DCUST_TEST_BUILD=1` don't collide with the
+    /// non-test ones. Houses the per-TU objects, the generated
+    /// `cust_test_main.c` runner, and the resulting test
+    /// executable.
+    pub fn test_build_dir(&self, member_name: &str) -> PathBuf {
+        self.profile_root.join("test").join(member_name)
+    }
+
+    /// Test executable path for `member_name`. V32D-5 specified
+    /// `target/<profile>/test/<crate>` (no extension) and V32D-4
+    /// specified the build tree at the same path; the two
+    /// conflict and v0.3.2 resolves it in favour of V32D-4's
+    /// "fully fresh build tree" framing — the executable lives
+    /// inside the build tree at
+    /// `target/<profile>/test/<crate>/<crate>`. Still a plain
+    /// `<crate>` name (V32D-5's `ps` argument carries over).
+    pub fn test_executable_path(&self, member_name: &str) -> PathBuf {
+        self.test_build_dir(member_name).join(member_name)
+    }
 }

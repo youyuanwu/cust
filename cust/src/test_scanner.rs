@@ -33,13 +33,6 @@
 //! restriction; users who prefer Cargo-style line breaks can
 //! opt in once that backend ships.
 
-// Slice B (v0.3.2 — scanner only) leaves this module unwired
-// behind cust's bin-crate `pub` visibility; the dead-code lint
-// fires because `scan` is only called from the test module
-// inside this file. Slice C wires it into `build.rs` and this
-// attribute is removed at that point.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};

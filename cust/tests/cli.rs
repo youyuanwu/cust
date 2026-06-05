@@ -1243,3 +1243,206 @@ fn lib_half_cannot_self_import_via_cust_use() {
     assert_failure_with(&out, "`#cust use badlib;`");
     assert_failure_with(&out, "not listed in [dependencies]");
 }
+
+// ─── Slice C — v0.3.2 `--__test-build` end-to-end ──────────────────
+//
+// These tests drive the test-build pipeline through the hidden
+// `cust build --__test-build` flag (the slice-D `cust test`
+// subcommand will replace it as the user-facing surface). They
+// build the resulting test binary and execute it directly so
+// the Cargo-shaped output, exit codes, and fork-isolation
+// behaviour are all on the hook for regression.
+
+#[test]
+fn test_build_produces_binary_at_expected_path() {
+    let (_tmp, dir) = stage("with_tests");
+    let out = cust(&dir, ["build", "--__test-build"]);
+    assert_success(&out);
+
+    let exe = dir.join("target/debug/test/with_tests/with_tests");
+    assert!(exe.is_file(), "test binary missing at {}", exe.display(),);
+    // V32D-4: test build is fully isolated from the normal
+    // build tree — no archive, no per-build dir for the
+    // lib half.
+    assert!(
+        !dir.join("target/debug/build/with_tests/libwith_tests.a")
+            .exists(),
+        "test build should not produce the non-test archive",
+    );
+}
+
+#[test]
+fn test_build_runner_runs_all_tests_with_cargo_shape() {
+    let (_tmp, dir) = stage("with_tests");
+    assert_success(&cust(&dir, ["build", "--__test-build"]));
+
+    let exe = dir.join("target/debug/test/with_tests/with_tests");
+    let out = Command::new(&exe)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn test binary");
+    assert!(
+        out.status.success(),
+        "test binary exited {}:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Cargo-shape header + per-test lines + summary.
+    assert!(stdout.contains("running 3 tests"), "{stdout}");
+    assert!(stdout.contains("test test_add_basic ... ok"), "{stdout}");
+    assert!(
+        stdout.contains("test test_mul_void_kind ... ok"),
+        "{stdout}",
+    );
+    assert!(stdout.contains("test test_skipped ... ignored"), "{stdout}",);
+    assert!(
+        stdout.contains("test result: ok. 2 passed; 0 failed; 1 ignored"),
+        "{stdout}",
+    );
+}
+
+#[test]
+fn test_build_runner_substring_filter() {
+    let (_tmp, dir) = stage("with_tests");
+    assert_success(&cust(&dir, ["build", "--__test-build"]));
+
+    let exe = dir.join("target/debug/test/with_tests/with_tests");
+    let out = Command::new(&exe)
+        .arg("mul")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(stdout.contains("running 1 tests"), "{stdout}");
+    assert!(
+        stdout.contains("test test_mul_void_kind ... ok"),
+        "{stdout}",
+    );
+    // The other two tests should be filtered out, not run.
+    assert!(!stdout.contains("test_add_basic"), "{stdout}");
+    assert!(!stdout.contains("test_skipped"), "{stdout}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored; 2 filtered out"),
+        "{stdout}",
+    );
+}
+
+#[test]
+fn test_build_runner_list_mode() {
+    let (_tmp, dir) = stage("with_tests");
+    assert_success(&cust(&dir, ["build", "--__test-build"]));
+
+    let exe = dir.join("target/debug/test/with_tests/with_tests");
+    let out = Command::new(&exe)
+        .arg("--list")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(stdout.contains("test_add_basic: test"), "{stdout}");
+    assert!(stdout.contains("test_mul_void_kind: test"), "{stdout}");
+    assert!(stdout.contains("test_skipped: test"), "{stdout}");
+    assert!(stdout.contains("3 tests, 0 benchmarks"), "{stdout}");
+}
+
+#[test]
+fn test_build_failure_isolated_by_fork() {
+    // Synthesize a fixture inline with a deliberately failing
+    // test sandwiched between passing ones. The runner must
+    // execute every test, mark only the failing one FAILED,
+    // and exit 1.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("isolation");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cust.toml"),
+        "[package]\nname = \"isolation\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.c"),
+        "cust_pub int answer(void) { return 42; }\n\
+         cust_test int test_pass_first(void) { cust_assert_eq(answer(), 42); return 0; }\n\
+         cust_test int test_will_fail(void)  { cust_assert_eq(answer(), 0); return 0; }\n\
+         cust_test int test_pass_last(void)  { cust_assert_eq(answer(), 42); return 0; }\n",
+    )
+    .unwrap();
+
+    assert_success(&cust(&dir, ["build", "--__test-build"]));
+
+    let exe = dir.join("target/debug/test/isolation/isolation");
+    let out = Command::new(&exe)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Fork isolation: the failing test does not stop the others.
+    assert!(stdout.contains("test test_pass_first ... ok"), "{stdout}");
+    assert!(
+        stdout.contains("test test_will_fail ... FAILED"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("test test_pass_last ... ok"), "{stdout}");
+    // Summary reflects the one failure.
+    assert!(
+        stdout.contains("test result: FAILED. 2 passed; 1 failed; 0 ignored"),
+        "{stdout}",
+    );
+    // The forked subprocess writes the assertion message to
+    // stderr (cust_panic_impl -> stderr).
+    assert!(
+        stderr.contains("assertion failed: `(answer()) == (0)`"),
+        "{stderr}",
+    );
+    // Exit 1 on any failure.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "wanted exit 1, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        out.status.code(),
+    );
+}
+
+#[test]
+fn test_build_excludes_cust_test_symbols_from_normal_archive() {
+    // Build the with_tests fixture in NORMAL (non-test) mode and
+    // confirm the resulting libwith_tests.a contains the cust_pub
+    // functions but NOT any test_* symbol. V32D-3: cust_test
+    // decays to `static unused` in non-test builds.
+    let (_tmp, dir) = stage("with_tests");
+    assert_success(&cust(&dir, ["build"]));
+
+    let archive = dir.join("target/debug/build/with_tests/libwith_tests.a");
+    assert!(archive.is_file());
+
+    let nm = Command::new("nm")
+        .arg(&archive)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn nm");
+    let symbols = String::from_utf8_lossy(&nm.stdout);
+
+    // cust_pub functions present:
+    assert!(
+        symbols.contains("add"),
+        "expected `add` in archive:\n{symbols}"
+    );
+    assert!(
+        symbols.contains("mul"),
+        "expected `mul` in archive:\n{symbols}"
+    );
+    // cust_test functions absent — they're static unused outside
+    // the test build.
+    for needle in ["test_add_basic", "test_mul_void_kind", "test_skipped"] {
+        assert!(
+            !symbols.contains(needle),
+            "test fn `{needle}` leaked into the non-test archive:\n{symbols}",
+        );
+    }
+}

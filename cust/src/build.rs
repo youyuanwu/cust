@@ -33,6 +33,8 @@ use crate::{
     plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
     target_layout::TargetLayout,
+    test_runner,
+    test_scanner::{self, TestEntry},
 };
 
 /// Inputs handed to `run` by the CLI layer.
@@ -67,6 +69,19 @@ pub struct BuildPlan<'a> {
     /// by `Manifest::resolve_kind` at the workspace orchestrator
     /// (or CLI) layer.
     pub kind: CrateKind,
+    /// v0.3.2 (V32D-2 / V32D-3): when `true`, the lib half is
+    /// compiled with `-DCUST_TEST_BUILD=1` into a fresh
+    /// `target/<profile>/test/<crate>/` tree, the driver pre-pass
+    /// test scanner runs over every module, a generated
+    /// `cust_test_main.c` runner is concatenated + compiled, and
+    /// everything is linked into a test executable at
+    /// `target/<profile>/test/<crate>/<crate>`. The bin half is
+    /// **skipped** (V32D-11 — v0.3.2 only tests the library
+    /// half). No archive, no crate header, no
+    /// `compile_commands.json`, no `.cust-version` are emitted
+    /// in this mode (the non-test `cust build` owns those).
+    /// Ignored when `syntax_only` is true.
+    pub test_build: bool,
 }
 
 /// Outputs `cust build` writes. `objects` and `compile_commands`
@@ -84,6 +99,10 @@ pub struct BuildOutputs {
     /// `LibAndBin`) and the build was not `syntax_only`; `None`
     /// otherwise.
     pub executable: Option<PathBuf>,
+    /// `Some` when `plan.test_build` was true and a test binary
+    /// was produced (V32D-4 / V32D-5). The path is
+    /// `target/<profile>/test/<crate>/<crate>`.
+    pub test_executable: Option<PathBuf>,
     #[allow(dead_code)]
     pub compile_commands: PathBuf,
 }
@@ -97,6 +116,28 @@ struct CompileEntry {
 
 #[allow(clippy::too_many_lines)] // staged lib+bin pipeline; splitting further hurts readability more than it helps
 pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
+    if plan.test_build && !plan.syntax_only {
+        // V32D-11: bin-only members produce no test artefacts.
+        // The workspace orchestrator calls run() for every
+        // in-scope member, including bin-only ones; silently
+        // return an empty result for those (V32D-12 also
+        // requires this — bare `cust test` skips bin-only
+        // members without erroring).
+        if !plan.kind.has_lib() {
+            return Ok(BuildOutputs {
+                objects: Vec::new(),
+                archive: None,
+                executable: None,
+                test_executable: None,
+                compile_commands: plan
+                    .workspace_root
+                    .join("target")
+                    .join("compile_commands.json"),
+            });
+        }
+        return run_test_build(plan);
+    }
+
     // Step 2: resolve profile.
     let profile_override = match plan.profile_kind {
         ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
@@ -260,12 +301,210 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
         objects: all_objects,
         archive: archive_path,
         executable,
+        test_executable: None,
         compile_commands: cc_path,
     })
 }
 
-/// Compile a tree of modules into `.o` files, threading
-/// `compile_commands.json` entries through `compile_entries`.
+/// v0.3.2 test-build pipeline. Per V32D-2 / V32D-3 / V32D-4 /
+/// V32D-6 / V32D-7 / V32D-11:
+///
+/// 1. Compile the lib half's TUs with `-DCUST_TEST_BUILD=1` into
+///    a fresh `target/<profile>/test/<crate>/` tree. Bin half is
+///    skipped (V32D-11 — v0.3.2 only tests the library half).
+/// 2. Run `test_scanner` over each module's source to collect
+///    `Vec<TestEntry>`.
+/// 3. Render + write + compile the `cust_test_main.c` runner
+///    TU with the per-test extern decls and the
+///    `__cust_tests[]` table (V32D-6).
+/// 4. Link every test-build object plus any transitive dep
+///    archive into the test binary at
+///    `target/<profile>/test/<crate>/<crate>`.
+///
+/// No archive, no crate header, no `compile_commands.json`, no
+/// version stamp are emitted — those belong to the non-test
+/// `cust build` pipeline. The dep-view symlink farm refresh
+/// `build_workspace` does after each member-build is also
+/// harmless in test-build mode: it points at the *non-test*
+/// build dir which may or may not exist; consumers that
+/// `#cust use <dep>;` in test code see the dep's normal lib
+/// header just like any other consumer would.
+fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
+    let profile_override = match plan.profile_kind {
+        ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
+        ProfileKind::Release => plan.manifest.profile.release.as_ref(),
+    };
+    let profile = ResolvedProfile::resolve(plan.profile_kind, profile_override)?;
+
+    let layout = TargetLayout::for_workspace(plan.workspace_root, profile.kind);
+    layout.ensure_dirs()?;
+
+    let prelude_path = layout.prelude_path();
+    materialise_prelude(&prelude_path)?;
+
+    let crate_name = plan.manifest.package_name();
+    let test_dir = layout.test_build_dir(crate_name);
+    fs::create_dir_all(&test_dir).with_context(|| format!("creating `{}`", test_dir.display()))?;
+
+    // V32D-11: bin-only members are rejected by the CLI layer
+    // (slice D). Internally we just no-op when there's no lib
+    // half — the CLI layer is responsible for the user-facing
+    // error message.
+    let Some(lib_src) = plan.kind.lib_source() else {
+        bail!(
+            "cust test internal: member `{crate_name}` has no library half — \
+             callers must reject bin-only members before invoking the test build"
+        );
+    };
+    if !lib_src.is_file() {
+        bail!(
+            "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
+            lib_src.display()
+        );
+    }
+
+    let lib_modules =
+        modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
+
+    // Same surface pass + crate-header sequence the lib half
+    // normally runs. Tests can `#cust use crate::<sibling>;`
+    // exactly like production code.
+    let needs_surface_pass =
+        plan.plugin.is_some() && lib_modules.iter().any(|m| !m.imports.is_empty());
+    if needs_surface_pass {
+        surface_pass(
+            plan,
+            &profile,
+            &prelude_path,
+            &test_dir,
+            &layout,
+            &lib_modules,
+        )?;
+    }
+
+    // Compile the lib half's TUs into the test build dir with
+    // -DCUST_TEST_BUILD=1 (added by build_cflags when
+    // plan.test_build is true — see build_cflags above).
+    let mut compile_entries: Vec<CompileEntry> = Vec::new();
+    let mut objects = compile_tree(
+        plan,
+        &profile,
+        &prelude_path,
+        &test_dir,
+        &layout,
+        &lib_modules,
+        /* emit_fragments = */ true,
+        /* extra_includes = */ &[],
+        /* is_bin_half = */ false,
+        &mut compile_entries,
+    )?;
+
+    // Run the driver pre-pass test scanner over every module's
+    // ORIGINAL source (not the rewritten preprocessed copy —
+    // line numbers must match what the user wrote so failure
+    // diagnostics resolve correctly). Errors propagate as-is.
+    let mut tests: Vec<TestEntry> = Vec::new();
+    for m in &lib_modules {
+        let src = fs::read_to_string(&m.source_path)
+            .with_context(|| format!("reading `{}`", m.source_path.display()))?;
+        let mut found = test_scanner::scan(&src, &m.qualified_name, &m.source_path)
+            .with_context(|| format!("scanning tests in `{}`", m.source_path.display()))?;
+        tests.append(&mut found);
+    }
+
+    // Render + write the runner TU. Always emitted (even with
+    // zero discovered tests) so the link step has a concrete
+    // `main`; the runner prints `running 0 tests` and exits 0
+    // in that case, matching Cargo's empty-suite behaviour.
+    let main_c_src = test_runner::render_main_c(&tests);
+    let main_c_path = test_dir.join("cust_test_main.c");
+    fs::write(&main_c_path, main_c_src)
+        .with_context(|| format!("writing `{}`", main_c_path.display()))?;
+
+    // Compile the runner TU. We bypass compile_one_module
+    // because the runner needs no #cust use rewriting, no
+    // fragment emission, no extra includes, and definitely no
+    // self-import carve-out. Straight clang -c -o.
+    let main_obj = test_dir.join("cust_test_main.o");
+    let main_cflags = build_runner_cflags(plan, &profile, &prelude_path, &main_c_path, &main_obj);
+    let status = plan
+        .clang
+        .command()
+        .args(&main_cflags)
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| {
+            format!(
+                "invoking `{}` to compile `cust_test_main.c`",
+                plan.clang.path.display()
+            )
+        })?;
+    if !status.success() {
+        bail!(
+            "clang exited with status {status} compiling the test runner TU `{}`",
+            main_c_path.display(),
+        );
+    }
+    objects.push(main_obj);
+
+    // Link everything into the test binary. Direct object link
+    // (no own-archive step — saves a write + matches how Cargo
+    // builds its own test binaries: cargo test for a lib crate
+    // doesn't go through libfoo.rlib, it links the test code
+    // against the lib's object files directly). Dep archives
+    // come from plan.link_deps as usual.
+    let exe_path = layout.test_executable_path(crate_name);
+    link_executable(
+        plan, &profile, &objects, /* own_archive = */ None, &layout, &exe_path,
+    )?;
+
+    Ok(BuildOutputs {
+        objects,
+        archive: None,
+        executable: None,
+        test_executable: Some(exe_path),
+        compile_commands: layout.target_root.join("compile_commands.json"),
+    })
+}
+
+/// Build the clang argv for the generated `cust_test_main.c`
+/// runner TU. Almost the same as `build_cflags` but without the
+/// plugin / fragment / module-include plumbing that doesn't
+/// apply to the runner.
+fn build_runner_cflags(
+    plan: &BuildPlan<'_>,
+    profile: &ResolvedProfile,
+    prelude: &Path,
+    source: &Path,
+    object: &Path,
+) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+
+    let std_flag = plan
+        .manifest
+        .clang
+        .std
+        .as_deref()
+        .unwrap_or_else(|| plan.clang.default_std());
+    flags.push(format!("-std={std_flag}"));
+
+    flags.extend(profile.cflags());
+    flags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
+
+    flags.push("-fvisibility=hidden".to_string());
+    flags.push("-DCUST_TEST_BUILD=1".to_string());
+
+    flags.push("-include".to_string());
+    flags.push(prelude.display().to_string());
+
+    flags.push("-c".to_string());
+    flags.push("-o".to_string());
+    flags.push(object.display().to_string());
+    flags.push(source.display().to_string());
+
+    flags
+}
+
 /// `emit_fragments = true` makes the plugin write per-module
 /// fragment headers (lib half); `false` skips that (bin half).
 /// `extra_includes` is prepended to clang's `-I` set so per-half
@@ -615,6 +854,14 @@ pub fn build_cflags(
     flags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
 
     flags.push("-fvisibility=hidden".to_string());
+    if plan.test_build {
+        // v0.3.2 V32D-3: activate the prelude's test-build
+        // branch — cust_test stops decaying to `static unused`
+        // and gains its annotate attribute; cust_assert / panic
+        // forward-declare cust_panic_impl (defined in the
+        // generated runner TU).
+        flags.push("-DCUST_TEST_BUILD=1".to_string());
+    }
     if let Some(plugin) = plan.plugin {
         flags.push(plugin.fplugin_flag());
         if let Some(path) = fragment_out {

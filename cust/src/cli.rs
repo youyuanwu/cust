@@ -49,6 +49,17 @@ pub struct BuildArgs {
     /// member is built.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
+    /// **Hidden test seam.** Build the lib half of each
+    /// in-scope member through the v0.3.2 test pipeline
+    /// (`-DCUST_TEST_BUILD=1`, fresh `target/<profile>/test/<crate>/`
+    /// tree, generated runner TU, test binary at
+    /// `target/<profile>/test/<crate>/<crate>`). Bin-only members
+    /// are silently skipped. Slice C carries this flag so the
+    /// integration test can drive the pipeline end-to-end before
+    /// slice D promotes it to a real `cust test` subcommand.
+    /// Not part of the user-facing CLI surface.
+    #[arg(long = "__test-build", hide = true)]
+    pub test_build: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -105,7 +116,11 @@ pub struct NewArgs {
 impl Cli {
     pub fn dispatch(self) -> Result<()> {
         match self.command {
-            Cmd::Build(args) => run_build(profile_kind(args.release), args.package.as_deref()),
+            Cmd::Build(args) => run_build(
+                profile_kind(args.release),
+                args.package.as_deref(),
+                args.test_build,
+            ),
             Cmd::Check(args) => run_check(profile_kind(args.release), args.package.as_deref()),
             Cmd::Run(args) => run_run(
                 profile_kind(args.release),
@@ -134,7 +149,7 @@ fn locate(cwd: &Path) -> Result<Workspace> {
     Workspace::discover(cwd)
 }
 
-fn run_build(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
+fn run_build(profile_kind: ProfileKind, package: Option<&str>, test_build: bool) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
@@ -145,6 +160,7 @@ fn run_build(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: false,
+        test_build,
         only: package,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
@@ -162,6 +178,9 @@ fn run_build(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
         if let Some(exe) = &out.executable {
             println!("  Finished {name} [{label}] -> {}", exe.display());
         }
+        if let Some(test_exe) = &out.test_executable {
+            println!("  Finished {name} [test] -> {}", test_exe.display());
+        }
     }
     Ok(())
 }
@@ -177,6 +196,7 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: true,
+        test_build: false,
         only: package,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
@@ -247,6 +267,7 @@ fn run_run(profile_kind: ProfileKind, package: Option<&str>, forwarded: &[String
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: false,
+        test_build: false,
         only: Some(&target_name),
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
