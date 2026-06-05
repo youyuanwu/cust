@@ -825,7 +825,12 @@ fn workspace_emits_cust_lock_at_root() {
     assert!(lock.is_file(), "missing {}", lock.display());
     let body = fs::read_to_string(&lock).unwrap();
     assert!(body.contains("lock_format_version = 1"), "{body}");
-    assert!(body.contains("workspace_root = "), "{body}");
+    // workspace_root is intentionally not recorded — the lock
+    // is location-independent (matches Cargo's `Cargo.lock`).
+    assert!(
+        !body.contains("workspace_root"),
+        "workspace_root leaked into lock:\n{body}"
+    );
     // Both members appear.
     assert!(body.contains("name = \"app\""), "{body}");
     assert!(body.contains("name = \"util\""), "{body}");

@@ -49,7 +49,6 @@ mtime not advancing when no graph change occurred.
 # v0.3: path deps only; no version pins or source hashes.
 
 lock_format_version = 1
-workspace_root = "/abs/path/to/workspace/at/lock/time"
 
 [[member]]
 name = "<package name>"
@@ -63,7 +62,13 @@ dependencies = ["<dep name>", "..."]
 | Key | Type | Required | Description |
 |---|---|---|---|
 | `lock_format_version` | integer | yes | Schema version. v1 in v0.3. Bumps only on non-additive change. |
-| `workspace_root` | string | yes | Absolute path of the workspace root at the time the lock was written. Used to detect moved-but-not-rebuilt workspaces in v0.4+ (v0.3 records but does not yet check). |
+
+The lock file is intentionally **location-independent**: no
+absolute workspace path is recorded. The file's *position on
+disk* (sibling to the workspace root's `Cust.toml`) identifies
+the workspace; embedding the path would only churn the file
+across clones and moves. This matches Cargo's `Cargo.lock`,
+which also records no workspace path.
 
 ### `[[member]]` array of tables
 
@@ -90,7 +95,6 @@ For the headline-outcome workspace in v0.3.md (`app` depending on
 # v0.3: path deps only; no version pins or source hashes.
 
 lock_format_version = 1
-workspace_root = "/home/user/my_project"
 
 [[member]]
 name = "app"

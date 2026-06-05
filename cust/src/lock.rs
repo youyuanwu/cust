@@ -16,7 +16,6 @@
 //!
 //! ```toml
 //! lock_format_version = 1
-//! workspace_root = "/abs/path/at/lock/time"
 //!
 //! [[member]]
 //! name = "app"
@@ -31,6 +30,11 @@
 //! path = "util"
 //! dependencies = []
 //! ```
+//!
+//! No `workspace_root` field is recorded: the lock lives at the
+//! workspace root by construction, so encoding the path would
+//! just churn the file across clones/moves without serving any
+//! functional purpose (matches Cargo's `Cargo.lock`).
 //!
 //! Members are written in **alphabetical order by name** rather
 //! than declaration order — so the on-disk content is independent
@@ -85,11 +89,6 @@ fn render(ws: &Workspace) -> String {
     out.push_str("# This file records the resolved workspace member graph.\n");
     out.push_str("# v0.3: path deps only; no version pins or source hashes.\n\n");
     let _ = writeln!(out, "lock_format_version = {LOCK_FORMAT_VERSION}");
-    let _ = writeln!(
-        out,
-        "workspace_root = {}",
-        toml_string(&ws.root.display().to_string())
-    );
 
     // Sort members alphabetically so the on-disk order is stable
     // across runs and independent of declaration order.
@@ -200,13 +199,26 @@ mod tests {
     }
 
     #[test]
-    fn render_has_format_version_and_workspace_root() {
+    fn render_has_format_version() {
         let tmp = tempfile::tempdir().unwrap();
         stage_workspace(tmp.path());
         let ws = Workspace::discover(tmp.path()).unwrap();
         let body = render(&ws);
         assert!(body.contains("lock_format_version = 1"), "{body}");
-        assert!(body.contains("workspace_root = \""), "{body}");
+    }
+
+    #[test]
+    fn render_omits_workspace_root() {
+        // Lock should be location-independent (matches Cargo's
+        // `Cargo.lock`): no absolute path embedded.
+        let tmp = tempfile::tempdir().unwrap();
+        stage_workspace(tmp.path());
+        let ws = Workspace::discover(tmp.path()).unwrap();
+        let body = render(&ws);
+        assert!(
+            !body.contains("workspace_root"),
+            "workspace_root leaked into lock:\n{body}"
+        );
     }
 
     #[test]
