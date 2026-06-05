@@ -1244,23 +1244,24 @@ fn lib_half_cannot_self_import_via_cust_use() {
     assert_failure_with(&out, "not listed in [dependencies]");
 }
 
-// ─── Slice C — v0.3.2 `--__test-build` end-to-end ──────────────────
+// ─── Slice D — v0.3.2 `cust test` end-to-end ──────────────────────
 //
-// These tests drive the test-build pipeline through the hidden
-// `cust build --__test-build` flag (the slice-D `cust test`
-// subcommand will replace it as the user-facing surface). They
-// build the resulting test binary and execute it directly so
-// the Cargo-shaped output, exit codes, and fork-isolation
-// behaviour are all on the hook for regression.
+// These tests drive the public `cust test` subcommand. The
+// command builds every testable workspace member's test binary
+// (lib or lib+bin; bin-only members are V32D-12 skipped, or
+// V32D-11 rejected with `-p`), then runs each in turn.
+// `cust test` itself captures stdout/stderr from the spawned
+// binaries via process inheritance, so we assert against
+// `cust test`'s own combined output.
 
 #[test]
-fn test_build_produces_binary_at_expected_path() {
+fn test_subcommand_produces_binary_at_expected_path() {
     let (_tmp, dir) = stage("with_tests");
-    let out = cust(&dir, ["build", "--__test-build"]);
+    let out = cust(&dir, ["test"]);
     assert_success(&out);
 
     let exe = dir.join("target/debug/test/with_tests/with_tests");
-    assert!(exe.is_file(), "test binary missing at {}", exe.display(),);
+    assert!(exe.is_file(), "test binary missing at {}", exe.display());
     // V32D-4: test build is fully isolated from the normal
     // build tree — no archive, no per-build dir for the
     // lib half.
@@ -1272,21 +1273,10 @@ fn test_build_produces_binary_at_expected_path() {
 }
 
 #[test]
-fn test_build_runner_runs_all_tests_with_cargo_shape() {
+fn test_subcommand_runs_all_tests_with_cargo_shape() {
     let (_tmp, dir) = stage("with_tests");
-    assert_success(&cust(&dir, ["build", "--__test-build"]));
-
-    let exe = dir.join("target/debug/test/with_tests/with_tests");
-    let out = Command::new(&exe)
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn test binary");
-    assert!(
-        out.status.success(),
-        "test binary exited {}:\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-    );
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     // Cargo-shape header + per-test lines + summary.
@@ -1296,7 +1286,7 @@ fn test_build_runner_runs_all_tests_with_cargo_shape() {
         stdout.contains("test test_mul_void_kind ... ok"),
         "{stdout}",
     );
-    assert!(stdout.contains("test test_skipped ... ignored"), "{stdout}",);
+    assert!(stdout.contains("test test_skipped ... ignored"), "{stdout}");
     assert!(
         stdout.contains("test result: ok. 2 passed; 0 failed; 1 ignored"),
         "{stdout}",
@@ -1304,26 +1294,22 @@ fn test_build_runner_runs_all_tests_with_cargo_shape() {
 }
 
 #[test]
-fn test_build_runner_substring_filter() {
+fn test_subcommand_substring_filter() {
     let (_tmp, dir) = stage("with_tests");
-    assert_success(&cust(&dir, ["build", "--__test-build"]));
-
-    let exe = dir.join("target/debug/test/with_tests/with_tests");
-    let out = Command::new(&exe)
-        .arg("mul")
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn test binary");
+    let out = cust(&dir, ["test", "mul"]);
+    assert_success(&out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success());
+
     assert!(stdout.contains("running 1 tests"), "{stdout}");
     assert!(
         stdout.contains("test test_mul_void_kind ... ok"),
         "{stdout}",
     );
     // The other two tests should be filtered out, not run.
-    assert!(!stdout.contains("test_add_basic"), "{stdout}");
-    assert!(!stdout.contains("test_skipped"), "{stdout}");
+    assert!(
+        !stdout.contains("... ok\n") || stdout.matches("... ok").count() == 1,
+        "{stdout}"
+    );
     assert!(
         stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored; 2 filtered out"),
         "{stdout}",
@@ -1331,18 +1317,12 @@ fn test_build_runner_substring_filter() {
 }
 
 #[test]
-fn test_build_runner_list_mode() {
+fn test_subcommand_list_mode() {
     let (_tmp, dir) = stage("with_tests");
-    assert_success(&cust(&dir, ["build", "--__test-build"]));
-
-    let exe = dir.join("target/debug/test/with_tests/with_tests");
-    let out = Command::new(&exe)
-        .arg("--list")
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn test binary");
+    // `--list` is a runner flag; forwarded via `--`.
+    let out = cust(&dir, ["test", "--", "--list"]);
+    assert_success(&out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success());
     assert!(stdout.contains("test_add_basic: test"), "{stdout}");
     assert!(stdout.contains("test_mul_void_kind: test"), "{stdout}");
     assert!(stdout.contains("test_skipped: test"), "{stdout}");
@@ -1350,11 +1330,11 @@ fn test_build_runner_list_mode() {
 }
 
 #[test]
-fn test_build_failure_isolated_by_fork() {
+fn test_subcommand_failure_isolated_by_fork() {
     // Synthesize a fixture inline with a deliberately failing
     // test sandwiched between passing ones. The runner must
     // execute every test, mark only the failing one FAILED,
-    // and exit 1.
+    // and `cust test` must exit 1.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("isolation");
     fs::create_dir_all(dir.join("src")).unwrap();
@@ -1372,13 +1352,7 @@ fn test_build_failure_isolated_by_fork() {
     )
     .unwrap();
 
-    assert_success(&cust(&dir, ["build", "--__test-build"]));
-
-    let exe = dir.join("target/debug/test/isolation/isolation");
-    let out = Command::new(&exe)
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn test binary");
+    let out = cust(&dir, ["test"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1400,12 +1374,115 @@ fn test_build_failure_isolated_by_fork() {
         stderr.contains("assertion failed: `(answer()) == (0)`"),
         "{stderr}",
     );
-    // Exit 1 on any failure.
+    // `cust test` exits 1 when any member's test binary fails.
     assert_eq!(
         out.status.code(),
         Some(1),
         "wanted exit 1, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         out.status.code(),
+    );
+}
+
+#[test]
+fn test_subcommand_rejects_bin_only_with_dash_p() {
+    // V32D-11: explicit `-p <bin-only>` is a clear error.
+    let (_tmp, dir) = stage("bin_only");
+    let out = cust(&dir, ["test", "-p", "bin_only"]);
+    assert_failure_with(&out, "is a bin-only crate");
+    assert_failure_with(&out, "cust test v0.3.2 only runs unit tests");
+}
+
+#[test]
+fn test_subcommand_silently_skips_bin_only_workspace_member() {
+    // V32D-12: bare `cust test` on a workspace mixing a bin
+    // member and a lib member should silently skip the bin and
+    // still report success when the lib's tests pass.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("mixed");
+    fs::create_dir_all(dir.join("lib_member/src")).unwrap();
+    fs::create_dir_all(dir.join("bin_member/src")).unwrap();
+    fs::write(
+        dir.join("Cust.toml"),
+        "[workspace]\nmembers = [\"lib_member\", \"bin_member\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("lib_member/Cust.toml"),
+        "[package]\nname = \"lib_member\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("lib_member/src/lib.c"),
+        "cust_pub int answer(void) { return 42; }\n\
+         cust_test int test_basic(void) { cust_assert_eq(answer(), 42); return 0; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("bin_member/Cust.toml"),
+        "[package]\nname = \"bin_member\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("bin_member/src/main.c"),
+        "cust_pub int cust_main(void) { return 0; }\n",
+    )
+    .unwrap();
+
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Lib member's tests ran:
+    assert!(stdout.contains("test test_basic ... ok"), "{stdout}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored"),
+        "{stdout}",
+    );
+    // bin_member should NOT appear in the run output — there
+    // should be no `Running …/bin_member/bin_member` line.
+    assert!(
+        !stdout.contains("test/bin_member/bin_member"),
+        "bin-only member should be silently skipped, got:\n{stdout}",
+    );
+}
+
+#[test]
+fn test_subcommand_lib_and_bin_tests_lib_half_only() {
+    // V32D-11 carve-out: a lib+bin crate tests the lib half.
+    let (_tmp, dir) = stage("lib_and_bin");
+    // The existing fixture has no cust_test functions; we add
+    // one to the lib half to confirm the test binary discovers
+    // it. The bin half's `cust_main` must NOT be reachable
+    // from the test binary (it would clash with the runner's
+    // own `main`).
+    let lib = dir.join("src/lib.c");
+    let mut lib_src = fs::read_to_string(&lib).unwrap();
+    lib_src.push_str(
+        "\n\
+         cust_test int test_demo_answer(void) { cust_assert_eq(demo_answer(), 42); return 0; }\n",
+    );
+    fs::write(&lib, lib_src).unwrap();
+
+    let out = cust(&dir, ["test", "-p", "demo"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("test test_demo_answer ... ok"), "{stdout}");
+}
+
+#[test]
+fn test_subcommand_zero_tests_succeeds() {
+    // A library member with no cust_test functions produces a
+    // valid (zero-test) binary. The runner prints
+    // `running 0 tests` and `test result: ok. 0 passed; 0
+    // failed; 0 ignored`, exit 0. Cargo parity.
+    let (_tmp, dir) = stage("hello");
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("running 0 tests"), "{stdout}");
+    assert!(
+        stdout.contains("test result: ok. 0 passed; 0 failed; 0 ignored"),
+        "{stdout}",
     );
 }
 

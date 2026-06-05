@@ -1,5 +1,5 @@
-//! CLI surface. Six entry points: `build`, `check`, `clean`, `new`,
-//! `--version`, `--help`.
+//! CLI surface. Seven entry points: `build`, `check`, `run`,
+//! `test`, `clean`, `new`, `--version`, `--help`.
 
 use std::{
     env, fs,
@@ -33,6 +33,8 @@ pub enum Cmd {
     /// Build the crate's binary and run it. Arguments after `--`
     /// are forwarded as `argv` to the spawned executable.
     Run(RunArgs),
+    /// Build and run the crate's unit tests (v0.3.2).
+    Test(TestArgs),
     /// Remove the `target/` directory.
     Clean,
     /// Scaffold a new cust crate at `<path>`.
@@ -49,17 +51,6 @@ pub struct BuildArgs {
     /// member is built.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
-    /// **Hidden test seam.** Build the lib half of each
-    /// in-scope member through the v0.3.2 test pipeline
-    /// (`-DCUST_TEST_BUILD=1`, fresh `target/<profile>/test/<crate>/`
-    /// tree, generated runner TU, test binary at
-    /// `target/<profile>/test/<crate>/<crate>`). Bin-only members
-    /// are silently skipped. Slice C carries this flag so the
-    /// integration test can drive the pipeline end-to-end before
-    /// slice D promotes it to a real `cust test` subcommand.
-    /// Not part of the user-facing CLI surface.
-    #[arg(long = "__test-build", hide = true)]
-    pub test_build: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -95,6 +86,34 @@ pub struct RunArgs {
     pub forwarded: Vec<String>,
 }
 
+/// Arguments for `cust test` (v0.3.2 V32D-9 / V32D-10).
+///
+/// `cust test [-p <member>] [--release] [<filter>] [-- <runner-args>...]`
+/// builds every testable member's test binary (lib or lib+bin;
+/// bin-only members are skipped silently per V32D-12, unless
+/// `-p <bin-only>` is explicit per V32D-11) and runs each in
+/// turn. `<filter>` is forwarded as the first runner argv
+/// (substring match against `module::name`); everything after
+/// `--` is appended after that.
+#[derive(Debug, clap::Args)]
+pub struct TestArgs {
+    /// Build (and run) with the `release` profile.
+    #[arg(long)]
+    pub release: bool,
+    /// Restrict the test run to one workspace member. Bin-only
+    /// members named here are rejected with the V32D-11 error.
+    #[arg(short = 'p', long = "package")]
+    pub package: Option<String>,
+    /// Substring filter forwarded to the runner. Matches against
+    /// the runner's `module::name` qualified name (V32D-9).
+    pub filter: Option<String>,
+    /// Extra arguments forwarded to the runner after the filter.
+    /// `--list` is the only v0.3.2 runner flag; other names are
+    /// passed through for forward compatibility.
+    #[arg(last = true, allow_hyphen_values = true)]
+    pub forwarded: Vec<String>,
+}
+
 #[derive(Debug, clap::Args)]
 pub struct NewArgs {
     /// Where to place the new crate. The directory will be created
@@ -116,15 +135,17 @@ pub struct NewArgs {
 impl Cli {
     pub fn dispatch(self) -> Result<()> {
         match self.command {
-            Cmd::Build(args) => run_build(
-                profile_kind(args.release),
-                args.package.as_deref(),
-                args.test_build,
-            ),
+            Cmd::Build(args) => run_build(profile_kind(args.release), args.package.as_deref()),
             Cmd::Check(args) => run_check(profile_kind(args.release), args.package.as_deref()),
             Cmd::Run(args) => run_run(
                 profile_kind(args.release),
                 args.package.as_deref(),
+                &args.forwarded,
+            ),
+            Cmd::Test(args) => run_test(
+                profile_kind(args.release),
+                args.package.as_deref(),
+                args.filter.as_deref(),
                 &args.forwarded,
             ),
             Cmd::Clean => run_clean(),
@@ -149,7 +170,7 @@ fn locate(cwd: &Path) -> Result<Workspace> {
     Workspace::discover(cwd)
 }
 
-fn run_build(profile_kind: ProfileKind, package: Option<&str>, test_build: bool) -> Result<()> {
+fn run_build(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
@@ -160,7 +181,7 @@ fn run_build(profile_kind: ProfileKind, package: Option<&str>, test_build: bool)
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: false,
-        test_build,
+        test_build: false,
         only: package,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
@@ -177,9 +198,6 @@ fn run_build(profile_kind: ProfileKind, package: Option<&str>, test_build: bool)
         }
         if let Some(exe) = &out.executable {
             println!("  Finished {name} [{label}] -> {}", exe.display());
-        }
-        if let Some(test_exe) = &out.test_executable {
-            println!("  Finished {name} [test] -> {}", test_exe.display());
         }
     }
     Ok(())
@@ -325,6 +343,112 @@ fn run_run(profile_kind: ProfileKind, package: Option<&str>, forwarded: &[String
     }
     // Fallback.
     std::process::exit(1);
+}
+
+/// `cust test` — build every testable workspace member's test
+/// binary (lib or lib+bin; bin-only members are skipped per
+/// V32D-12, unless explicitly named via `-p` per V32D-11),
+/// then run each one in turn with `[filter] + forwarded` as
+/// argv.
+///
+/// Exit code: 0 if every test binary exited 0; 1 if any
+/// member's test binary exited non-zero. Bare `cust test` on
+/// a workspace with no testable members (only bin-only crates)
+/// exits 0 — that matches Cargo's behaviour ("0 tests" is not
+/// itself an error).
+fn run_test(
+    profile_kind: ProfileKind,
+    package: Option<&str>,
+    filter: Option<&str>,
+    forwarded: &[String],
+) -> Result<()> {
+    let cwd = env::current_dir().context("getting current directory")?;
+    let ws = locate(&cwd)?;
+
+    // V32D-11: explicit `-p <bin-only>` is an error before we
+    // build anything. Lib+bin is fine (we test the lib half).
+    if let Some(name) = package {
+        let m = ws.member(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown workspace member `{name}` — known: [{}]",
+                ws.members
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        if !m.kind.has_lib() {
+            anyhow::bail!(
+                "workspace member `{name}` is a bin-only crate; \
+                 cust test v0.3.2 only runs unit tests in library crates \
+                 (lib+bin members test their library half only)"
+            );
+        }
+    }
+
+    let clang = Clang::discover()?;
+    let plugin = crate::plugin::Plugin::discover();
+    let opts = WorkspaceBuildOptions {
+        profile_kind,
+        clang: &clang,
+        plugin: plugin.as_ref(),
+        syntax_only: false,
+        test_build: true,
+        only: package,
+    };
+    let outputs = workspace::build_workspace(&ws, &opts)?;
+
+    if let Some(p) = &plugin {
+        eprintln!("  Plugin   {}", p.path.display());
+    }
+    for (name, out) in &outputs.per_member {
+        if let Some(test_exe) = &out.test_executable {
+            println!("  Finished {name} [test] -> {}", test_exe.display());
+        }
+    }
+
+    // Run each test binary in turn. We honour the workspace
+    // build order (deps first), since a test depending on a
+    // sibling dep wants the dep's tests to have already passed
+    // anyway. Members without a test_executable (bin-only
+    // skipped per V32D-12) drop out here naturally.
+    let mut overall_failed = false;
+    for (name, out) in &outputs.per_member {
+        let Some(test_exe) = out.test_executable.as_deref() else {
+            continue;
+        };
+
+        println!("     Running {}", test_exe.display());
+
+        // argv = [filter?, forwarded...]. The runner parses
+        // `<filter>` as its single positional and treats every
+        // following non-flag token as either ignored or a
+        // future flag (V32D-10).
+        let mut child = std::process::Command::new(test_exe);
+        if let Some(f) = filter {
+            child.arg(f);
+        }
+        child.args(forwarded);
+
+        let status = child
+            .stdin(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("spawning `{}`", test_exe.display()))?;
+
+        if !status.success() {
+            overall_failed = true;
+            // Don't bail; keep running so the user sees every
+            // member's status in one pass (matches Cargo's
+            // `cargo test --workspace` behaviour).
+            eprintln!("error: test binary for `{name}` failed");
+        }
+    }
+
+    if overall_failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_clean() -> Result<()> {
