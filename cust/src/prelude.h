@@ -40,7 +40,60 @@
 #define cust_noreturn          _Noreturn
 
 /* Reserved for later plugin work: */
-/*   cust_test, cust_cfg, cust_feature, cust_derive, cust_no_panic */
+/*   cust_cfg, cust_feature, cust_derive, cust_no_panic */
+
+/* cust_test / cust_test_ignore: mark a unit-test function. v0.3.2
+ * discovers these via a driver pre-pass scanner (see
+ * docs/design/v0.3.2.md V32D-2); plugin v1 in v0.4 joins as a
+ * second discovery backend behind the same `__cust_tests[]`
+ * contract.
+ *
+ * In the test variant build (`cust test`, which injects
+ * `-DCUST_TEST_BUILD=1`) the macros expand to an annotate-only
+ * attribute so the plugin can spot them after macro expansion.
+ * In a normal `cust build` the macros expand to
+ * `__attribute__((unused)) static`, which keeps tests
+ * type-checked but excludes them from the public surface and
+ * from the resulting archive.
+ *
+ * Pre-pass scanner restriction: the marker, return type
+ * (`int` or `void`), and function name must all appear on the
+ * same source line. Cargo-style `cust_test\n  int foo(void)`
+ * is rejected by the v0.3.2 regex. Plugin v1 lifts this.
+ */
+#ifdef CUST_TEST_BUILD
+#  define cust_test            __attribute__((annotate("cust::test")))
+#  define cust_test_ignore     __attribute__((annotate("cust::test_ignore")))
+#else
+#  define cust_test            __attribute__((unused)) static
+#  define cust_test_ignore     __attribute__((unused)) static
+#endif
+
+/* cust_panic / cust_assert family: assertion macros usable from
+ * inside `cust_test` functions. They expand to no-ops outside a
+ * test build, so the prelude carries no link-time dependency on
+ * `cust_panic_impl` in normal builds. The runner TU (emitted by
+ * the driver as `target/<profile>/test/<crate>/cust_test_main.c`)
+ * defines `cust_panic_impl` to write `<msg>` + `at <file>:<line>`
+ * to stderr and call `_exit(101)` — Rust's `cargo test` exit code
+ * for an assertion failure.
+ */
+#ifdef CUST_TEST_BUILD
+_Noreturn void cust_panic_impl(const char *file, int line, const char *msg);
+#  define cust_panic(msg)         cust_panic_impl(__FILE__, __LINE__, (msg))
+#  define cust_assert(e)          ((e) ? (void)0 : cust_panic("assertion failed: " #e))
+#  define cust_assert_eq(a, b)                                              \
+        ((a) == (b) ? (void)0                                               \
+                    : cust_panic("assertion failed: `(" #a ") == (" #b ")`"))
+#  define cust_assert_ne(a, b)                                              \
+        ((a) != (b) ? (void)0                                               \
+                    : cust_panic("assertion failed: `(" #a ") != (" #b ")`"))
+#else
+#  define cust_panic(msg)         ((void)(msg))
+#  define cust_assert(e)          ((void)0)
+#  define cust_assert_eq(a, b)    ((void)(sizeof((a) == (b))))
+#  define cust_assert_ne(a, b)    ((void)(sizeof((a) != (b))))
+#endif
 
 /* cust_main: bin-crate entry point. Aliased to `main` so the user
  * can write `int cust_main(void) { ... }` and the C runtime sees
