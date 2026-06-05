@@ -30,4 +30,12 @@
 /* Reserved for later plugin work: */
 /*   cust_test, cust_cfg, cust_feature, cust_derive, cust_no_panic */
 
+/* cust_main: bin-crate entry point. Aliased to `main` so the user
+ * can write `int cust_main(void) { ... }` and the C runtime sees
+ * `main`. This is a plain alias today; a future cust runtime
+ * (panic install, signal handling, argv normalisation) may grow
+ * a real `main` that calls `cust_main` from inside.
+ */
+#define cust_main              main
+
 #endif /* CUST_PRELUDE_H */

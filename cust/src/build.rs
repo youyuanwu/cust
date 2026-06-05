@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::{
     clang::Clang,
-    manifest::Manifest,
+    manifest::{CrateKind, Manifest},
     mod_scanner,
     modules::{self, Module},
     plugin::Plugin,
@@ -48,9 +48,9 @@ pub struct BuildPlan<'a> {
     /// crates.
     pub plugin: Option<&'a Plugin>,
     /// When `true`, every TU is compiled with `-fsyntax-only`
-    /// instead of producing an object, and no archive / version
-    /// stamp / `compile_commands.json` is written. This is what
-    /// `cust check` runs.
+    /// instead of producing an object, and no archive / executable
+    /// / version stamp / `compile_commands.json` is written.
+    /// This is what `cust check` runs.
     pub syntax_only: bool,
     /// Names of dep crates this consumer is allowed to import via
     /// `#cust use <name>;` (V3D-6). Validated against the
@@ -58,16 +58,32 @@ pub struct BuildPlan<'a> {
     /// declares no `[dependencies]`. The workspace orchestrator
     /// populates this from the resolved edge list.
     pub deps: &'a [&'a str],
+    /// Transitive dep names whose archives must be linked into
+    /// this crate's executable (v0.3.1). For lib-only crates this
+    /// is unused. Workspace orchestrator computes this in topo
+    /// order; for non-workspace single-crate builds it's empty.
+    pub link_deps: &'a [&'a str],
+    /// What this crate produces (lib / bin / lib+bin). Computed
+    /// by `Manifest::resolve_kind` at the workspace orchestrator
+    /// (or CLI) layer.
+    pub kind: CrateKind,
 }
 
 /// Outputs `cust build` writes. `objects` and `compile_commands`
 /// are reported back so callers can plumb them into future tooling
-/// (e.g. `cust test`); only `archive` is printed today.
+/// (e.g. `cust test`); `archive` and `executable` are what the
+/// CLI prints in the `Finished` line.
 #[derive(Debug)]
 pub struct BuildOutputs {
     #[allow(dead_code)]
     pub objects: Vec<PathBuf>,
-    pub archive: PathBuf,
+    /// `Some` when the crate has a lib component (`Lib` or
+    /// `LibAndBin`); `None` for bin-only crates.
+    pub archive: Option<PathBuf>,
+    /// `Some` when the crate has a bin component (`Bin` or
+    /// `LibAndBin`) and the build was not `syntax_only`; `None`
+    /// otherwise.
+    pub executable: Option<PathBuf>,
     #[allow(dead_code)]
     pub compile_commands: PathBuf,
 }
@@ -79,6 +95,7 @@ struct CompileEntry {
     arguments: Vec<String>,
 }
 
+#[allow(clippy::too_many_lines)] // staged lib+bin pipeline; splitting further hurts readability more than it helps
 pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     // Step 2: resolve profile.
     let profile_override = match plan.profile_kind {
@@ -94,78 +111,202 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     let prelude_path = layout.prelude_path();
     materialise_prelude(&prelude_path)?;
 
-    // Step 4: discover modules.
-    let root_source = plan.manifest.lib_source(plan.crate_root);
-    if !root_source.is_file() {
-        bail!(
-            "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
-            root_source.display()
-        );
-    }
-    let modules =
-        modules::discover(plan.crate_root, &root_source).context("discovering module graph")?;
-
     let crate_name = plan.manifest.package_name();
-    let crate_build_dir = layout.profile_root.join("build").join(crate_name);
+    let crate_build_dir = layout.build_dir(crate_name);
     fs::create_dir_all(&crate_build_dir)
         .with_context(|| format!("creating `{}`", crate_build_dir.display()))?;
 
-    // Step 5a: surface-extraction pass. When the plugin is loaded
-    // and at least one module imports another, we need fragment
-    // headers to exist before the codegen pass — otherwise the
-    // importer would compile against missing forward declarations.
-    // Run clang with -fsyntax-only so the plugin emits fragments
-    // without paying for codegen; tolerate parse errors caused by
-    // unresolved cross-module references, since they're exactly
-    // what the codegen pass will fix.
-    let needs_surface_pass = plan.plugin.is_some() && modules.iter().any(|m| !m.imports.is_empty());
-    if needs_surface_pass {
-        surface_pass(
+    // Combined compile_commands.json entries from both halves
+    // (lib first, then bin). Two entries per module: one for the
+    // rewritten file we actually compiled, one for the original
+    // source clangd will open.
+    let mut compile_entries: Vec<CompileEntry> = Vec::new();
+    let mut all_objects: Vec<PathBuf> = Vec::new();
+
+    // ─── Lib half ───────────────────────────────────────────────
+    //
+    // Produces objects, an archive, and the concatenated crate
+    // header. Skipped for bin-only crates.
+    let mut archive_path: Option<PathBuf> = None;
+    if let Some(lib_src) = plan.kind.lib_source() {
+        if !lib_src.is_file() {
+            bail!(
+                "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
+                lib_src.display()
+            );
+        }
+        let lib_modules =
+            modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
+
+        // Surface-extraction pass for cross-module fragment
+        // headers, only relevant for the lib half (the bin half
+        // doesn't publish fragments).
+        let needs_surface_pass =
+            plan.plugin.is_some() && lib_modules.iter().any(|m| !m.imports.is_empty());
+        if needs_surface_pass {
+            surface_pass(
+                plan,
+                &profile,
+                &prelude_path,
+                &crate_build_dir,
+                &layout,
+                &lib_modules,
+            )?;
+        }
+
+        let objects = compile_tree(
             plan,
             &profile,
             &prelude_path,
             &crate_build_dir,
             &layout,
-            &modules,
+            &lib_modules,
+            /* emit_fragments = */ true,
+            /* extra_includes = */ &[],
+            &mut compile_entries,
         )?;
+
+        if !plan.syntax_only {
+            // v0.3 (workspaces) archive location:
+            // `target/<profile>/build/<crate>/lib<crate>.a` so
+            // per-member outputs don't collide. The dep-view
+            // symlink (V3D-5) exposes this to consumers.
+            let archive = crate_build_dir.join(format!("lib{crate_name}.a"));
+            archive_objects(&objects, &archive)?;
+            archive_path = Some(archive);
+        }
+        all_objects.extend(objects);
+
+        // Concatenate fragment headers into the user-facing crate
+        // header (cust-design.md §5). Runs in *both* build and
+        // check mode so downstream workspace members can resolve
+        // upstream `#cust use <name>;` includes during their own
+        // check pass. Only emit when fragments actually exist
+        // (plugin was loaded).
+        if plan.plugin.is_some() {
+            write_crate_header(&layout, crate_name, &lib_modules)?;
+        }
     }
 
-    // Step 5b: per-TU codegen.
-    let mut objects: Vec<PathBuf> = Vec::with_capacity(modules.len());
-    // Two entries per module: one for the rewritten file (what
-    // clang actually compiled) and one paired entry pointing at
-    // the user's original source with the same flags but the file
-    // path swapped. clangd picks whichever matches the file the
-    // editor opened — so editing src/lib.c sees the real flags,
-    // not the default fallback set.
-    let mut compile_entries: Vec<CompileEntry> = Vec::with_capacity(modules.len() * 2);
+    // ─── Bin half ───────────────────────────────────────────────
+    //
+    // Produces objects and an executable at
+    // `target/<profile>/<crate-name>` (V31D-4). For lib+bin
+    // crates the bin compile is given `-I<lib-include-dir>` so
+    // `main.c` can `#include "<crate>.h"` to reach the lib's
+    // exported surface. The bin half does NOT emit fragment
+    // headers (bins have no downstream consumers).
+    let mut executable: Option<PathBuf> = None;
+    if let Some(bin_src) = plan.kind.bin_source() {
+        if !bin_src.is_file() {
+            bail!(
+                "binary source `{}` not found (set `[[bin]] path` in Cust.toml to override)",
+                bin_src.display()
+            );
+        }
+        let bin_modules =
+            modules::discover(plan.crate_root, bin_src).context("discovering bin module graph")?;
 
-    for m in &modules {
-        let fragment_path = plan
-            .plugin
-            .map(|_| layout.fragment_path(crate_name, &m.qualified_name));
-        let (rewritten_path, object_path, cflags) = compile_one_module(
+        // Extra include so the bin can reach the lib's
+        // concatenated public header at `<name>.h`.
+        let lib_include_dir = layout
+            .crate_header_path(crate_name)
+            .parent()
+            .map(Path::to_path_buf);
+        let extra_includes: Vec<&Path> = lib_include_dir
+            .as_deref()
+            .filter(|_| plan.kind.has_lib())
+            .into_iter()
+            .collect();
+
+        let objects = compile_tree(
             plan,
             &profile,
             &prelude_path,
             &crate_build_dir,
             &layout,
+            &bin_modules,
+            /* emit_fragments = */ false,
+            &extra_includes,
+            &mut compile_entries,
+        )?;
+
+        if !plan.syntax_only {
+            let exe_path = layout.profile_root.join(crate_name);
+            link_executable(
+                plan,
+                &profile,
+                &objects,
+                archive_path.as_deref(),
+                &layout,
+                &exe_path,
+            )?;
+            executable = Some(exe_path);
+        }
+        all_objects.extend(objects);
+    }
+
+    // Step 7 + 8: compile_commands.json + version stamp. Always
+    // at `target/`, never per-profile.
+    let cc_path = layout.target_root.join("compile_commands.json");
+    if !plan.syntax_only {
+        write_compile_commands(&cc_path, &compile_entries)?;
+        write_version_stamp(&layout.target_root.join(".cust-version"), plan.clang)?;
+    }
+
+    Ok(BuildOutputs {
+        objects: all_objects,
+        archive: archive_path,
+        executable,
+        compile_commands: cc_path,
+    })
+}
+
+/// Compile a tree of modules into `.o` files, threading
+/// `compile_commands.json` entries through `compile_entries`.
+/// `emit_fragments = true` makes the plugin write per-module
+/// fragment headers (lib half); `false` skips that (bin half).
+/// `extra_includes` is prepended to clang's `-I` set so per-half
+/// concerns (e.g. bin → lib include dir) propagate.
+#[allow(clippy::too_many_arguments)] // tightly coupled to compile_one_module's surface
+fn compile_tree(
+    plan: &BuildPlan<'_>,
+    profile: &ResolvedProfile,
+    prelude: &Path,
+    crate_build_dir: &Path,
+    layout: &TargetLayout,
+    modules: &[Module],
+    emit_fragments: bool,
+    extra_includes: &[&Path],
+    compile_entries: &mut Vec<CompileEntry>,
+) -> Result<Vec<PathBuf>> {
+    let crate_name = plan.manifest.package_name();
+    let mut objects: Vec<PathBuf> = Vec::with_capacity(modules.len());
+
+    for m in modules {
+        let fragment_path = if emit_fragments && plan.plugin.is_some() {
+            Some(layout.fragment_path(crate_name, &m.qualified_name))
+        } else {
+            None
+        };
+        let (rewritten_path, object_path, cflags) = compile_one_module(
+            plan,
+            profile,
+            prelude,
+            crate_build_dir,
+            layout,
             fragment_path.as_deref(),
+            extra_includes,
             m,
         )?;
         objects.push(object_path);
 
-        // Entry 1: the rewritten file (matches what we actually
-        // ran). Source argument at the tail is the rewritten path.
         compile_entries.push(CompileEntry {
             directory: plan.crate_root.to_path_buf(),
             file: rewritten_path.clone(),
             arguments: argv_with_clang(plan, &cflags),
         });
 
-        // Entry 2: the original source. Swap the trailing source-
-        // file arg for the user's source path so clangd sees the
-        // right file when it parses this entry.
         let original_args = swap_source_arg(
             &argv_with_clang(plan, &cflags),
             &rewritten_path,
@@ -178,48 +319,10 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
         });
     }
 
-    // Step 6: archive.
-    // Step 6: archive. Skipped in syntax-only mode; the caller
-    // gets a stub `archive` path back so the BuildOutputs shape
-    // stays uniform.
-    //
-    // v0.3 (workspaces): archive lives at
-    // `target/<profile>/build/<crate>/lib<crate>.a` so per-member
-    // outputs don't collide. The v0.1/v0.2 spec location
-    // (`target/<profile>/lib<name>.a`) is no longer used; the
-    // workspace orchestrator publishes a stable `deps/<name>`
-    // symlink for cross-crate access (V3D-5).
-    let archive_path = crate_build_dir.join(format!("lib{crate_name}.a"));
-    let cc_path = layout.target_root.join("compile_commands.json");
-    if !plan.syntax_only {
-        archive_objects(&objects, &archive_path)?;
-
-        // Step 7: compile_commands.json (always at `target/`, never
-        // per-profile — pinned by the v0.1 layout block).
-        write_compile_commands(&cc_path, &compile_entries)?;
-
-        // Step 8: stamp .cust-version.
-        write_version_stamp(&layout.target_root.join(".cust-version"), plan.clang)?;
-    }
-
-    // Step 9: concatenate per-module fragment headers into the
-    // user-facing crate header (cust-design.md §5). Runs in
-    // *both* build and check mode so downstream workspace members
-    // can resolve upstream `#cust use <name>;` includes during
-    // their own check pass. Only emit when fragments actually
-    // exist (plugin was loaded); otherwise the include/<crate>.h
-    // would be empty.
-    if plan.plugin.is_some() {
-        write_crate_header(&layout, crate_name, &modules)?;
-    }
-
-    Ok(BuildOutputs {
-        objects,
-        archive: archive_path,
-        compile_commands: cc_path,
-    })
+    Ok(objects)
 }
 
+#[allow(clippy::too_many_arguments)] // tightly coupled to the per-TU pipeline; passing a struct would just move the same fields
 fn compile_one_module(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -227,6 +330,7 @@ fn compile_one_module(
     crate_build_dir: &Path,
     layout: &TargetLayout,
     fragment_out: Option<&Path>,
+    extra_includes: &[&Path],
     m: &Module,
 ) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     // Read + scan + rewrite. We always rewrite (even when the
@@ -308,15 +412,21 @@ fn compile_one_module(
     // Honour `#include "x.h"` from the *original* source location —
     // the rewritten file lives in `target/`, so without -I clang
     // resolves relative includes against `target/` rather than the
-    // user's source layout.
+    // user's source layout. `extra_includes` (lib+bin case: the
+    // lib's include dir) is prepended ahead of the original-dir
+    // include so `#include "<crate>.h"` from main.c hits the lib
+    // header rather than any same-named file in the source dir.
     let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
+    let mut includes: Vec<&Path> = Vec::with_capacity(extra_includes.len() + 1);
+    includes.extend(extra_includes.iter().copied());
+    includes.push(original_dir);
     let mut cflags = build_cflags(
         plan,
         profile,
         prelude,
         &rewritten_path,
         &object_path,
-        Some(original_dir),
+        &includes,
         fragment_out,
     );
 
@@ -400,13 +510,14 @@ fn surface_pass(
         // cross-module references in this pass don't stop the
         // plugin from running.
         let dummy_obj = crate_build_dir.join(format!("{}.surface.o", m.qualified_name));
+        let includes: [&Path; 1] = [original_dir];
         let mut cflags = build_cflags(
             plan,
             profile,
             prelude,
             &surface_path,
             &dummy_obj,
-            Some(original_dir),
+            &includes,
             Some(&fragment_path),
         );
         // Strip trailing `-c -o <obj> <src>` (4 args), replace
@@ -445,21 +556,21 @@ fn surface_pass(
     Ok(())
 }
 
-/// Build the clang argv for a single TU. `extra_include` (when
-/// `Some`) becomes `-I<dir>` immediately before the prelude
-/// `-include` so per-module includes resolve against the original
-/// source layout even when we're compiling a rewritten copy from
-/// `target/`. `fragment_out` (when `Some` and a plugin is also
-/// configured) becomes
-/// `-fplugin-arg-cust-fragment-out=<path>` so the plugin emits a
-/// per-module fragment header.
+/// Build the clang argv for a single TU. `extra_includes` is a
+/// list of dirs that become `-I<dir>` flags before the prelude
+/// `-include`. For lib compiles this is the original source dir
+/// only; for bin compiles in a lib+bin crate it's the lib's
+/// include dir followed by the bin source dir.
+/// `fragment_out` (when `Some` and a plugin is also configured)
+/// becomes `-fplugin-arg-cust-fragment-out=<path>` so the plugin
+/// emits a per-module fragment header.
 pub fn build_cflags(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
     prelude: &Path,
     source: &Path,
     object: &Path,
-    extra_include: Option<&Path>,
+    extra_includes: &[&Path],
     fragment_out: Option<&Path>,
 ) -> Vec<String> {
     let mut flags: Vec<String> = Vec::new();
@@ -483,7 +594,7 @@ pub fn build_cflags(
             flags.push(format!("-fplugin-arg-cust-fragment-out={}", path.display()));
         }
     }
-    if let Some(dir) = extra_include {
+    for dir in extra_includes {
         flags.push(format!("-I{}", dir.display()));
     }
     flags.push("-include".to_string());
@@ -558,6 +669,79 @@ fn archive_objects(objects: &[PathBuf], archive: &Path) -> Result<()> {
         .with_context(|| format!("invoking `{}`", ar.to_string_lossy()))?;
     if !status.success() {
         bail!("{} exited with status {status}", ar.to_string_lossy());
+    }
+    Ok(())
+}
+
+/// Link a binary crate's executable from the bin half's objects,
+/// the lib half's own archive (when `own_archive` is `Some`), and
+/// every transitive dep archive listed in `plan.link_deps` (paths
+/// resolved through the workspace dep-view symlink farm).
+///
+/// Static archives are wrapped in `-Wl,--start-group` /
+/// `-Wl,--end-group` so the linker re-scans them as needed,
+/// sparing the v0.3.1 driver from computing strict link-time
+/// dependency order. `ThinLTO` across crates (v0.6) will revisit
+/// this once bitcode rlibs replace `.a` files.
+fn link_executable(
+    plan: &BuildPlan<'_>,
+    profile: &ResolvedProfile,
+    objects: &[PathBuf],
+    own_archive: Option<&Path>,
+    layout: &TargetLayout,
+    exe_path: &Path,
+) -> Result<()> {
+    let mut cmd = plan.clang.command();
+
+    // Profile-driven flags (debug/opt) propagate to the link line
+    // — they're harmless for `clang` driving the link step and
+    // match what Cargo does (link with the same `-O`/`-g` flags).
+    for f in profile.cflags() {
+        cmd.arg(f);
+    }
+    // User extra ldflags. cflags are intentionally NOT forwarded
+    // here — they're compile-only.
+    for f in &plan.manifest.clang.extra_ldflags {
+        cmd.arg(f);
+    }
+
+    cmd.arg("-o").arg(exe_path);
+
+    for o in objects {
+        cmd.arg(o);
+    }
+
+    // Group own archive + dep archives so the linker can re-scan.
+    let dep_archives: Vec<PathBuf> = plan
+        .link_deps
+        .iter()
+        .map(|dep| layout.dep_dir(dep).join(format!("lib{dep}.a")))
+        .collect();
+
+    let has_archives = own_archive.is_some() || !dep_archives.is_empty();
+    if has_archives {
+        cmd.arg("-Wl,--start-group");
+        if let Some(a) = own_archive {
+            cmd.arg(a);
+        }
+        for a in &dep_archives {
+            cmd.arg(a);
+        }
+        cmd.arg("-Wl,--end-group");
+    }
+
+    let status = cmd.stdin(Stdio::null()).status().with_context(|| {
+        format!(
+            "invoking `{}` to link `{}`",
+            plan.clang.path.display(),
+            exe_path.display()
+        )
+    })?;
+    if !status.success() {
+        bail!(
+            "clang link exited with status {status} for `{}`",
+            exe_path.display()
+        );
     }
     Ok(())
 }

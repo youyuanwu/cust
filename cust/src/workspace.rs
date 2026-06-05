@@ -570,9 +570,32 @@ pub fn build_workspace(
             .member(name)
             .expect("build_order returned a member not in ws");
 
+        // Resolve the crate kind from the filesystem. v0.3.1: a
+        // member may now be lib, bin, or lib+bin (V31D-1). This
+        // is fallible (it confirms the configured source file
+        // exists); we wrap with a member-level context for a
+        // clean diagnostic.
+        let kind = m
+            .manifest
+            .resolve_kind(&m.root)
+            .with_context(|| format!("member `{name}`"))?;
+
         // Materialise each member's deps as &str slices so
         // BuildPlan can borrow them.
         let dep_strs: Vec<&str> = m.deps.iter().map(String::as_str).collect();
+
+        // Transitive deps for the bin link step (v0.3.1). For
+        // lib-only members this is unused; we compute it
+        // unconditionally for uniformity, but it's cheap.
+        // The closure includes `m` itself; we filter it out so
+        // the linker only sees deps. `collect_transitive_deps`
+        // walks in arbitrary set order; we sort here so the
+        // link line is deterministic across runs.
+        let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        collect_transitive_deps(ws, m, &mut closure);
+        closure.remove(&m.name);
+        let link_deps_owned: Vec<String> = closure.into_iter().collect();
+        let link_deps: Vec<&str> = link_deps_owned.iter().map(String::as_str).collect();
 
         let plan = BuildPlan {
             manifest: &m.manifest,
@@ -583,6 +606,8 @@ pub fn build_workspace(
             plugin: opts.plugin,
             syntax_only: opts.syntax_only,
             deps: &dep_strs,
+            link_deps: &link_deps,
+            kind,
         };
         let outputs = build::run(&plan).with_context(|| format!("building member `{name}`"))?;
 
@@ -591,7 +616,9 @@ pub fn build_workspace(
         // both build and check mode — downstream members'
         // `#cust use <name>;` rewrites point at
         // `target/<profile>/deps/<name>/include/<name>.h`, which
-        // resolves through this symlink.
+        // resolves through this symlink. Bin-only members get a
+        // symlink too; it's harmless since (per V31D-6, enforced
+        // in Slice C) no one will resolve through it for a bin.
         refresh_dep_symlink(&layout, &m.name, &m.root)
             .with_context(|| format!("publishing dep view for `{name}`"))?;
 

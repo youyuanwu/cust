@@ -1,0 +1,3 @@
+[package]
+name    = "bin_only"
+version = "0.1.0"

@@ -487,10 +487,17 @@ impl Manifest {
         Ok(())
     }
 
-    /// Resolved path to the single TU we compile for this
-    /// crate's `cust build`. Relative paths in `[lib].path` are
-    /// resolved against `crate_root`. Callers must have already
-    /// confirmed the manifest is a package (see `require_package`).
+    /// Resolved path to the lib's root TU when this crate has
+    /// a library component. Honours `[lib] path` override.
+    /// Returns `crate_root.join("src/lib.c")` by default.
+    ///
+    /// Used to be the single source of truth for the build
+    /// pipeline's root; v0.3.1 superseded that with
+    /// `Manifest::resolve_kind` (which also handles bin and
+    /// lib+bin shapes). Retained as a small helper for callers
+    /// that *know* they want the lib-source-or-default path
+    /// without rejecting based on disk presence.
+    #[allow(dead_code)] // retained for symmetry with resolve_kind; expected to be consumed by v0.4 cust-test
     pub fn lib_source(&self, crate_root: &Path) -> PathBuf {
         let rel = self
             .lib

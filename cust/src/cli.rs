@@ -121,11 +121,15 @@ fn run_build(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
         eprintln!("  Plugin   {}", p.path.display());
     }
     for (name, out) in &outputs.per_member {
-        println!(
-            "  Finished {name} [{}] -> {}",
-            profile_kind.manifest_name(),
-            out.archive.display()
-        );
+        // v0.3.1: a member may produce an archive, an executable,
+        // or both. Print whatever was produced (in produce order).
+        let label = profile_kind.manifest_name();
+        if let Some(arch) = &out.archive {
+            println!("  Finished {name} [{label}] -> {}", arch.display());
+        }
+        if let Some(exe) = &out.executable {
+            println!("  Finished {name} [{label}] -> {}", exe.display());
+        }
     }
     Ok(())
 }
