@@ -1,0 +1,5 @@
+[package]
+name    = "lib_member"
+version = "0.1.0"
+[dependencies]
+bin_member = { path = "../bin_member" }

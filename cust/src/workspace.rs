@@ -34,7 +34,7 @@ use anyhow::{bail, Context, Result};
 use crate::{
     build::{self, BuildOutputs, BuildPlan},
     clang::Clang,
-    manifest::{Manifest, ManifestLocation, MANIFEST_FILE},
+    manifest::{CrateKind, Manifest, ManifestLocation, MANIFEST_FILE},
     plugin::Plugin,
     profile::ProfileKind,
     target_layout::TargetLayout,
@@ -49,6 +49,12 @@ pub struct Member {
     pub root: PathBuf,
     /// Loaded + validated manifest.
     pub manifest: Manifest,
+    /// What this member produces (lib / bin / lib+bin). Resolved
+    /// once at workspace construction via `Manifest::resolve_kind`
+    /// — enforces filesystem invariants (declared source files
+    /// exist) early, and lets `cust run` know which members are
+    /// runnable without re-walking the disk.
+    pub kind: CrateKind,
     /// `true` when this member is the workspace root itself
     /// (root-is-also-a-member shape). Otherwise the member is in
     /// a subdirectory listed in `[workspace] members`.
@@ -117,6 +123,7 @@ impl Workspace {
     /// Build a workspace from the `[workspace]`-bearing manifest
     /// at `loc`. The manifest has already been parsed +
     /// validated by `Manifest::load`.
+    #[allow(clippy::too_many_lines)] // member-staging + invariant checks read more clearly inline than split
     fn build(loc: &ManifestLocation, root_manifest: Manifest) -> Result<Self> {
         let root = loc
             .dir
@@ -144,10 +151,15 @@ impl Workspace {
         // Implicit root member (root-is-also-a-member shape).
         if root_manifest.is_package() {
             let pkg = root_manifest.require_package(&loc.path)?;
+            let manifest_clone = clone_manifest(&loc.path)?;
+            let kind = manifest_clone
+                .resolve_kind(&root)
+                .with_context(|| format!("member `{}`", pkg.name))?;
             let m = Member {
                 name: pkg.name.clone(),
                 root: root.clone(),
-                manifest: clone_manifest(&loc.path)?,
+                manifest: manifest_clone,
+                kind,
                 is_implicit_root: true,
                 deps: Vec::new(),
             };
@@ -199,10 +211,14 @@ impl Workspace {
             }
             seen_names.insert(pkg.name.clone(), canon.clone());
             seen_dirs.insert(canon.clone(), pkg.name.clone());
+            let kind = member_manifest
+                .resolve_kind(&canon)
+                .with_context(|| format!("member `{}`", pkg.name))?;
             members.push(Member {
                 name: pkg.name.clone(),
                 root: canon,
                 manifest: member_manifest,
+                kind,
                 is_implicit_root: false,
                 deps: Vec::new(),
             });
@@ -254,10 +270,15 @@ impl Workspace {
             );
         }
         let pkg = manifest.require_package(&loc.path)?;
+        let manifest_clone = clone_manifest(&loc.path)?;
+        let kind = manifest_clone
+            .resolve_kind(&root)
+            .with_context(|| format!("member `{}`", pkg.name))?;
         let member = Member {
             name: pkg.name.clone(),
             root: root.clone(),
-            manifest: clone_manifest(&loc.path)?,
+            manifest: manifest_clone,
+            kind,
             is_implicit_root: true,
             deps: Vec::new(),
         };
@@ -411,6 +432,22 @@ impl Workspace {
                          match",
                         spec.name,
                         spec.path
+                    );
+                }
+
+                // V31D-6 (v0.3.1): only library members may
+                // appear as dependencies. Bin-only members have
+                // no surface to import; bin-bin edges are
+                // disallowed for the same reason Cargo disallows
+                // them — if two bins want to share code, extract
+                // a lib member they both depend on.
+                let dep_kind = &self.members[*dep_idx].kind;
+                if !dep_kind.has_lib() {
+                    bail!(
+                        "workspace member `{dep_pkg_name}` (bin) cannot be a \
+                         dependency of `{consumer_name}` — only library \
+                         members may appear in [dependencies]\n  hint: \
+                         extract the shared code into a separate lib member"
                     );
                 }
 
@@ -570,15 +607,11 @@ pub fn build_workspace(
             .member(name)
             .expect("build_order returned a member not in ws");
 
-        // Resolve the crate kind from the filesystem. v0.3.1: a
-        // member may now be lib, bin, or lib+bin (V31D-1). This
-        // is fallible (it confirms the configured source file
-        // exists); we wrap with a member-level context for a
-        // clean diagnostic.
-        let kind = m
-            .manifest
-            .resolve_kind(&m.root)
-            .with_context(|| format!("member `{name}`"))?;
+        // Resolve the crate kind from the cached Member metadata.
+        // v0.3.1: a member may now be lib, bin, or lib+bin
+        // (V31D-1). Workspace::build computed this once at
+        // discovery; we just clone it here.
+        let kind = m.kind.clone();
 
         // Materialise each member's deps as &str slices so
         // BuildPlan can borrow them.

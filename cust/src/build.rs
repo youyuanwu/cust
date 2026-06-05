@@ -163,6 +163,7 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
             &lib_modules,
             /* emit_fragments = */ true,
             /* extra_includes = */ &[],
+            /* is_bin_half = */ false,
             &mut compile_entries,
         )?;
 
@@ -228,6 +229,7 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
             &bin_modules,
             /* emit_fragments = */ false,
             &extra_includes,
+            /* is_bin_half = */ true,
             &mut compile_entries,
         )?;
 
@@ -268,6 +270,10 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
 /// fragment headers (lib half); `false` skips that (bin half).
 /// `extra_includes` is prepended to clang's `-I` set so per-half
 /// concerns (e.g. bin → lib include dir) propagate.
+/// `is_bin_half` controls intra-crate self-import semantics:
+/// when `true`, `#cust use <own-package-name>;` is accepted as
+/// Cargo-style "bin reaches its own lib" and lowered to the
+/// crate's own lib include (Slice C, V31D-1 follow-up).
 #[allow(clippy::too_many_arguments)] // tightly coupled to compile_one_module's surface
 fn compile_tree(
     plan: &BuildPlan<'_>,
@@ -278,6 +284,7 @@ fn compile_tree(
     modules: &[Module],
     emit_fragments: bool,
     extra_includes: &[&Path],
+    is_bin_half: bool,
     compile_entries: &mut Vec<CompileEntry>,
 ) -> Result<Vec<PathBuf>> {
     let crate_name = plan.manifest.package_name();
@@ -297,6 +304,7 @@ fn compile_tree(
             layout,
             fragment_path.as_deref(),
             extra_includes,
+            is_bin_half,
             m,
         )?;
         objects.push(object_path);
@@ -331,6 +339,7 @@ fn compile_one_module(
     layout: &TargetLayout,
     fragment_out: Option<&Path>,
     extra_includes: &[&Path],
+    is_bin_half: bool,
     m: &Module,
 ) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     // Read + scan + rewrite. We always rewrite (even when the
@@ -349,7 +358,13 @@ fn compile_one_module(
     // an `#include` of the dep's public crate header. The dep is
     // looked up by name against `plan.deps`; an unknown name is
     // a hard error pointing the user at [dependencies].
+    //
+    // v0.3.1 (Cargo parity): in the bin half of a lib+bin crate,
+    // `#cust use <own-package-name>;` is also accepted and lowers
+    // to the crate's own concatenated lib header. This is the
+    // analogue of Rust's `use my_crate::*;` in src/main.rs.
     let crate_name = plan.manifest.package_name();
+    let own_lib_header = layout.crate_header_path(crate_name);
     let rewritten = mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| {
         match &d.kind {
             crate::mod_scanner::DirectiveKind::UseCrate { name } => {
@@ -357,10 +372,17 @@ fn compile_one_module(
                 Some(format!("#include \"{}\"", frag.display()))
             }
             crate::mod_scanner::DirectiveKind::UseDep { name } => {
-                // Validated below; if we substitute even when
-                // unknown the compiler error would point at a
-                // missing header. We do the check separately so
-                // the diagnostic is clean.
+                // Bin half importing own lib: point at the local
+                // crate header directly (no dep-symlink hop —
+                // single-crate non-workspace lib+bin has no
+                // symlink farm to resolve through).
+                if is_bin_half && plan.kind.has_lib() && name == crate_name {
+                    return Some(format!("#include \"{}\"", own_lib_header.display()));
+                }
+                // External dep: validated below; substitute even
+                // when unknown so the diagnostic block below has
+                // a chance to point at line:column rather than
+                // surface a missing-header compile error.
                 let dep_header = layout
                     .dep_dir(name)
                     .join("include")
@@ -371,12 +393,17 @@ fn compile_one_module(
         }
     });
 
-    // Validate every `#cust use <name>;` resolves to a declared
-    // dependency. We do this *after* the rewrite so the error
-    // message can include the line position, not after a
+    // Validate every `#cust use <name>;` resolves to either a
+    // declared dependency, or (bin half of lib+bin) the crate's
+    // own package name. We do this *after* the rewrite so the
+    // error message can include the line position, not after a
     // confusing compile failure.
     for d in &scan.directives {
         if let crate::mod_scanner::DirectiveKind::UseDep { name } = &d.kind {
+            // Cargo parity carve-out: bin half may use own name.
+            if is_bin_half && plan.kind.has_lib() && name == crate_name {
+                continue;
+            }
             if !plan.deps.iter().any(|n| n == name) {
                 bail!(
                     "{}:{}:{}: `#cust use {name};` refers to a crate not \

@@ -1,13 +1,14 @@
-//! `cust new <path> [--lib] [--name <name>]`.
+//! `cust new <path> [--lib | --bin] [--name <name>]`.
 //!
 //! Scaffolds a new cust crate at `<path>`. The directory may exist
 //! (e.g. a freshly `mkdir`-ed one) but must be empty, *or* must not
 //! exist yet — we refuse to clobber any file we did not create.
 //!
-//! In v0.2 only `--lib` (a staticlib crate) is supported. `--bin`
-//! waits for `cust run` and the binary target story.
+//! v0.2 supported only `--lib` (a staticlib crate). v0.3.1 adds
+//! `--bin` (V31D-11), defaulting to `--lib` when neither is
+//! passed.
 //!
-//! Generated layout:
+//! Generated layout (lib):
 //!
 //! ```text
 //! <path>/
@@ -15,6 +16,16 @@
 //! ├── Cust.toml         # [package] name + version = "0.1.0"
 //! └── src/
 //!     └── lib.c         # one cust_pub function so `cust build` works
+//! ```
+//!
+//! Generated layout (bin):
+//!
+//! ```text
+//! <path>/
+//! ├── .gitignore        # just `/target`
+//! ├── Cust.toml         # [package] name + version = "0.1.0"
+//! └── src/
+//!     └── main.c        # int cust_main(void) printing a greeting
 //! ```
 
 use std::{
@@ -34,14 +45,14 @@ pub struct NewPlan<'a> {
     /// Package name. If `None`, derived from the final path
     /// component.
     pub name: Option<&'a str>,
-    /// Only `Lib` in v0.2.
-    #[allow(dead_code)] // currently always `Lib`; field exists so `--bin` flip is non-breaking
+    /// `Lib` or `Bin` (v0.3.1).
     pub kind: CrateKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrateKind {
     Lib,
+    Bin,
 }
 
 /// Report what `cust new` actually wrote — handy for tests.
@@ -70,7 +81,10 @@ pub fn run(plan: &NewPlan<'_>) -> Result<NewOutputs> {
 
     let src_dir = root.join("src");
     fs::create_dir_all(&src_dir).with_context(|| format!("creating `{}`", src_dir.display()))?;
-    write_file_new(&src_dir.join("lib.c"), &lib_c(&name))?;
+    match plan.kind {
+        CrateKind::Lib => write_file_new(&src_dir.join("lib.c"), &lib_c(&name))?,
+        CrateKind::Bin => write_file_new(&src_dir.join("main.c"), &main_c(&name))?,
+    }
 
     Ok(NewOutputs { root, name })
 }
@@ -155,9 +169,23 @@ fn lib_c(name: &str) -> String {
     )
 }
 
+fn main_c(name: &str) -> String {
+    // cust_main aliases to main (see prelude.h). Keeps the
+    // cust_* naming consistent and leaves room for a future cust
+    // runtime that wraps main and calls cust_main from inside.
+    format!(
+        "#include <stdio.h>\n\
+         \n\
+         cust_pub int cust_main(void) {{\n    \
+             printf(\"hello from {name}\\n\");\n    \
+             return 0;\n\
+         }}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cust_toml, lib_c};
+    use super::{cust_toml, lib_c, main_c};
 
     #[test]
     fn cust_toml_contains_name_and_version() {
@@ -171,5 +199,13 @@ mod tests {
         let c = lib_c("my-crate");
         assert!(c.contains("my_crate_add"), "{c}");
         assert!(c.contains("cust_pub"), "{c}");
+    }
+
+    #[test]
+    fn main_c_uses_cust_main_and_greets_with_name() {
+        let c = main_c("greeter");
+        assert!(c.contains("cust_pub int cust_main"), "{c}");
+        assert!(c.contains("greeter"), "{c}");
+        assert!(c.contains("return 0;"), "{c}");
     }
 }

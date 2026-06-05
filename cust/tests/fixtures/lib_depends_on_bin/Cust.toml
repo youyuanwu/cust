@@ -1,0 +1,2 @@
+[workspace]
+members = ["bin_member", "lib_member"]
