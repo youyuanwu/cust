@@ -866,3 +866,65 @@ fn cust_check_does_not_touch_lock() {
     let mtime_after = fs::metadata(&lock).unwrap().modified().unwrap();
     assert_eq!(mtime_before, mtime_after, "cust check touched Cust.lock");
 }
+
+#[test]
+fn build_p_filters_to_member_and_transitive_deps() {
+    // Workspace has 3 members: util, app (-> util), extra.
+    // `cust build -p app` should build util and app but NOT extra.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_three");
+    let out = cust(&dir, ["build", "-p", "app"]);
+    assert_success(&out);
+    assert!(
+        dir.join("target/debug/build/util/libutil.a").is_file(),
+        "util not built"
+    );
+    assert!(
+        dir.join("target/debug/build/app/libapp.a").is_file(),
+        "app not built"
+    );
+    assert!(
+        !dir.join("target/debug/build/extra/libextra.a").exists(),
+        "extra should not have been built with -p app"
+    );
+}
+
+#[test]
+fn build_long_package_flag_works() {
+    // `--package` is the long form Cargo users will reach for.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_three");
+    let out = cust(&dir, ["build", "--package", "util"]);
+    assert_success(&out);
+    assert!(dir.join("target/debug/build/util/libutil.a").is_file());
+    assert!(!dir.join("target/debug/build/app/libapp.a").exists());
+    assert!(!dir.join("target/debug/build/extra/libextra.a").exists());
+}
+
+#[test]
+fn build_p_unknown_member_is_error() {
+    let (_tmp, dir) = stage("workspace_three");
+    let out = cust(&dir, ["build", "-p", "nope"]);
+    assert_failure_with(&out, "unknown workspace member `nope`");
+}
+
+#[test]
+fn check_p_filters_to_member_and_transitive_deps() {
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_three");
+    let out = cust(&dir, ["check", "-p", "app"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Checked util"), "{stdout}");
+    assert!(stdout.contains("Checked app"), "{stdout}");
+    assert!(!stdout.contains("Checked extra"), "{stdout}");
+}

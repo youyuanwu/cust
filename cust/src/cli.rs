@@ -41,6 +41,11 @@ pub struct BuildArgs {
     /// Build with the `release` profile.
     #[arg(long)]
     pub release: bool,
+    /// Restrict the build to one workspace member and its
+    /// transitive path dependencies. Without this flag every
+    /// member is built.
+    #[arg(short = 'p', long = "package")]
+    pub package: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -48,6 +53,11 @@ pub struct CheckArgs {
     /// Check with the `release` profile's flags.
     #[arg(long)]
     pub release: bool,
+    /// Restrict the check to one workspace member and its
+    /// transitive path dependencies. Without this flag every
+    /// member is checked.
+    #[arg(short = 'p', long = "package")]
+    pub package: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -68,8 +78,8 @@ pub struct NewArgs {
 impl Cli {
     pub fn dispatch(self) -> Result<()> {
         match self.command {
-            Cmd::Build(args) => run_build(profile_kind(args.release)),
-            Cmd::Check(args) => run_check(profile_kind(args.release)),
+            Cmd::Build(args) => run_build(profile_kind(args.release), args.package.as_deref()),
+            Cmd::Check(args) => run_check(profile_kind(args.release), args.package.as_deref()),
             Cmd::Clean => run_clean(),
             Cmd::New(args) => run_new(&args),
         }
@@ -92,7 +102,7 @@ fn locate(cwd: &Path) -> Result<Workspace> {
     Workspace::discover(cwd)
 }
 
-fn run_build(profile_kind: ProfileKind) -> Result<()> {
+fn run_build(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
@@ -103,7 +113,7 @@ fn run_build(profile_kind: ProfileKind) -> Result<()> {
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: false,
-        only: None,
+        only: package,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 
@@ -120,7 +130,7 @@ fn run_build(profile_kind: ProfileKind) -> Result<()> {
     Ok(())
 }
 
-fn run_check(profile_kind: ProfileKind) -> Result<()> {
+fn run_check(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
@@ -131,7 +141,7 @@ fn run_check(profile_kind: ProfileKind) -> Result<()> {
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: true,
-        only: None,
+        only: package,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
     for (name, _) in &outputs.per_member {
