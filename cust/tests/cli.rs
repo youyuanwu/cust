@@ -507,9 +507,23 @@ fn build_emits_concatenated_crate_header() {
     assert!(body.contains("#ifndef USE_CRATE_WORKS_H"), "{body}");
     assert!(body.contains("#define USE_CRATE_WORKS_H"), "{body}");
     assert!(body.contains("extern \"C\" {"), "{body}");
-    // Self-contained: pulls in stdint so consumers don't have
-    // to include <stdint.h> first.
-    assert!(body.contains("#include <stdint.h>"), "{body}");
+    // No `#include` injection: the generated crate header is
+    // pure declarations. Consumers that reach for system types
+    // (stdint.h / stddef.h / stdbool.h) must include them
+    // themselves, or the producing crate must export its own
+    // `cust_pub typedef`s (e.g. cstd's i32/usize aliases).
+    assert!(
+        !body.contains("#include <stdint.h>"),
+        "generated header injected <stdint.h>:\n{body}"
+    );
+    assert!(
+        !body.contains("#include <stddef.h>"),
+        "generated header injected <stddef.h>:\n{body}"
+    );
+    assert!(
+        !body.contains("#include <stdbool.h>"),
+        "generated header injected <stdbool.h>:\n{body}"
+    );
     // Both modules' public surfaces appear, each banner-tagged.
     assert!(body.contains("/* --- module `lib` --- */"), "{body}");
     assert!(body.contains("/* --- module `util` --- */"), "{body}");
@@ -524,10 +538,15 @@ fn build_emits_concatenated_crate_header() {
 
     // End-to-end: a non-cust consumer can #include the header,
     // link the archive, and the resulting binary actually runs.
+    // The crate header no longer injects <stdint.h>, so the
+    // consumer pulls it in itself before the cust header — this
+    // is exactly the new contract (cust-design.md §5: "No
+    // `#include` injection").
     let consumer_src = dir.join("consumer.c");
     fs::write(
         &consumer_src,
-        b"#include \"target/debug/build/use_crate_works/include/use_crate_works.h\"\n\
+        b"#include <stdint.h>\n\
+          #include \"target/debug/build/use_crate_works/include/use_crate_works.h\"\n\
           int main(void) { return use_crate_works_total() == 42 ? 0 : 1; }\n",
     )
     .unwrap();

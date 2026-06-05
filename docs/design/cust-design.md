@@ -402,6 +402,35 @@ for downstream consumers are produced on demand by:
   bundle alongside the `<crate>Config.cmake` artifacts.
 * `cust publish` — seals the header into the distributed crate.
 
+### No `#include` injection
+
+The generated crate header is **pure declarations**. cust does
+**not** inject `#include <stdint.h>`, `<stddef.h>`, `<stdbool.h>`,
+or any other system header into it. Consequence: if a crate's
+public surface mentions a type that lives in a system header
+(e.g. `int32_t`, `size_t`, `bool`), the crate must either
+
+1. export its own `cust_pub typedef` alias for that type — the
+   Cargo-parity pattern (`cstd` defines bare `i32`, `u64`,
+   `usize`, … as `cust_pub typedef`s, so a consumer that
+   `#cust use cstd;` reaches the aliases by name without
+   needing `<stdint.h>`), or
+2. accept that consumers must `#include <stdint.h>` themselves
+   before the `#cust use <crate>;` directive that lowers to
+   `#include "<crate>.h"`.
+
+Rationale: include injection silently couples every cust crate
+to libc, breaks the future `freestanding = true` profile
+(§16 OQ-8), and creates a hidden contract (consumers come to
+rely on the injected includes, then break when we remove
+them). Forcing the producer to be explicit about its surface
+types keeps the contract honest. Clang's `__INT32_TYPE__` /
+`__UINT64_TYPE__` / `__SIZE_TYPE__` builtin macros let a crate
+define type aliases without itself including `<stdint.h>` —
+the pretty-printer resolves them to the underlying primitive
+(`int`, `unsigned long`, …) when emitting the typedef into the
+fragment header.
+
 ---
 
 ## 6. Visibility & symbol hygiene
