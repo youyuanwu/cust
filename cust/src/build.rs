@@ -99,7 +99,7 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     let modules =
         modules::discover(plan.crate_root, &root_source).context("discovering module graph")?;
 
-    let crate_name = &plan.manifest.package.name;
+    let crate_name = plan.manifest.package_name();
     let crate_build_dir = layout.profile_root.join("build").join(crate_name);
     fs::create_dir_all(&crate_build_dir)
         .with_context(|| format!("creating `{}`", crate_build_dir.display()))?;
@@ -224,7 +224,7 @@ fn compile_one_module(
     // of X's fragment header so the compiler sees the imported
     // module's [[cust::pub]] surface. The surface pass (when run)
     // has already populated the fragments dir.
-    let crate_name = &plan.manifest.package.name;
+    let crate_name = plan.manifest.package_name();
     let rewritten = mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| {
         if let crate::mod_scanner::DirectiveKind::UseCrate { name } = &d.kind {
             let frag = layout.fragment_path(crate_name, name);
@@ -324,7 +324,7 @@ fn surface_pass(
     layout: &TargetLayout,
     modules: &[Module],
 ) -> Result<()> {
-    let crate_name = &plan.manifest.package.name;
+    let crate_name = plan.manifest.package_name();
     for m in modules {
         let src_text = fs::read_to_string(&m.source_path)
             .with_context(|| format!("reading `{}`", m.source_path.display()))?;

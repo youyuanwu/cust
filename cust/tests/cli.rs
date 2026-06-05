@@ -221,10 +221,25 @@ fn rejects_unknown_top_level_field() {
 
 #[test]
 fn rejects_populated_dependencies_section() {
+    // The fixture's manifest contains `something = "1.0"` (a bare
+    // version spec). v0.3 rejects this at parse time with a v0.4
+    // pointer: version specs are not in v0.3's scope.
     let (_tmp, dir) = stage("populated_deps");
     let out = cust(&dir, ["build"]);
-    assert_failure_with(&out, "`[dependencies]`");
-    assert_failure_with(&out, "not yet supported in cust v0.1");
+    assert_failure_with(&out, "version specs are v0.4+");
+    assert_failure_with(&out, "path");
+}
+
+#[test]
+fn rejects_path_dep_without_workspace() {
+    // A path-form dep in a single-crate (non-workspace) Cust.toml.
+    // Parses cleanly (V3D-3 shape is valid), then the CLI's
+    // locate() catches the missing [workspace] and points the
+    // user at adding one to a parent manifest.
+    let (_tmp, dir) = stage("path_dep_no_workspace");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "no enclosing [workspace]");
+    assert_failure_with(&out, "path dependencies require a [workspace]");
 }
 
 #[test]

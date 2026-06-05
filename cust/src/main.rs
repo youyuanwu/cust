@@ -17,6 +17,8 @@ mod new;
 mod plugin;
 mod profile;
 mod target_layout;
+#[allow(dead_code)] // Slice C will wire workspace orchestration into cli.rs
+mod workspace;
 
 use std::process::ExitCode;
 
