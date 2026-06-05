@@ -75,6 +75,34 @@ pub struct WorkspaceTable {
     pub members: Vec<String>,
 }
 
+/// One entry from `[dependencies]`, typed after validation.
+///
+/// v0.3 only carries path dependencies (V3D-3). `features`,
+/// `default-features`, and `optional` are parsed and surfaced
+/// for the v0.4 features-graph work; the v0.3 build pipeline
+/// ignores them (no feature evaluation yet).
+#[derive(Debug, Clone)]
+pub struct DepSpec {
+    /// The key under `[dependencies]` (e.g. `util` in
+    /// `util = { path = "../util" }`). This is the name the
+    /// consumer reaches the dep by — `#cust use <name>;`.
+    pub name: String,
+    /// Relative path string, exactly as written in the manifest.
+    /// Resolved by `crate::workspace` against the consumer's
+    /// directory.
+    pub path: String,
+    /// Requested features (v0.4 will evaluate these).
+    #[allow(dead_code)]
+    pub features: Vec<String>,
+    /// `false` if the manifest set `default-features = false`.
+    /// Defaults to `true`.
+    #[allow(dead_code)]
+    pub default_features: bool,
+    /// `optional = true` (v0.4 features-graph wires this).
+    #[allow(dead_code)]
+    pub optional: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // metadata fields parsed for strict-mode rejection; surfaced later
@@ -233,6 +261,56 @@ impl Manifest {
             .as_ref()
             .expect("build pipeline invoked on virtual workspace; cli::locate must filter")
             .name
+    }
+
+    /// Return the `[dependencies]` table as a list of typed
+    /// `DepSpec`s. The TOML shape was already validated by
+    /// `validate_dep_spec` during `load`, so the unwrap-ish
+    /// extraction below cannot fail in practice — any error
+    /// indicates a contract bug between `validate_dep_spec` and
+    /// this method, surfaced via `expect` rather than swallowed.
+    ///
+    /// The `path` field is **as written in the manifest** — a
+    /// relative string. Callers (typically `crate::workspace`)
+    /// resolve it against the manifest's directory.
+    pub fn dep_specs(&self) -> Vec<DepSpec> {
+        self.dependencies
+            .iter()
+            .map(|(name, value)| {
+                let table = value
+                    .as_table()
+                    .expect("validate_dep_spec ensures every dep is a table");
+                let path = table
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .expect("validate_dep_spec ensures `path` is a string")
+                    .to_string();
+                let features = table
+                    .get("features")
+                    .and_then(toml::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let default_features = table
+                    .get("default-features")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(true);
+                let optional = table
+                    .get("optional")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                DepSpec {
+                    name: name.clone(),
+                    path,
+                    features,
+                    default_features,
+                    optional,
+                }
+            })
+            .collect()
     }
 
     fn validate(&self, path: &Path) -> Result<()> {

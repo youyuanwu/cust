@@ -45,6 +45,10 @@ pub struct Member {
     /// (root-is-also-a-member shape). Otherwise the member is in
     /// a subdirectory listed in `[workspace] members`.
     pub is_implicit_root: bool,
+    /// Names of other members this member depends on, in
+    /// declaration order. Resolved by `Workspace::resolve_edges`
+    /// (V3D-4: every dep path must point at a sibling member).
+    pub deps: Vec<String>,
 }
 
 /// A resolved workspace.
@@ -134,6 +138,7 @@ impl Workspace {
                 root: root.clone(),
                 manifest: clone_manifest(&loc.path)?,
                 is_implicit_root: true,
+                deps: Vec::new(),
             };
             seen_names.insert(m.name.clone(), m.root.clone());
             seen_dirs.insert(m.root.clone(), m.name.clone());
@@ -188,6 +193,7 @@ impl Workspace {
                 root: canon,
                 manifest: member_manifest,
                 is_implicit_root: false,
+                deps: Vec::new(),
             });
         }
 
@@ -199,12 +205,14 @@ impl Workspace {
             );
         }
 
-        Ok(Self {
+        let mut ws = Self {
             root,
             root_manifest_path: loc.path.clone(),
             root_manifest,
             members,
-        })
+        };
+        ws.resolve_edges()?;
+        Ok(ws)
     }
 
     /// Build a single-crate "workspace" wrapper around a manifest
@@ -229,6 +237,7 @@ impl Workspace {
             root: root.clone(),
             manifest: clone_manifest(&loc.path)?,
             is_implicit_root: true,
+            deps: Vec::new(),
         };
         Ok(Self {
             root,
@@ -284,6 +293,116 @@ impl Workspace {
     /// (i.e. is not a single-crate degeneracy).
     pub const fn is_real_workspace(&self) -> bool {
         self.root_manifest.workspace.is_some()
+    }
+
+    /// For each member, resolve its `[dependencies]` paths
+    /// against the *member's own directory* and check that each
+    /// result is another member's root directory (V3D-4). Also
+    /// checks the dep `name` matches the resolved target's
+    /// `[package].name` — names rather than paths are what
+    /// `#cust use <name>;` keys off, so they must be consistent.
+    ///
+    /// Errors raised here:
+    ///
+    /// * path doesn't exist on disk
+    /// * path resolves outside the workspace
+    /// * path resolves to a directory that isn't a workspace
+    ///   member
+    /// * dep name doesn't match the resolved member's package
+    ///   name
+    /// * member depends on itself
+    /// * the consumer is a non-workspace single-crate degeneracy
+    ///   and has any deps (this case is also caught by
+    ///   `cli::locate`; we double-check here for robustness)
+    fn resolve_edges(&mut self) -> Result<()> {
+        // Build a lookup: canonicalised member root → (index, name).
+        // Members are uniquely-named (build() rejects dups).
+        let dir_to_member: BTreeMap<PathBuf, (usize, String)> = self
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.root.clone(), (i, m.name.clone())))
+            .collect();
+
+        for i in 0..self.members.len() {
+            // Take the member's deps out by value so we can mutate
+            // through `&mut self.members[i].deps` later without
+            // holding two borrows. Snapshot what we need first.
+            let (consumer_name, consumer_root, dep_specs) = {
+                let m = &self.members[i];
+                (m.name.clone(), m.root.clone(), m.manifest.dep_specs())
+            };
+
+            let mut resolved: Vec<String> = Vec::with_capacity(dep_specs.len());
+            for spec in &dep_specs {
+                let raw = consumer_root.join(&spec.path);
+                let canon = raw.canonicalize().with_context(|| {
+                    format!(
+                        "dependency `{}` of `{consumer_name}`: path `{}` \
+                         does not exist or is not accessible (resolved to `{}`)",
+                        spec.name,
+                        spec.path,
+                        raw.display()
+                    )
+                })?;
+
+                // V3D-4: must be inside the workspace root.
+                if !canon.starts_with(&self.root) {
+                    bail!(
+                        "dependency `{}` of `{consumer_name}` resolves to `{}` \
+                         which is not a workspace member; add it to [workspace] \
+                         members or move it inside the workspace tree",
+                        spec.name,
+                        canon.display()
+                    );
+                }
+
+                // V3D-4: must point at a known member directory.
+                let Some((dep_idx, dep_pkg_name)) = dir_to_member.get(&canon) else {
+                    bail!(
+                        "dependency `{}` of `{consumer_name}` resolves to `{}` \
+                         which is not a workspace member; add it to [workspace] \
+                         members",
+                        spec.name,
+                        canon.display()
+                    );
+                };
+
+                // Self-dep: a member depending on itself.
+                if *dep_idx == i {
+                    bail!(
+                        "member `{consumer_name}` depends on itself via `{}`",
+                        spec.name
+                    );
+                }
+
+                // Name consistency: the [dependencies] key must
+                // match the resolved member's [package].name.
+                // Otherwise `#cust use <spec.name>;` in the
+                // consumer would point at the wrong include file.
+                if &spec.name != dep_pkg_name {
+                    bail!(
+                        "dependency name mismatch: `{consumer_name}` declares \
+                         `{} = {{ path = \"{}\" }}` but that path resolves to \
+                         member `{dep_pkg_name}`; rename the dependency key to \
+                         match",
+                        spec.name,
+                        spec.path
+                    );
+                }
+
+                resolved.push(spec.name.clone());
+            }
+
+            self.members[i].deps = resolved;
+        }
+
+        Ok(())
+    }
+
+    /// Look up a member by name. `None` if absent.
+    pub fn member(&self, name: &str) -> Option<&Member> {
+        self.members.iter().find(|m| m.name == name)
     }
 }
 
@@ -461,5 +580,157 @@ mod tests {
 
         let e = format!("{:#}", Workspace::discover(root).unwrap_err());
         assert!(e.contains("duplicate member name `same`"), "{e}");
+    }
+
+    #[test]
+    fn path_dep_resolves_to_sibling_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            "[workspace]\nmembers = [\"app\", \"util\"]\n",
+        );
+        write(
+            root,
+            "app/Cust.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nutil = { path = \"../util\" }\n",
+        );
+        write(root, "app/src/lib.c", "int a = 1;\n");
+        write(
+            root,
+            "util/Cust.toml",
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "util/src/lib.c", "int u = 1;\n");
+
+        let ws = Workspace::discover(root).unwrap();
+        let app = ws.member("app").unwrap();
+        assert_eq!(app.deps, vec!["util".to_string()]);
+        let util = ws.member("util").unwrap();
+        assert!(util.deps.is_empty());
+    }
+
+    #[test]
+    fn path_dep_outside_workspace_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        // Workspace at outer/proj/, but app deps on outer/util/.
+        write(
+            outer,
+            "proj/Cust.toml",
+            "[workspace]\nmembers = [\"app\"]\n",
+        );
+        write(
+            outer,
+            "proj/app/Cust.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nutil = { path = \"../../util\" }\n",
+        );
+        write(outer, "proj/app/src/lib.c", "int a = 1;\n");
+        write(
+            outer,
+            "util/Cust.toml",
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        );
+        write(outer, "util/src/lib.c", "int u = 1;\n");
+
+        let e = format!(
+            "{:#}",
+            Workspace::discover(&outer.join("proj")).unwrap_err()
+        );
+        assert!(e.contains("not a workspace member"), "{e}");
+        assert!(e.contains("util"), "{e}");
+    }
+
+    #[test]
+    fn path_dep_to_non_member_inside_workspace_is_error() {
+        // helper/ exists under the workspace root but isn't listed
+        // as a member.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "Cust.toml", "[workspace]\nmembers = [\"app\"]\n");
+        write(
+            root,
+            "app/Cust.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nhelper = { path = \"../helper\" }\n",
+        );
+        write(root, "app/src/lib.c", "int a = 1;\n");
+        write(
+            root,
+            "helper/Cust.toml",
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "helper/src/lib.c", "int h = 1;\n");
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("not a workspace member"), "{e}");
+        assert!(e.contains("helper"), "{e}");
+    }
+
+    #[test]
+    fn path_dep_name_mismatch_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            "[workspace]\nmembers = [\"app\", \"util\"]\n",
+        );
+        write(
+            root,
+            "app/Cust.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\naliased = { path = \"../util\" }\n",
+        );
+        write(root, "app/src/lib.c", "int a = 1;\n");
+        write(
+            root,
+            "util/Cust.toml",
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "util/src/lib.c", "int u = 1;\n");
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("name mismatch"), "{e}");
+        assert!(e.contains("rename the dependency key"), "{e}");
+    }
+
+    #[test]
+    fn path_dep_self_loop_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "Cust.toml", "[workspace]\nmembers = [\"loner\"]\n");
+        write(
+            root,
+            "loner/Cust.toml",
+            "[package]\nname = \"loner\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nloner = { path = \".\" }\n",
+        );
+        write(root, "loner/src/lib.c", "int x = 1;\n");
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("depends on itself"), "{e}");
+    }
+
+    #[test]
+    fn path_dep_missing_on_disk_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "Cust.toml", "[workspace]\nmembers = [\"app\"]\n");
+        write(
+            root,
+            "app/Cust.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nutil = { path = \"../util\" }\n",
+        );
+        write(root, "app/src/lib.c", "int a = 1;\n");
+        // `../util` does not exist.
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("does not exist"), "{e}");
+        assert!(e.contains("util"), "{e}");
     }
 }
