@@ -713,15 +713,30 @@ driver‑side in‑process callbacks required):
    (§4 phase 1). The driver later concatenates the `[[cust::pub]]`
    subset across all modules into the crate header
    `target/<profile>/include/<crate>.h` (§5). Output channel: files.
-3. **Test discovery.** Collects `[[cust::test]]` functions and
-   serialises `(name, file, line, fn_ptr_symbol)` into a per‑TU
-   constructor that registers the test with the cust runtime test
-   registry. (Earlier drafts of this doc proposed an
-   `__attribute__((section("cust_tests")))` table; we switched to
-   ctor‑based registration because section layout varies by object
-   format — ELF / Mach‑O / COFF / wasm — and LTO is prone to dropping
-   "unused" section data.) Output channel: emitted C, compiled into
-   the test binary.
+3. **Test discovery.** Collects `[[cust::test]]` / `cust_test`
+   functions and serialises them into a static
+   `__cust_tests[]` table emitted into the per‑crate generated
+   runner TU (`cust_test_main.c`), one entry per discovered
+   test (`(qname, fn_ptr, fn_kind, ignored, file, line)`).
+   The runner's `main` iterates the table and forks per test
+   (§11). Two backends sit behind this same table contract:
+   * **Driver pre‑pass** (shipped in v0.3.2) — a line‑oriented
+     regex scanner over module sources. Restrictions: the
+     marker, return type (`int` or `void`), and function name
+     must all appear on one source line. Lives forever as the
+     `cust check --no-plugin` discovery path (§9 fallback).
+     See [v0.3.2.md](v0.3.2.md) V32D‑2 for the full contract.
+   * **Plugin v1** (v0.4) — walks the AST, no single‑line
+     restriction, recognises both the `cust_test` macro and
+     the `[[cust::test]]` attribute spelling. Joins as a
+     second backend; the pre‑pass stays in tree.
+   Earlier drafts of this paragraph proposed ctor‑based
+   registration as a workaround for section‑layout instability
+   across object formats; the static‑table emission both
+   backends use today sidesteps that problem entirely (driver
+   or plugin already knows the full test list at TU generation
+   time, no runtime registration required).
+   Output channel: emitted C, compiled into the test binary.
 4. **Derive‑style codegen.** For `[[cust::derive(...)]]`, the plugin
    appends new top‑level decls (e.g. `T_eq`, `T_hash`, `T_debug`) to
    the AST before codegen. Strictly additive: never mutates user code.
@@ -797,6 +812,42 @@ and code generators run via `build.cust.c`.
 * `cust test --doc` (later) compiles `///` code blocks from doc
   comments as standalone TUs, the way `rustdoc` does. Powered by a
   separate libclang‑based doc‑comment extractor.
+
+### v0.3.2 implementation — driver pre‑pass discovery
+
+What ships today (v0.3.2) is the unit‑test subset of the above:
+
+* Tests colocated in `src/**.c`, marked with the `cust_test` or
+  `cust_test_ignore` macros (the `[[cust::test]]` attribute
+  spelling arrives with plugin v1 in v0.4 — RQ‑V32‑1).
+* Discovery via the **driver pre‑pass** scanner
+  (`cust/src/test_scanner.rs`) — line‑oriented regex; the marker,
+  return type (`int` or `void`), and function name must fit on
+  one source line. V32D‑2 trade‑off; plugin v1 lifts it.
+* Cargo‑shape CLI: `cust test [-p <member>] [<filter>] [-- --list]`
+  with substring filter, exit code 0/1, and a Cargo‑format
+  per‑binary summary (`test result: ok. N passed; M failed; …`).
+* **Fork‑per‑test** isolation (V32D‑7) — Linux only,
+  `fork`/`waitpid`/`_exit(101)`. This is stricter than stock
+  `cargo test` (which runs threads inside one process); it matches
+  `cargo‑nextest`'s "one test per process" model and survives a
+  test‑side `SIGSEGV` / `abort()` without taking the binary down.
+* No `[profile.test]`, no per‑test timeout, no `--nocapture`,
+  no `--exact`, no multi‑filter, no parallel test execution, no
+  integration tests under `tests/` — all deferred to v0.4.
+
+The runner template lives in `cust/src/test_runner_template.c`
+(included into the driver via `include_str!`) and is concatenated
+ahead of per‑test `extern` decls + a static `__cust_tests[]`
+table + the runner's `main`. Output path:
+`target/<profile>/test/<crate>/<crate>` (V32D‑4 + V32D‑5,
+resolved in favour of V32D‑4's "fully fresh build tree").
+
+Full locked V32D‑N decisions, deferrals, and the verification
+target live in [v0.3.2.md](v0.3.2.md). Plugin v1 in v0.4 joins
+as a *second* discovery backend behind the same
+`__cust_tests[]` contract; the v0.3.2 pre‑pass stays in tree as
+the `cust check --no-plugin` discovery path (§9).
 
 ---
 
@@ -1061,6 +1112,32 @@ Roadmap bullets here are deliberately short:
   `Cust.lock` schema unchanged (V31D-10 — bin-vs-lib is not a
   property of the resolved graph). Full shipped details, locked
   V31D-N decisions, and verification in [v0.3.1.md](v0.3.1.md).
+* **v0.3.2 — `cust test` (Rust-style unit tests).** ✅ **shipped.**
+  Small single-purpose milestone slotted between v0.3.1 and
+  v0.4. `cust_test` / `cust_test_ignore` macros + Cargo-shape
+  `cust test [-p <member>] [<filter>] [-- --list]` subcommand
+  with substring filter, `--list`, and a Cargo-format per-binary
+  summary. Tests colocated in `src/**.c`, discovered by a
+  **driver pre-pass** scanner (V32D-2) — the macro,
+  return type (`int` or `void`), and function name fit on one
+  source line. Plugin v1 in v0.4 joins as a *second* discovery
+  backend behind the same `__cust_tests[]` table contract; the
+  pre-pass stays in tree as the `cust check --no-plugin` path.
+  **Fork-per-test** isolation (V32D-7) — Linux only,
+  `fork`/`waitpid`/`_exit(101)`, stricter than stock `cargo
+  test` (matches `cargo-nextest`'s "one test per process"
+  model). V32D-11 rejects `cust test -p <bin-only>`; V32D-12
+  silently skips bin-only members in workspace-bare runs.
+  Test build is fully isolated in
+  `target/<profile>/test/<crate>/` (V32D-4) with
+  `-DCUST_TEST_BUILD=1` activating the prelude's test branch
+  so `cust_test`-marked functions stop decaying to
+  `static unused`. No `Cust.toml` schema changes. Per-test
+  timeout, `--nocapture`, `--exact`, multi-filter, parallel
+  test execution, `tests/` integration tests, and
+  `[[cust::test(inline)]]` all deferred to v0.4. Full shipped
+  details, locked V32D-N decisions, and verification in
+  [v0.3.2.md](v0.3.2.md).
 * **v0.4 — dependency resolver, registry, plugin v1, tests.**
   Brings the *network* half of dep work that v0.3 deferred:
   initial registry wire protocol (`Index` trait, `file://` first
@@ -1070,12 +1147,18 @@ Roadmap bullets here are deliberately short:
   the §12 hang-protection timeout, plugin v1 (full AST-based
   fragment header synthesis, `[[cust::pub(repr)]]` opt-in body
   export), circular-dep fixed-point loop with the convergence
-  criterion (§4), `[[cust::test]]` collection via ctor-based
-  registration (§10), fork-based test process isolation (§11),
-  and `-jN` parallelism (within and across crates). Multi-bin
-  per crate (`src/bin/*.c`, `[[bin]]` arrays) also lands here
-  (V31D-3 deferral from v0.3.1). v0.3.1 is the prerequisite for
-  the examples / test-harness work in this milestone.
+  criterion (§4), plugin-v1 second test-discovery backend
+  (replaces the v0.3.2 pre-pass scanner's single-line regex
+  with an AST walk; both backends coexist behind the same
+  `__cust_tests[]` contract — V32D-2), `tests/` integration
+  tests, `[[cust::test(inline)]]` + `should_panic` + per-test
+  timeout (need `[profile.test]` plumbing), `--nocapture` /
+  `--exact` / multi-filter / `--test-threads N`, and `-jN`
+  parallelism (within and across crates). Multi-bin per crate
+  (`src/bin/*.c`, `[[bin]]` arrays) also lands here (V31D-3
+  deferral from v0.3.1). v0.3.1 + v0.3.2 are the prerequisites
+  for the multi-target / parallel-test-harness work in this
+  milestone.
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
 * **v0.6 — ThinLTO across the dep graph, bitcode rlib format with
   `metadata.json` including `rlib_format_version` and `llvm_version`

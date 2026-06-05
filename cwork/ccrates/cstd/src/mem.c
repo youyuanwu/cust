@@ -27,3 +27,24 @@ cust_pub usize cstd_strlen(const char *s) {
 cust_pub i32 cstd_memcmp(const void *a, const void *b, usize n) {
     return memcmp(a, b, n);
 }
+
+/* ─── v0.3.2 unit tests ───────────────────────────────────── */
+
+cust_test int test_strlen_empty(void) {
+    cust_assert_eq(cstd_strlen(""), (usize)0);
+    return 0;
+}
+
+cust_test int test_strlen_hello(void) {
+    cust_assert_eq(cstd_strlen("hello"), (usize)5);
+    cust_assert_eq(cstd_strlen("hello, cstd"), (usize)11);
+    return 0;
+}
+
+cust_test int test_memcmp_equal_and_diff(void) {
+    cust_assert_eq(cstd_memcmp("abc", "abc", 3), 0);
+    /* Sign of memcmp is implementation-defined, only the
+     * sign-vs-zero invariant is portable. */
+    cust_assert(cstd_memcmp("abc", "abd", 3) != 0);
+    return 0;
+}
