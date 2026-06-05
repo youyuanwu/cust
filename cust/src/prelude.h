@@ -14,13 +14,25 @@
 #ifndef CUST_PRELUDE_H
 #define CUST_PRELUDE_H
 
-/* cust_pub: export this decl from the crate.
+/* cust_pub: export this decl from the crate. Use on **functions
+ * and variables**, where visibility actually applies.
  *   - visibility("default") lifts the symbol over -fvisibility=hidden.
  *   - annotate("cust::pub") lets the plugin spot it and emit a
  *     forward declaration into the per-module fragment header
  *     (target/<profile>/.h-fragments/<crate>/<mod>.cust.h).
  */
 #define cust_pub               __attribute__((visibility("default"), annotate("cust::pub")))
+
+/* cust_pub_t: export a **type declaration** (typedef, struct, union,
+ * enum) from the crate. Same plugin behaviour as `cust_pub`, but
+ * skips the visibility attribute — types have no linkage, so
+ * applying `visibility("default")` to a typedef produces a clang
+ * `'visibility' attribute ignored [-Wignored-attributes]` warning.
+ * Use this for any `cust_pub_t typedef X y;` / `cust_pub_t struct
+ * X { ... };` site. Plugin treats both forms identically.
+ */
+#define cust_pub_t             __attribute__((annotate("cust::pub")))
+
 #define cust_pub_crate         __attribute__((annotate("cust::pub_crate")))
 #define cust_must_use          __attribute__((warn_unused_result))
 #define cust_deprecated(msg)   __attribute__((deprecated(msg)))

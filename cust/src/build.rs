@@ -869,6 +869,19 @@ fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
 ///
 /// Missing fragments are skipped silently — a module with zero
 /// `cust_pub` decls produces no fragment, which is fine.
+///
+/// **Module order.** Modules are emitted in topological order
+/// over their intra-crate `#cust use crate::<mod>;` edges so any
+/// type or decl a module's fragment references is declared
+/// earlier in the concatenated header. Discovery order (DFS
+/// preorder, root first) breaks the moment a sibling module
+/// exports a typedef used by the root or by an earlier sibling
+/// — that's exactly the pattern cstd needs (types module
+/// exports `i32`/`u64`; math and lib use them). Cycles are
+/// impossible at this point: the discovery pass (`modules::
+/// discover`) already rejects intra-crate `#cust mod` cycles,
+/// and intra-crate fragment includes are forward-decl-only so
+/// they can't reintroduce one.
 fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module]) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -876,6 +889,8 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
     }
+
+    let ordered = topo_order_modules(modules);
 
     let guard = header_guard(crate_name);
     let mut out = String::new();
@@ -890,7 +905,7 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
     // the producer's surface). See cust-design.md §5.
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
 
-    for m in modules {
+    for m in &ordered {
         let frag = layout.fragment_path(crate_name, &m.qualified_name);
         let Ok(body) = fs::read_to_string(frag) else {
             continue; // module had no cust_pub decls; plugin emitted nothing
@@ -908,6 +923,78 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
 
     fs::write(&path, out).with_context(|| format!("writing `{}`", path.display()))?;
     Ok(())
+}
+
+/// Order `modules` so any module appears after every module it
+/// `#cust use crate::<…>;`-imports. Stable: ties (modules with
+/// the same in-degree) preserve discovery order, so the existing
+/// DFS-preorder behaviour is preserved for any crate that
+/// doesn't have intra-crate type dependencies.
+///
+/// Kahn's algorithm. `imports` lists *predecessors* (this module
+/// uses them); we count in-degrees as "how many modules I depend
+/// on", then repeatedly emit zero-in-degree modules in discovery
+/// order. Modules whose imports name non-existent siblings (which
+/// shouldn't happen — `modules::discover` validates this — but
+/// we guard against it for defence in depth) are treated as if
+/// the missing edge weren't there.
+fn topo_order_modules(modules: &[Module]) -> Vec<&Module> {
+    use std::collections::{BTreeSet, VecDeque};
+
+    // Name → discovery index.
+    let name_to_idx: std::collections::BTreeMap<&str, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.qualified_name.as_str(), i))
+        .collect();
+
+    // In-degree per module (count of imports that resolve to a
+    // sibling in this same crate). Outbound edges from i: for
+    // each name in modules[i].imports, edge name → i.
+    let mut in_deg: Vec<usize> = vec![0; modules.len()];
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); modules.len()];
+    for (i, m) in modules.iter().enumerate() {
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        for imp in &m.imports {
+            if let Some(&j) = name_to_idx.get(imp.as_str()) {
+                if seen.insert(j) {
+                    successors[j].push(i);
+                    in_deg[i] += 1;
+                }
+            }
+        }
+    }
+
+    // Initial queue: every module with zero in-degree, in
+    // discovery order — keeps ties stable.
+    let mut queue: VecDeque<usize> = (0..modules.len()).filter(|&i| in_deg[i] == 0).collect();
+    let mut out: Vec<&Module> = Vec::with_capacity(modules.len());
+
+    while let Some(i) = queue.pop_front() {
+        out.push(&modules[i]);
+        for &succ in &successors[i] {
+            in_deg[succ] -= 1;
+            if in_deg[succ] == 0 {
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    // Cycle defence: if we couldn't drain the whole graph fall
+    // back to discovery order for the leftover. modules::discover
+    // already rejects #cust mod cycles, and intra-crate fragment
+    // includes are forward-decl-only, so this branch shouldn't
+    // be reachable in practice.
+    if out.len() != modules.len() {
+        for (i, m) in modules.iter().enumerate() {
+            if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
+                let _ = i;
+                out.push(m);
+            }
+        }
+    }
+
+    out
 }
 
 /// Derive an include-guard macro name from a crate name. Mirrors
@@ -985,5 +1072,69 @@ mod tests {
         use super::strip_fragment_header_comment;
         let input = "int foo(void);\n";
         assert_eq!(strip_fragment_header_comment(input), input);
+    }
+
+    fn mk_mod(name: &str, imports: &[&str]) -> super::Module {
+        super::Module {
+            qualified_name: name.to_string(),
+            source_path: std::path::PathBuf::from(format!("/x/{name}.c")),
+            imports: imports.iter().map(|s| (*s).to_string()).collect(),
+            dep_imports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn topo_order_modules_preserves_discovery_order_with_no_edges() {
+        // No intra-crate imports → discovery order preserved.
+        use super::topo_order_modules;
+        let mods = vec![mk_mod("lib", &[]), mk_mod("a", &[]), mk_mod("b", &[])];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["lib", "a", "b"]);
+    }
+
+    #[test]
+    fn topo_order_modules_pulls_imported_module_to_front() {
+        // lib uses types; types must appear before lib in the
+        // concatenated header.
+        use super::topo_order_modules;
+        let mods = vec![
+            mk_mod("lib", &["types"]),
+            mk_mod("types", &[]),
+            mk_mod("math", &["types"]),
+        ];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["types", "lib", "math"]);
+    }
+
+    #[test]
+    fn topo_order_modules_keeps_ties_in_discovery_order() {
+        // Two roots-of-the-DAG: order between them follows
+        // discovery order.
+        use super::topo_order_modules;
+        let mods = vec![mk_mod("a", &[]), mk_mod("b", &[]), mk_mod("c", &["a", "b"])];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn topo_order_modules_ignores_unresolved_imports() {
+        // An import naming a non-sibling (shouldn't happen — discovery
+        // rejects this — but the orderer must be robust).
+        use super::topo_order_modules;
+        let mods = vec![mk_mod("lib", &["ghost"]), mk_mod("real", &[])];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["lib", "real"]);
     }
 }
