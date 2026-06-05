@@ -810,3 +810,59 @@ fn workspace_check_runs_for_every_member() {
     // No archive should be produced.
     assert!(!dir.join("target/debug/build/app/libapp.a").is_file());
 }
+
+#[test]
+fn workspace_emits_cust_lock_at_root() {
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_basic");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+
+    let lock = dir.join("Cust.lock");
+    assert!(lock.is_file(), "missing {}", lock.display());
+    let body = fs::read_to_string(&lock).unwrap();
+    assert!(body.contains("lock_format_version = 1"), "{body}");
+    assert!(body.contains("workspace_root = "), "{body}");
+    // Both members appear.
+    assert!(body.contains("name = \"app\""), "{body}");
+    assert!(body.contains("name = \"util\""), "{body}");
+    // Edge recorded.
+    assert!(body.contains("dependencies = [\"util\"]"), "{body}");
+    // Alphabetical: app before util.
+    let app_pos = body.find("name = \"app\"").unwrap();
+    let util_pos = body.find("name = \"util\"").unwrap();
+    assert!(app_pos < util_pos);
+}
+
+#[test]
+fn single_crate_does_not_emit_cust_lock() {
+    let (_tmp, dir) = stage("hello");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+    assert!(
+        !dir.join("Cust.lock").exists(),
+        "single-crate project should not produce Cust.lock"
+    );
+}
+
+#[test]
+fn cust_check_does_not_touch_lock() {
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_basic");
+    // First a real build to create the lock.
+    assert_success(&cust(&dir, ["build"]));
+    let lock = dir.join("Cust.lock");
+    assert!(lock.is_file());
+    let mtime_before = fs::metadata(&lock).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // cust check must not rewrite the lockfile.
+    assert_success(&cust(&dir, ["check"]));
+    let mtime_after = fs::metadata(&lock).unwrap().modified().unwrap();
+    assert_eq!(mtime_before, mtime_after, "cust check touched Cust.lock");
+}

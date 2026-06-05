@@ -598,6 +598,15 @@ pub fn build_workspace(
         per_member.push((name.clone(), outputs));
     }
 
+    // After all members built successfully, emit Cust.lock at the
+    // workspace root. Skipped for single-crate (non-workspace)
+    // projects — they have no edges to record — and skipped in
+    // syntax-only mode (cust check shouldn't churn the lockfile;
+    // any lock changes are committed by the user via `cust build`).
+    if !opts.syntax_only {
+        crate::lock::write_lock(ws).context("writing Cust.lock")?;
+    }
+
     Ok(WorkspaceBuildOutputs { per_member })
 }
 
