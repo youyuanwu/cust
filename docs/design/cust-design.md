@@ -978,6 +978,23 @@ Roadmap bullets here are deliberately short:
   outputs moved to `target/<profile>/build/<member>/`. Full
   shipped details, locked V3D-N decisions, deferrals, and
   verification in [v0.3.md](v0.3.md).
+* **v0.3.1 — binary crates & `cust run`.** ✅ **shipped.**
+  Small single-purpose milestone slotted between v0.3 and v0.4.
+  `[[bin]]` table (single entry; multi-bin via `src/bin/*.c`
+  deferred to v0.4) plus auto-inference: `src/main.c` →
+  bin-only, `src/lib.c` + `src/main.c` → lib+bin (Cargo shape).
+  Bin output at `target/<profile>/<crate>` (Cargo parity).
+  `cust run [-p <member>] [--release] [-- <argv>…]` builds the
+  target bin + transitive deps, spawns it inheriting stdio,
+  exits with the child's exit code. `cust new --bin` lights up
+  the previously-reserved flag. V31D-6 enforces lib-only deps
+  (lib → bin / bin → bin edges rejected at edge-resolution).
+  Cargo-parity intra-crate self-import: `#cust use <own-name>;`
+  in the bin half of a lib+bin crate resolves to the local lib
+  header (mirrors Rust's `use my_crate::*;` in `src/main.rs`).
+  `Cust.lock` schema unchanged (V31D-10 — bin-vs-lib is not a
+  property of the resolved graph). Full shipped details, locked
+  V31D-N decisions, and verification in [v0.3.1.md](v0.3.1.md).
 * **v0.4 — dependency resolver, registry, plugin v1, tests.**
   Brings the *network* half of dep work that v0.3 deferred:
   initial registry wire protocol (`Index` trait, `file://` first
@@ -989,7 +1006,10 @@ Roadmap bullets here are deliberately short:
   export), circular-dep fixed-point loop with the convergence
   criterion (§4), `[[cust::test]]` collection via ctor-based
   registration (§10), fork-based test process isolation (§11),
-  and `-jN` parallelism (within and across crates).
+  and `-jN` parallelism (within and across crates). Multi-bin
+  per crate (`src/bin/*.c`, `[[bin]]` arrays) also lands here
+  (V31D-3 deferral from v0.3.1). v0.3.1 is the prerequisite for
+  the examples / test-harness work in this milestone.
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
 * **v0.6 — ThinLTO across the dep graph, bitcode rlib format with
   `metadata.json` including `rlib_format_version` and `llvm_version`

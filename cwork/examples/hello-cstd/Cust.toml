@@ -1,0 +1,6 @@
+[package]
+name    = "hello-cstd"
+version = "0.1.0"
+
+[dependencies]
+cstd = { path = "../../ccrates/cstd" }

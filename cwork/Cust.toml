@@ -1,2 +1,2 @@
 [workspace]
-members = ["ccrates/cstd"]
+members = ["ccrates/cstd", "examples/hello-cstd"]

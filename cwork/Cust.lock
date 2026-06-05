@@ -9,3 +9,9 @@ name = "cstd"
 version = "0.1.0"
 path = "ccrates/cstd"
 dependencies = []
+
+[[member]]
+name = "hello-cstd"
+version = "0.1.0"
+path = "examples/hello-cstd"
+dependencies = ["cstd"]
