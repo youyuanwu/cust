@@ -66,11 +66,33 @@ impl TargetLayout {
             .join(format!("{qualified_name}.cust.h"))
     }
 
-    /// `target/<profile>/include/<crate>.h` — the user-facing
-    /// concatenated crate header (cust-design.md §5).
+    /// Per-member crate header
+    /// (`target/<profile>/build/<crate>/include/<crate>.h`).
+    ///
+    /// In v0.2 this lived at `target/<profile>/include/<crate>.h`
+    /// (profile-level, single-crate-only). v0.3 moves it under
+    /// the member's own build dir so workspace builds can point
+    /// the `deps/<name>` symlink at it without collisions
+    /// (cust-design.md §5 + v0.3.md scope item 6).
     pub fn crate_header_path(&self, crate_name: &str) -> PathBuf {
-        self.profile_root
+        self.build_dir(crate_name)
             .join("include")
             .join(format!("{crate_name}.h"))
+    }
+
+    /// `target/<profile>/deps/<dep_name>/` — the workspace-shared
+    /// view of a dep's outputs. v0.3 makes this a symlink to the
+    /// dep's own build dir (V3D-5 option A); consumers reach
+    /// `<dep_dir>/include/<dep>.h` and `<dep_dir>/lib<dep>.a`
+    /// through it.
+    pub fn dep_dir(&self, dep_name: &str) -> PathBuf {
+        self.profile_root.join("deps").join(dep_name)
+    }
+
+    /// Producer build directory for a member \u2014
+    /// `target/<profile>/build/<member>/`. Per-member outputs land
+    /// here (objects, fragment dir, include dir, archive).
+    pub fn build_dir(&self, member_name: &str) -> PathBuf {
+        self.profile_root.join("build").join(member_name)
     }
 }

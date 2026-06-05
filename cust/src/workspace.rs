@@ -25,12 +25,20 @@
 
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
 
-use crate::manifest::{Manifest, ManifestLocation, MANIFEST_FILE};
+use crate::{
+    build::{self, BuildOutputs, BuildPlan},
+    clang::Clang,
+    manifest::{Manifest, ManifestLocation, MANIFEST_FILE},
+    plugin::Plugin,
+    profile::ProfileKind,
+    target_layout::TargetLayout,
+};
 
 /// One resolved workspace member.
 #[derive(Debug)]
@@ -44,6 +52,7 @@ pub struct Member {
     /// `true` when this member is the workspace root itself
     /// (root-is-also-a-member shape). Otherwise the member is in
     /// a subdirectory listed in `[workspace] members`.
+    #[allow(dead_code)] // surfaced by Slice D (Cust.lock) and `cust build -v` (Slice E)
     pub is_implicit_root: bool,
     /// Names of other members this member depends on, in
     /// declaration order. Resolved by `Workspace::resolve_edges`
@@ -58,8 +67,10 @@ pub struct Workspace {
     /// directory (the directory containing the root `Cust.toml`).
     pub root: PathBuf,
     /// Absolute path to the root `Cust.toml`.
+    #[allow(dead_code)] // surfaced by Slice D (Cust.lock) for the moved-workspace check
     pub root_manifest_path: PathBuf,
     /// The workspace root manifest.
+    #[allow(dead_code)] // surfaced by `is_real_workspace` + Slice D
     pub root_manifest: Manifest,
     /// Members in declaration order (implicit root first when
     /// present, then `members` entries in their `Cust.toml` order).
@@ -231,6 +242,17 @@ impl Workspace {
                 loc.path.display()
             );
         }
+        // V3D-4 / scope item 9: path deps require a workspace.
+        // A single-crate manifest with [dependencies] has nowhere
+        // for its deps to point — there are no sibling members.
+        if !manifest.dependencies.is_empty() {
+            bail!(
+                "`{}` has [dependencies] but no enclosing [workspace]; \
+                 path dependencies require a [workspace] — add it to a \
+                 parent Cust.toml",
+                loc.path.display()
+            );
+        }
         let pkg = manifest.require_package(&loc.path)?;
         let member = Member {
             name: pkg.name.clone(),
@@ -291,6 +313,7 @@ impl Workspace {
 
     /// `true` when this workspace has a real `[workspace]` table
     /// (i.e. is not a single-crate degeneracy).
+    #[allow(dead_code)] // surfaced by Slice D (Cust.lock emission gated on this)
     pub const fn is_real_workspace(&self) -> bool {
         self.root_manifest.workspace.is_some()
     }
@@ -403,6 +426,284 @@ impl Workspace {
     /// Look up a member by name. `None` if absent.
     pub fn member(&self, name: &str) -> Option<&Member> {
         self.members.iter().find(|m| m.name == name)
+    }
+
+    /// Return member names in reverse-topological order
+    /// (dependencies before dependents). Cycle detection raises
+    /// `error: dependency cycle: a → b → a` with the cycle
+    /// canonicalised to start at the alphabetically-first name
+    /// (per scope item 5 in docs/design/v0.3.md). Self-cycles
+    /// produce `error: dependency cycle: a → a`.
+    ///
+    /// The returned vector contains every member exactly once.
+    pub fn build_order(&self) -> Result<Vec<String>> {
+        // Kahn's algorithm: compute in-degrees in the *consumer →
+        // dependency* direction (so dep-first is a forward topo),
+        // then peel zero-in-degree nodes one at a time. Equivalent
+        // to a DFS post-order but easier to reason about.
+        let n = self.members.len();
+        let name_to_idx: BTreeMap<&str, usize> = self
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.name.as_str(), i))
+            .collect();
+
+        // adj[i] = indices of members that depend on i.
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // in_degree[i] = number of deps i still needs to wait for.
+        let mut in_degree: Vec<usize> = vec![0; n];
+        for (i, m) in self.members.iter().enumerate() {
+            for d in &m.deps {
+                // resolve_edges already guarantees d is a member.
+                let dep_idx = name_to_idx[d.as_str()];
+                adj[dep_idx].push(i);
+                in_degree[i] += 1;
+            }
+        }
+
+        // Seed: every member with no deps. Sort descending by name
+        // so `pop()` (which removes the last element) yields
+        // names in ascending order — deterministic output across
+        // runs.
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        ready.sort_by(|a, b| self.members[*b].name.cmp(&self.members[*a].name));
+
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        while let Some(i) = ready.pop() {
+            out.push(self.members[i].name.clone());
+            // Collect newly-ready into a temp so we can sort.
+            let mut newly_ready: Vec<usize> = Vec::new();
+            for &j in &adj[i] {
+                in_degree[j] -= 1;
+                if in_degree[j] == 0 {
+                    newly_ready.push(j);
+                }
+            }
+            // Same descending-then-pop trick.
+            newly_ready.sort_by(|a, b| self.members[*b].name.cmp(&self.members[*a].name));
+            ready.extend(newly_ready);
+            // Keep `ready` sorted (descending) overall so the next
+            // pop is the next alphabetical name regardless of
+            // which newly_ready batch contributed it.
+            ready.sort_by(|a, b| self.members[*b].name.cmp(&self.members[*a].name));
+        }
+
+        if out.len() != n {
+            // Cycle. Find one for the diagnostic. Start from the
+            // alphabetically-first member that still has nonzero
+            // in-degree (per the scope item 5 rule).
+            let mut remaining: Vec<usize> = (0..n).filter(|&i| in_degree[i] > 0).collect();
+            remaining.sort_by(|a, b| self.members[*a].name.cmp(&self.members[*b].name));
+            let start = remaining[0];
+            let cycle = find_cycle(&self.members, start);
+            bail!(
+                "dependency cycle: {}",
+                cycle
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            );
+        }
+
+        Ok(out)
+    }
+}
+
+/// Inputs to `build_workspace`. Mirror of `BuildPlan` minus the
+/// per-member fields the orchestrator fills in.
+pub struct WorkspaceBuildOptions<'a> {
+    pub profile_kind: ProfileKind,
+    pub clang: &'a Clang,
+    pub plugin: Option<&'a Plugin>,
+    /// `true` runs every member with `cust check` semantics
+    /// (`-fsyntax-only`, no archive, no `compile_commands.json`).
+    pub syntax_only: bool,
+    /// If `Some(name)`, build only `name` and its transitive deps.
+    /// `None` builds every member. Used by `cust build -p <member>`
+    /// (Slice E).
+    pub only: Option<&'a str>,
+}
+
+/// One member's build outputs, indexed for callers that want to
+/// know which archive belongs to which crate.
+pub struct WorkspaceBuildOutputs {
+    pub per_member: Vec<(String, BuildOutputs)>,
+}
+
+/// Build every workspace member in reverse-topological order
+/// (dependencies first). After each producer build, refresh the
+/// `target/<profile>/deps/<name>` symlink so downstream consumers
+/// reach the producer's outputs at a stable path (V3D-5 option A).
+pub fn build_workspace(
+    ws: &Workspace,
+    opts: &WorkspaceBuildOptions<'_>,
+) -> Result<WorkspaceBuildOutputs> {
+    let order = ws.build_order()?;
+
+    // Filter for -p <member> scoping.
+    let to_build: Vec<String> = if let Some(only) = opts.only {
+        let target = ws.member(only).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown workspace member `{only}` — known: [{}]",
+                ws.members
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        collect_transitive_deps(ws, target, &mut needed);
+        order.into_iter().filter(|n| needed.contains(n)).collect()
+    } else {
+        order
+    };
+
+    let layout = TargetLayout::for_workspace(&ws.root, opts.profile_kind);
+    layout.ensure_dirs()?;
+
+    let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
+    for name in &to_build {
+        let m = ws
+            .member(name)
+            .expect("build_order returned a member not in ws");
+
+        // Materialise each member's deps as &str slices so
+        // BuildPlan can borrow them.
+        let dep_strs: Vec<&str> = m.deps.iter().map(String::as_str).collect();
+
+        let plan = BuildPlan {
+            manifest: &m.manifest,
+            crate_root: &m.root,
+            workspace_root: &ws.root,
+            profile_kind: opts.profile_kind,
+            clang: opts.clang,
+            plugin: opts.plugin,
+            syntax_only: opts.syntax_only,
+            deps: &dep_strs,
+        };
+        let outputs = build::run(&plan).with_context(|| format!("building member `{name}`"))?;
+
+        // Refresh the dep view symlink so consumers reach this
+        // member's outputs at a stable path (V3D-5 A). Runs in
+        // both build and check mode — downstream members'
+        // `#cust use <name>;` rewrites point at
+        // `target/<profile>/deps/<name>/include/<name>.h`, which
+        // resolves through this symlink.
+        refresh_dep_symlink(&layout, &m.name, &m.root)
+            .with_context(|| format!("publishing dep view for `{name}`"))?;
+
+        per_member.push((name.clone(), outputs));
+    }
+
+    Ok(WorkspaceBuildOutputs { per_member })
+}
+
+/// `target/<profile>/deps/<name>` → `target/<profile>/build/<name>/`.
+///
+/// Symlink is recreated on every producer build so the new-member
+/// case (no prior symlink) and the moved-member case (stale
+/// symlink) are both handled.
+fn refresh_dep_symlink(layout: &TargetLayout, dep_name: &str, _producer_root: &Path) -> Result<()> {
+    let dep_dir = layout.dep_dir(dep_name);
+    let build_dir = layout.build_dir(dep_name);
+    if !build_dir.is_dir() {
+        bail!(
+            "internal: build dir `{}` does not exist after building `{dep_name}`",
+            build_dir.display()
+        );
+    }
+    if let Some(parent) = dep_dir.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    // Wipe whatever's there. Could be a stale symlink, a real dir
+    // (e.g. from a prior v0.4 cache-style layout), or nothing.
+    match fs::symlink_metadata(&dep_dir) {
+        Ok(meta) => {
+            if meta.is_dir() && !meta.is_symlink() {
+                fs::remove_dir_all(&dep_dir)
+                    .with_context(|| format!("removing stale `{}`", dep_dir.display()))?;
+            } else {
+                fs::remove_file(&dep_dir)
+                    .with_context(|| format!("removing stale `{}`", dep_dir.display()))?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("stat `{}`", dep_dir.display()));
+        }
+    }
+    std::os::unix::fs::symlink(&build_dir, &dep_dir).with_context(|| {
+        format!(
+            "symlink `{}` → `{}`",
+            dep_dir.display(),
+            build_dir.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Recursive helper for `-p <member>` scoping: collect the named
+/// member plus everything in its transitive `deps` closure.
+fn collect_transitive_deps(
+    ws: &Workspace,
+    m: &Member,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    if !out.insert(m.name.clone()) {
+        return;
+    }
+    for d in &m.deps {
+        if let Some(dep) = ws.member(d) {
+            collect_transitive_deps(ws, dep, out);
+        }
+    }
+}
+
+/// Walk forward from `start` following the first dep edge until we
+/// hit a node we've already seen, then return the cycle slice
+/// rotated to begin at the alphabetically-first name in the
+/// cycle. The returned vec includes the start name twice (closes
+/// the loop visually, e.g. `[\"a\", \"b\", \"a\"]`).
+fn find_cycle(members: &[Member], start: usize) -> Vec<String> {
+    let name_to_idx: BTreeMap<&str, usize> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.as_str(), i))
+        .collect();
+
+    let mut path: Vec<usize> = Vec::new();
+    let mut seen: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut cur = start;
+    loop {
+        if let Some(&first_occurrence) = seen.get(&cur) {
+            // cycle is path[first_occurrence..] then back to cur.
+            let mut cyc: Vec<String> = path[first_occurrence..]
+                .iter()
+                .map(|&i| members[i].name.clone())
+                .collect();
+            // Rotate to start at the alphabetically-first name in
+            // the cycle.
+            if let Some(min_pos) = (0..cyc.len()).min_by(|&a, &b| cyc[a].cmp(&cyc[b])) {
+                cyc.rotate_left(min_pos);
+            }
+            let first = cyc[0].clone();
+            cyc.push(first); // close the loop visually
+            return cyc;
+        }
+        seen.insert(cur, path.len());
+        path.push(cur);
+        let next_name = members[cur].deps.first().cloned();
+        let Some(next_name) = next_name else {
+            // Dead end without closing the loop \u2014 shouldn't happen
+            // when called on a member with in_degree > 0, but fall
+            // back gracefully.
+            return vec![members[start].name.clone(), members[start].name.clone()];
+        };
+        cur = name_to_idx[next_name.as_str()];
     }
 }
 

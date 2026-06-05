@@ -47,6 +47,13 @@ pub struct Module {
     /// `#cust use crate::<name>;`. Validated against the
     /// rest of the graph by `discover`.
     pub imports: Vec<String>,
+    /// Cross-crate dep names this module imports via
+    /// `#cust use <name>;` (V3D-6). Validated by the build
+    /// pipeline against the consumer's `[dependencies]` table —
+    /// `modules::discover` has no workspace context.
+    #[allow(dead_code)]
+    // build.rs validates UseDep names via plan.deps; the field is the canonical list per module
+    pub dep_imports: Vec<String>,
 }
 
 /// Walk the module graph rooted at `root_source` (typically
@@ -83,6 +90,7 @@ pub fn discover(crate_root: &Path, root_source: &Path) -> Result<Vec<Module>> {
         // order in the output), then emit the current module.
         let mut children: Vec<(String, PathBuf, PathBuf)> = Vec::new();
         let mut imports: Vec<String> = Vec::new();
+        let mut dep_imports: Vec<String> = Vec::new();
         for d in &scan.directives {
             match &d.kind {
                 DirectiveKind::Mod { name } => {
@@ -100,6 +108,9 @@ pub fn discover(crate_root: &Path, root_source: &Path) -> Result<Vec<Module>> {
                 DirectiveKind::UseCrate { name } => {
                     imports.push(name.clone());
                 }
+                DirectiveKind::UseDep { name } => {
+                    dep_imports.push(name.clone());
+                }
             }
         }
 
@@ -107,6 +118,7 @@ pub fn discover(crate_root: &Path, root_source: &Path) -> Result<Vec<Module>> {
             qualified_name: qname,
             source_path: path,
             imports,
+            dep_imports,
         });
 
         // Reverse so the first declared child is popped first.

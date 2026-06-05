@@ -3,11 +3,13 @@
 //! This is the v0.2 module loader's input layer (V2D-1, see
 //! `docs/design/v0.2.md`). It runs *before* clang and recognises:
 //!
-//! * `#cust mod <ident>;`         declare a submodule
-//! * `#cust use crate::<ident>;`  pull in a sibling module's
+//! * `#cust mod <ident>;`           declare a submodule
+//! * `#cust use crate::<ident>;`    pull in a sibling module's
 //!   fragment header
+//! * `#cust use <ident>;`            pull in a **dep crate**'s
+//!   public header (added in v0.3 — V3D-6)
 //!
-//! Future extensions (v0.3+): `#cust pub_macro`, `#cust
+//! Future extensions (v0.4+): `#cust pub_macro`, `#cust
 //! include_generated!(...)`, attribute-form `[[cust::cfg]]` /
 //! `[[cust::feature]]` gating on module-level decls.
 //!
@@ -55,8 +57,13 @@ pub struct Directive {
 pub enum DirectiveKind {
     /// `#cust mod <ident>;`
     Mod { name: String },
-    /// `#cust use crate::<ident>;`
+    /// `#cust use crate::<ident>;` — intra-crate sibling module.
     UseCrate { name: String },
+    /// `#cust use <ident>;` — cross-crate dep import (v0.3,
+    /// V3D-6). The bare name must match an entry in the consuming
+    /// crate's `[dependencies]` table; the build pipeline rewrites
+    /// it to an `#include` of the dep's public header.
+    UseDep { name: String },
 }
 
 /// A byte range in the source plus the source `(line, column)` of
@@ -542,49 +549,81 @@ fn parse_mod(tokens: &[Token], file: &Path, line: u32, col: u32) -> Result<Direc
 }
 
 fn parse_use(tokens: &[Token], file: &Path, line: u32, col: u32) -> Result<DirectiveKind> {
-    // `use crate :: <ident>` — exactly four tokens: ident("use" was
-    // consumed as `first`; here tokens[0] is "use"), ident("crate"),
-    // `::`, ident.
-    if tokens.len() != 4 {
-        bail!(
-            "{}:{}:{}: `#cust use` expects `crate::<name>` (got {} token(s))",
+    // Two accepted shapes:
+    //   `use crate :: <ident>`  — 4 tokens (UseCrate)
+    //   `use <ident>`           — 2 tokens (UseDep, v0.3 V3D-6)
+    //
+    // tokens[0] is always `use` (the dispatch in
+    // parse_directive_tokens guarantees this).
+    match tokens.len() {
+        2 => {
+            let name = &tokens[1];
+            if name.kind != TokenKind::Ident {
+                bail!(
+                    "{}:{}:{}: `#cust use` expects an identifier",
+                    file.display(),
+                    name.line,
+                    name.column
+                );
+            }
+            if name.text == "crate" {
+                // `#cust use crate;` with nothing after — user
+                // meant `crate::<something>` but forgot.
+                bail!(
+                    "{}:{}:{}: `#cust use crate;` is invalid; \
+                     write `#cust use crate::<name>;` for an intra-crate \
+                     import",
+                    file.display(),
+                    name.line,
+                    name.column
+                );
+            }
+            Ok(DirectiveKind::UseDep {
+                name: name.text.clone(),
+            })
+        }
+        4 => {
+            let crate_tok = &tokens[1];
+            let coloncolon = &tokens[2];
+            let name = &tokens[3];
+            if crate_tok.kind != TokenKind::Ident || crate_tok.text != "crate" {
+                bail!(
+                    "{}:{}:{}: `#cust use` 4-token form must begin with \
+                     `crate::` (got {:?})",
+                    file.display(),
+                    crate_tok.line,
+                    crate_tok.column,
+                    crate_tok.text
+                );
+            }
+            if coloncolon.kind != TokenKind::ColonColon {
+                bail!(
+                    "{}:{}:{}: expected `::` after `crate`",
+                    file.display(),
+                    coloncolon.line,
+                    coloncolon.column
+                );
+            }
+            if name.kind != TokenKind::Ident {
+                bail!(
+                    "{}:{}:{}: `#cust use crate::` expects an identifier",
+                    file.display(),
+                    name.line,
+                    name.column
+                );
+            }
+            Ok(DirectiveKind::UseCrate {
+                name: name.text.clone(),
+            })
+        }
+        n => bail!(
+            "{}:{}:{}: `#cust use` accepts `<name>` or `crate::<name>` \
+             (got {n} token(s))",
             file.display(),
             line,
-            col,
-            tokens.len()
-        );
+            col
+        ),
     }
-    let crate_tok = &tokens[1];
-    let coloncolon = &tokens[2];
-    let name = &tokens[3];
-    if crate_tok.kind != TokenKind::Ident || crate_tok.text != "crate" {
-        bail!(
-            "{}:{}:{}: `#cust use` must begin with `crate::` (got {:?})",
-            file.display(),
-            crate_tok.line,
-            crate_tok.column,
-            crate_tok.text
-        );
-    }
-    if coloncolon.kind != TokenKind::ColonColon {
-        bail!(
-            "{}:{}:{}: expected `::` after `crate`",
-            file.display(),
-            coloncolon.line,
-            coloncolon.column
-        );
-    }
-    if name.kind != TokenKind::Ident {
-        bail!(
-            "{}:{}:{}: `#cust use crate::` expects an identifier",
-            file.display(),
-            name.line,
-            name.column
-        );
-    }
-    Ok(DirectiveKind::UseCrate {
-        name: name.text.clone(),
-    })
 }
 
 // ─── Rewrite helpers ────────────────────────────────────────────────
@@ -871,9 +910,24 @@ int main(void) { return 0; }
     }
 
     #[test]
-    fn use_without_crate_prefix_is_error() {
-        let e = scan_err("#cust use parser;\n");
-        assert!(e.contains("expects `crate::<name>`"), "{e}");
+    fn use_dep_bare_form_is_a_use_dep_directive() {
+        // v0.3 (V3D-6): `#cust use <name>;` (no `crate::`) is the
+        // cross-crate dep import. Used to be an error in v0.2.
+        let r = scan_ok("#cust use parser;\n");
+        assert_eq!(r.directives.len(), 1);
+        assert!(matches!(
+            r.directives[0].kind,
+            DirectiveKind::UseDep { ref name } if name == "parser"
+        ));
+    }
+
+    #[test]
+    fn use_crate_bare_word_alone_is_error() {
+        // `#cust use crate;` is a user typo (meant
+        // `crate::<name>`). Catch it with a clear message
+        // rather than producing UseDep { name: "crate" }.
+        let e = scan_err("#cust use crate;\n");
+        assert!(e.contains("crate::<name>"), "{e}");
     }
 
     #[test]

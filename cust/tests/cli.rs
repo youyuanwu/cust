@@ -107,7 +107,7 @@ fn build_hello_dev_produces_static_archive() {
     let out = cust(&dir, ["build"]);
     assert_success(&out);
 
-    let archive = dir.join("target/debug/libhello.a");
+    let archive = dir.join("target/debug/build/hello/libhello.a");
     assert!(archive.is_file(), "{} missing", archive.display());
 
     // Per §17, `compile_commands.json` lives at `target/`, not
@@ -138,7 +138,7 @@ fn build_hello_release_uses_release_dir() {
     let out = cust(&dir, ["build", "--release"]);
     assert_success(&out);
 
-    assert!(dir.join("target/release/libhello.a").is_file());
+    assert!(dir.join("target/release/build/hello/libhello.a").is_file());
     // Dev profile dir should NOT have been created.
     assert!(!dir.join("target/debug").exists());
 }
@@ -207,7 +207,7 @@ fn discovers_manifest_from_subdirectory() {
     assert_success(&out);
     // Artifacts land next to Cust.toml (the crate root), NOT next
     // to the cwd we invoked from.
-    assert!(dir.join("target/debug/libhello.a").is_file());
+    assert!(dir.join("target/debug/build/hello/libhello.a").is_file());
 }
 
 // ─── Error-path tests ───────────────────────────────────────────────
@@ -283,7 +283,7 @@ fn new_creates_buildable_lib_crate() {
 
     // The scaffold should build cleanly with `cust build`.
     assert_success(&cust(&dir, ["build"]));
-    assert!(dir.join("target/debug/libgreet.a").is_file());
+    assert!(dir.join("target/debug/build/greet/libgreet.a").is_file());
 }
 
 #[test]
@@ -323,7 +323,9 @@ fn new_with_dash_in_path_sanitises_c_symbol() {
 
     // And `cust build` still works on the result.
     assert_success(&cust(&dir, ["build"]));
-    assert!(dir.join("target/debug/libmy-crate.a").is_file());
+    assert!(dir
+        .join("target/debug/build/my-crate/libmy-crate.a")
+        .is_file());
 }
 
 #[test]
@@ -366,7 +368,7 @@ fn build_multi_module_compiles_all_tus() {
         assert!(bd.join(format!("{name}.o")).is_file(), "missing {name}.o");
     }
 
-    let archive = dir.join("target/debug/libmulti_module.a");
+    let archive = dir.join("target/debug/build/multi_module/libmulti_module.a");
     assert!(archive.is_file());
 
     // All three `cust_pub` symbols should be in the archive.
@@ -463,7 +465,7 @@ fn use_crate_compiles_cross_module_call() {
     assert_success(&out);
 
     // Both `cust_pub` symbols must end up in the archive.
-    let archive = dir.join("target/debug/libuse_crate_works.a");
+    let archive = dir.join("target/debug/build/use_crate_works/libuse_crate_works.a");
     assert!(archive.is_file());
     let nm = Command::new("nm")
         .arg("--defined-only")
@@ -495,7 +497,7 @@ fn build_emits_concatenated_crate_header() {
     let (_tmp, dir) = stage("use_crate_works");
     assert_success(&cust(&dir, ["build"]));
 
-    let hdr = dir.join("target/debug/include/use_crate_works.h");
+    let hdr = dir.join("target/debug/build/use_crate_works/include/use_crate_works.h");
     assert!(hdr.is_file(), "missing crate header at {}", hdr.display());
 
     let body = fs::read_to_string(&hdr).unwrap();
@@ -523,7 +525,7 @@ fn build_emits_concatenated_crate_header() {
     let consumer_src = dir.join("consumer.c");
     fs::write(
         &consumer_src,
-        b"#include \"target/debug/include/use_crate_works.h\"\n\
+        b"#include \"target/debug/build/use_crate_works/include/use_crate_works.h\"\n\
           int main(void) { return use_crate_works_total() == 42 ? 0 : 1; }\n",
     )
     .unwrap();
@@ -533,7 +535,7 @@ fn build_emits_concatenated_crate_header() {
             consumer_src.to_str().unwrap(),
             "-I",
             dir.to_str().unwrap(),
-            dir.join("target/debug/libuse_crate_works.a")
+            dir.join("target/debug/build/use_crate_works/libuse_crate_works.a")
                 .to_str()
                 .unwrap(),
             "-o",
@@ -567,7 +569,7 @@ fn build_without_plugin_skips_crate_header() {
         .output()
         .expect("spawn cust");
     assert_success(&out);
-    let hdr = dir.join("target/debug/include/hello.h");
+    let hdr = dir.join("target/debug/build/hello/include/hello.h");
     assert!(
         !hdr.exists(),
         "expected NO crate header without plugin, but found {}",
@@ -694,4 +696,117 @@ fn plugin_emits_fragment_header_per_module() {
             f.display()
         );
     }
+}
+
+// ─── v0.3 workspace tests ───────────────────────────────────────────
+
+#[test]
+fn workspace_builds_all_members_in_topo_order() {
+    // app depends on util via path. Build at the workspace root,
+    // expect both libs in target/<profile>/build/<member>/ and a
+    // dep view symlink at target/<profile>/deps/util/. Plugin-
+    // dependent (the cross-crate header is what makes the build
+    // work).
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_basic");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+
+    // Per-member archives.
+    let util_archive = dir.join("target/debug/build/util/libutil.a");
+    let app_archive = dir.join("target/debug/build/app/libapp.a");
+    assert!(util_archive.is_file(), "missing {}", util_archive.display());
+    assert!(app_archive.is_file(), "missing {}", app_archive.display());
+
+    // Per-member crate headers.
+    let util_header = dir.join("target/debug/build/util/include/util.h");
+    let app_header = dir.join("target/debug/build/app/include/app.h");
+    assert!(util_header.is_file(), "missing {}", util_header.display());
+    assert!(app_header.is_file(), "missing {}", app_header.display());
+
+    // Dep view symlink: target/debug/deps/util -> target/debug/build/util.
+    let dep_link = dir.join("target/debug/deps/util");
+    let link_meta = fs::symlink_metadata(&dep_link).expect("dep symlink not created");
+    assert!(
+        link_meta.is_symlink(),
+        "target/debug/deps/util is not a symlink (got {link_meta:?})"
+    );
+    let resolved = fs::read_link(&dep_link).unwrap();
+    assert!(
+        resolved.ends_with("target/debug/build/util"),
+        "unexpected symlink target: {}",
+        resolved.display()
+    );
+
+    // app's archive carries its own cust_pub symbol; util's
+    // remains in util.a (not bundled — library deps are rlib-
+    // style per scope item 8).
+    let nm = Command::new("nm")
+        .arg("--defined-only")
+        .arg(&app_archive)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn nm");
+    let app_syms = String::from_utf8_lossy(&nm.stdout);
+    assert!(
+        app_syms.contains("app_doubled"),
+        "app archive missing app_doubled:\n{app_syms}"
+    );
+
+    let nm_util = Command::new("nm")
+        .arg("--defined-only")
+        .arg(&util_archive)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn nm");
+    let util_syms = String::from_utf8_lossy(&nm_util.stdout);
+    assert!(
+        util_syms.contains("util_value"),
+        "util archive missing util_value:\n{util_syms}"
+    );
+}
+
+#[test]
+fn workspace_dep_cycle_is_detected() {
+    let (_tmp, dir) = stage("workspace_cycle");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "dependency cycle");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Cycle is rendered starting at alphabetically-first name (a).
+    assert!(
+        stderr.contains("a → b → a") || stderr.contains("a -> b -> a"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn cust_use_dep_without_dependency_entry_is_error() {
+    // The workspace has only `app`. `app/src/lib.c` does
+    // `#cust use util;` but app has no [dependencies] entry for
+    // util. The build pipeline should reject this at the rewrite
+    // step.
+    let (_tmp, dir) = stage("workspace_undeclared_dep");
+    let out = cust(&dir, ["build"]);
+    assert_failure_with(&out, "`#cust use util;`");
+    assert_failure_with(&out, "not listed in [dependencies]");
+}
+
+#[test]
+fn workspace_check_runs_for_every_member() {
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("workspace_basic");
+    let out = cust(&dir, ["check"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Both members appear in the output.
+    assert!(stdout.contains("Checked util"), "{stdout}");
+    assert!(stdout.contains("Checked app"), "{stdout}");
+    // No archive should be produced.
+    assert!(!dir.join("target/debug/build/app/libapp.a").is_file());
 }

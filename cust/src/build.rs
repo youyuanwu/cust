@@ -52,6 +52,12 @@ pub struct BuildPlan<'a> {
     /// stamp / `compile_commands.json` is written. This is what
     /// `cust check` runs.
     pub syntax_only: bool,
+    /// Names of dep crates this consumer is allowed to import via
+    /// `#cust use <name>;` (V3D-6). Validated against the
+    /// scanner's `UseDep` directives. Empty for a crate that
+    /// declares no `[dependencies]`. The workspace orchestrator
+    /// populates this from the resolved edge list.
+    pub deps: &'a [&'a str],
 }
 
 /// Outputs `cust build` writes. `objects` and `compile_commands`
@@ -176,7 +182,14 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     // Step 6: archive. Skipped in syntax-only mode; the caller
     // gets a stub `archive` path back so the BuildOutputs shape
     // stays uniform.
-    let archive_path = layout.profile_root.join(format!("lib{crate_name}.a"));
+    //
+    // v0.3 (workspaces): archive lives at
+    // `target/<profile>/build/<crate>/lib<crate>.a` so per-member
+    // outputs don't collide. The v0.1/v0.2 spec location
+    // (`target/<profile>/lib<name>.a`) is no longer used; the
+    // workspace orchestrator publishes a stable `deps/<name>`
+    // symlink for cross-crate access (V3D-5).
+    let archive_path = crate_build_dir.join(format!("lib{crate_name}.a"));
     let cc_path = layout.target_root.join("compile_commands.json");
     if !plan.syntax_only {
         archive_objects(&objects, &archive_path)?;
@@ -187,14 +200,17 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
 
         // Step 8: stamp .cust-version.
         write_version_stamp(&layout.target_root.join(".cust-version"), plan.clang)?;
+    }
 
-        // Step 9: concatenate per-module fragment headers into the
-        // user-facing crate header (cust-design.md §5). Only emit
-        // when fragments actually exist (plugin was loaded);
-        // otherwise the include/<crate>.h would be empty.
-        if plan.plugin.is_some() {
-            write_crate_header(&layout, crate_name, &modules)?;
-        }
+    // Step 9: concatenate per-module fragment headers into the
+    // user-facing crate header (cust-design.md §5). Runs in
+    // *both* build and check mode so downstream workspace members
+    // can resolve upstream `#cust use <name>;` includes during
+    // their own check pass. Only emit when fragments actually
+    // exist (plugin was loaded); otherwise the include/<crate>.h
+    // would be empty.
+    if plan.plugin.is_some() {
+        write_crate_header(&layout, crate_name, &modules)?;
     }
 
     Ok(BuildOutputs {
@@ -224,15 +240,50 @@ fn compile_one_module(
     // of X's fragment header so the compiler sees the imported
     // module's [[cust::pub]] surface. The surface pass (when run)
     // has already populated the fragments dir.
+    //
+    // For `#cust use <dep>;` directives (V3D-6, v0.3), lower to
+    // an `#include` of the dep's public crate header. The dep is
+    // looked up by name against `plan.deps`; an unknown name is
+    // a hard error pointing the user at [dependencies].
     let crate_name = plan.manifest.package_name();
     let rewritten = mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| {
-        if let crate::mod_scanner::DirectiveKind::UseCrate { name } = &d.kind {
-            let frag = layout.fragment_path(crate_name, name);
-            Some(format!("#include \"{}\"", frag.display()))
-        } else {
-            None
+        match &d.kind {
+            crate::mod_scanner::DirectiveKind::UseCrate { name } => {
+                let frag = layout.fragment_path(crate_name, name);
+                Some(format!("#include \"{}\"", frag.display()))
+            }
+            crate::mod_scanner::DirectiveKind::UseDep { name } => {
+                // Validated below; if we substitute even when
+                // unknown the compiler error would point at a
+                // missing header. We do the check separately so
+                // the diagnostic is clean.
+                let dep_header = layout
+                    .dep_dir(name)
+                    .join("include")
+                    .join(format!("{name}.h"));
+                Some(format!("#include \"{}\"", dep_header.display()))
+            }
+            crate::mod_scanner::DirectiveKind::Mod { .. } => None,
         }
     });
+
+    // Validate every `#cust use <name>;` resolves to a declared
+    // dependency. We do this *after* the rewrite so the error
+    // message can include the line position, not after a
+    // confusing compile failure.
+    for d in &scan.directives {
+        if let crate::mod_scanner::DirectiveKind::UseDep { name } = &d.kind {
+            if !plan.deps.iter().any(|n| n == name) {
+                bail!(
+                    "{}:{}:{}: `#cust use {name};` refers to a crate not \
+                     listed in [dependencies]; add `{name} = {{ path = \"…\" }}`",
+                    m.source_path.display(),
+                    d.span.line,
+                    d.span.column
+                );
+            }
+        }
+    }
 
     let rewritten_path = crate_build_dir.join(format!("{}.preprocessed.c", m.qualified_name));
     if let Some(parent) = rewritten_path.parent() {
