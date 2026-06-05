@@ -211,8 +211,19 @@ over modules; phase 3 is the link.
    plain object output. Plugin runs here too, but only to enforce
    `[[cust::*]]` semantic contracts — not to emit headers.
 3. **Crate header + link.** Concatenate every module's `[[cust::pub]]`
-   (not `pub(crate)`) fragment into `target/<profile>/include/<crate>.h`.
-   Link the bitcode/objects into the requested `crate-type` artifacts.
+   (not `pub(crate)`) fragment into
+   `target/<profile>/build/<crate>/include/<crate>.h`
+   (path migration shipped in v0.3 — see v0.3.md scope item 6).
+   Modules are emitted in **topological order over intra-crate
+   `#cust use crate::<mod>;` edges** (Kahn's algorithm, stable on
+   ties so the existing DFS-preorder behaviour is preserved for
+   crates without intra-crate type deps). This matters because a
+   sibling module can export a typedef used by the root or by an
+   earlier sibling (cstd's `types` exports `i32`/`usize`, `lib`
+   and `math` consume them) — declaration order in the
+   concatenated header has to match the type-dependency DAG, not
+   the file-discovery order. Link the bitcode/objects into the
+   requested `crate-type` artifacts.
 
 This is the same shape as Cargo / rustc: a metadata pass (`rmeta`)
 followed by full codegen (`rlib`), with cheap metadata stamping
@@ -631,6 +642,32 @@ Dual‑path correctness is enforced by a test matrix: each attribute has
 `test_<attr>_with_plugin`, `test_<attr>_without_plugin`, and
 `test_<attr>_fallback_behavior` tests; divergences are documented in
 `docs/ATTRIBUTE-SEMANTICS.md`.
+
+### Prelude macro shape for `[[cust::pub]]` (and why there are two)
+
+The v0.x prelude exposes `[[cust::pub]]` via two macro spellings,
+picked by decl kind:
+
+* `cust_pub` — for **functions and variables**. Expands to
+  `__attribute__((visibility("default"), annotate("cust::pub")))`.
+  Visibility lifts the symbol over the crate-wide
+  `-fvisibility=hidden`; the annotate carries the plugin signal.
+* `cust_pub_t` — for **type declarations** (`typedef`, `struct`,
+  `union`, `enum`). Expands to
+  `__attribute__((annotate("cust::pub")))` only — no visibility.
+  Type decls have no linkage; applying `visibility("default")`
+  to a `typedef` produces a clang
+  `'visibility' attribute ignored [-Wignored-attributes]`
+  warning. cstd's `types` module hits this 12 times if you use
+  the wrong macro.
+
+Both forms expand to the same plugin annotation, so the plugin
+(§10) treats `cust_pub` and `cust_pub_t` decls identically when
+building the fragment header. The macro split is purely about
+which underlying clang attribute is meaningful for the decl
+kind. A future plugin v2 that makes `[[cust::pub]]` decl-kind-aware
+(emitting the right combination automatically) can collapse
+these into a single macro (§16 OQ — to be filed).
 
 ---
 
