@@ -7,10 +7,11 @@
  * is a v0.4 plugin feature.
  *
  * Layout:
- *   src/lib.c    — crate root; declares submodules + a couple of
- *                  top-level re-exports
- *   src/math.c   — integer min/max/abs/clamp
- *   src/mem.c    — strlen / memcmp wrappers with cust visibility
+ *   src/lib.c    — crate root; declares submodules + cstd_version()
+ *   src/types.c  — Rust-aligned primitive aliases
+ *                  (i8/.../i64, u8/.../u64, usize, isize, f32, f64)
+ *   src/math.c   — integer min/max/abs/clamp over `i32`
+ *   src/mem.c    — strlen / memcmp wrappers, returning `usize`/`i32`
  *
  * Downstream usage from another crate in the same workspace:
  *
@@ -20,19 +21,20 @@
  *     // src/lib.c
  *     #cust use cstd;
  *
- *     cust_pub int32_t my_max(int32_t a, int32_t b) {
+ *     cust_pub i32 my_max(i32 a, i32 b) {
  *         return cstd_max_i32(a, b);
  *     }
  */
 
+#cust mod types;
 #cust mod math;
 #cust mod mem;
 
-#include <stdint.h>
+#cust use crate::types;
 
 /* The cust major/minor this crate was authored against. Bumps with
  * the driver. Useful for downstream `static_assert`s once we expose
  * a real version macro. */
-cust_pub uint32_t cstd_version(void) {
-    return (0u << 16) | (3u << 8) | 0u; /* 0.3.0 */
+cust_pub u32 cstd_version(void) {
+    return (0u << 16) | (3u << 8) | 1u; /* 0.3.1 */
 }
