@@ -10,6 +10,11 @@
 //! strictly-whitelisted shape of `[dependencies]` entries (path
 //! deps only); see `validate_v0_3` below for the exact rules.
 //!
+//! v0.3.1 ([docs/design/v0.3.1.md]) adds `[[bin]]` (single-entry in
+//! v0.3.1; multi-bin via `src/bin/*.c` and `[[bin]]` arrays is
+//! v0.4+) and `Manifest::resolve_kind` for filesystem-driven crate
+//! kind inference (lib / bin / lib+bin).
+//!
 //! See `docs/design/cust-design.md` §3 and §17 for the canonical
 //! schema and current scope.
 
@@ -39,6 +44,12 @@ pub struct Manifest {
 
     #[serde(default)]
     pub lib: Option<Lib>,
+
+    /// v0.3.1: `[[bin]]` array. Accepted as an array shape for
+    /// forward-compat with the multi-bin v0.4 schema, but
+    /// `validate` rejects `len > 1` in v0.3.1 (V31D-3).
+    #[serde(default)]
+    pub bin: Vec<Bin>,
 
     #[serde(default)]
     pub clang: Clang,
@@ -134,6 +145,18 @@ pub struct Lib {
     /// v0.1 accepts only `["staticlib"]` (the default).
     #[serde(default, rename = "crate-type")]
     pub crate_type: Option<Vec<String>>,
+}
+
+/// `[[bin]]` table entry. v0.3.1 accepts a single entry only;
+/// multi-bin via `src/bin/*.c` and the multi-entry `[[bin]]`
+/// array is deferred to v0.4 (V31D-3 in v0.3.1.md).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bin {
+    /// Defaults to `src/main.c` when omitted.
+    #[serde(default)]
+    #[allow(dead_code)] // consumed by Slice B via resolve_kind
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -365,17 +388,40 @@ impl Manifest {
                 );
             }
             if let Some(ct) = &lib.crate_type {
-                // v0.3 stays library-only (V3D-7): bin / cdylib /
-                // rlib are rejected at parse time. Only
-                // ["staticlib"] is accepted.
+                // v0.3.1 still gates non-staticlib lib outputs:
+                // bin is now a [[bin]] table (v0.3.1), cdylib is
+                // still v0.4+. [lib] crate-type is a *library*
+                // setting and must be staticlib if present.
                 if ct.iter().any(|s| s != "staticlib") {
                     bail!(
                         "`[lib] crate-type` in `{}` only supports \
-                         [\"staticlib\"] in cust v0.3 (got {ct:?}); \
-                         binary and cdylib crates are v0.4+",
+                         [\"staticlib\"] in cust v0.3.1 (got {ct:?}); \
+                         binary crates use `[[bin]]`; cdylib is v0.4+",
                         path.display()
                     );
                 }
+            }
+        }
+
+        // [[bin]] settings only apply when the manifest is a
+        // package; v0.3.1 also caps the array at length 1
+        // (V31D-3 in v0.3.1.md).
+        if !self.bin.is_empty() {
+            if self.package.is_none() {
+                bail!(
+                    "`{}` has [[bin]] but no [package]; [[bin]] only \
+                     makes sense in a buildable crate",
+                    path.display()
+                );
+            }
+            if self.bin.len() > 1 {
+                bail!(
+                    "`{}` has {} [[bin]] entries; cust v0.3.1 supports \
+                     exactly one binary target per crate \
+                     (multi-bin via `src/bin/*.c` is v0.4+)",
+                    path.display(),
+                    self.bin.len()
+                );
             }
         }
 
@@ -452,6 +498,134 @@ impl Manifest {
             .and_then(|l| l.path.as_deref())
             .unwrap_or_else(|| Path::new("src/lib.c"));
         crate_root.join(rel)
+    }
+
+    /// Resolve which artifact(s) this crate produces based on
+    /// the manifest plus the on-disk presence of `src/lib.c` and
+    /// `src/main.c`. See [docs/design/v0.3.1.md](../../../docs/design/v0.3.1.md)
+    /// V31D-1 for the full decision table.
+    ///
+    /// Auto-inference rules:
+    ///
+    /// | `src/lib.c` | `src/main.c` | `[lib]` | `[[bin]]` | Result |
+    /// |---|---|---|---|---|
+    /// | present | absent  | any | absent | lib-only |
+    /// | absent  | present | absent | absent | bin-only |
+    /// | present | present | any | absent | lib+bin |
+    /// | any | any | any | present | path determined by `[[bin]] path` |
+    /// | absent  | absent  | absent | absent | error |
+    ///
+    /// An explicit `[lib]` or `[[bin]]` table makes the
+    /// corresponding component *required*: a missing file at the
+    /// declared (or default) path is an error rather than a
+    /// silent omission.
+    #[allow(dead_code)] // consumed by Slice B (build pipeline kind dispatch)
+    pub fn resolve_kind(&self, crate_root: &Path) -> Result<CrateKind> {
+        let lib_default = Path::new("src/lib.c");
+        let bin_default = Path::new("src/main.c");
+
+        let lib_rel = self.lib.as_ref().and_then(|l| l.path.as_deref());
+        let bin_rel = self.bin.first().and_then(|b| b.path.as_deref());
+
+        let lib_path = crate_root.join(lib_rel.unwrap_or(lib_default));
+        let bin_path = crate_root.join(bin_rel.unwrap_or(bin_default));
+
+        // Presence of the table itself (not just an explicit
+        // `path` field) is the "user wants this component" signal
+        // — mirrors how Cargo treats an empty `[lib]` / `[[bin]]`.
+        let lib_explicit = self.lib.is_some();
+        let bin_explicit = !self.bin.is_empty();
+
+        let lib_exists = lib_path.is_file();
+        let bin_exists = bin_path.is_file();
+
+        if lib_explicit && !lib_exists {
+            bail!(
+                "library source `{}` not found (configured via `[lib]` in `Cust.toml`)",
+                lib_path.display()
+            );
+        }
+        if bin_explicit && !bin_exists {
+            bail!(
+                "binary source `{}` not found (configured via `[[bin]]` in `Cust.toml`)",
+                bin_path.display()
+            );
+        }
+
+        let use_lib = lib_explicit || lib_exists;
+        let use_bin = bin_explicit || bin_exists;
+
+        match (use_lib, use_bin) {
+            (true, true) => Ok(CrateKind::LibAndBin {
+                lib_source: lib_path,
+                bin_source: bin_path,
+            }),
+            (true, false) => Ok(CrateKind::Lib {
+                lib_source: lib_path,
+            }),
+            (false, true) => Ok(CrateKind::Bin {
+                bin_source: bin_path,
+            }),
+            (false, false) => bail!(
+                "no library or binary source found in `{}`: neither \
+                 `src/lib.c` (lib) nor `src/main.c` (bin) is present \
+                 — add one, or set `[lib].path` / `[[bin]].path` in \
+                 `Cust.toml`",
+                crate_root.display()
+            ),
+        }
+    }
+}
+
+/// What a crate produces, after `Manifest::resolve_kind`
+/// consults the filesystem. v0.3.1's three shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // variants constructed by Slice B onward
+pub enum CrateKind {
+    /// Library only — produces `lib<name>.a` and a crate header.
+    Lib { lib_source: PathBuf },
+    /// Binary only — produces an executable; no archive published
+    /// for downstream consumption.
+    Bin { bin_source: PathBuf },
+    /// Both — lib built first, bin links against it. Crate
+    /// header is still published by the lib half.
+    LibAndBin {
+        lib_source: PathBuf,
+        bin_source: PathBuf,
+    },
+}
+
+impl CrateKind {
+    /// `true` when this crate has a library component
+    /// (`Lib` or `LibAndBin`).
+    #[allow(dead_code)] // consumed by Slice B/C
+    pub const fn has_lib(&self) -> bool {
+        matches!(self, Self::Lib { .. } | Self::LibAndBin { .. })
+    }
+
+    /// `true` when this crate has a binary component
+    /// (`Bin` or `LibAndBin`).
+    #[allow(dead_code)] // consumed by Slice B/C
+    pub const fn has_bin(&self) -> bool {
+        matches!(self, Self::Bin { .. } | Self::LibAndBin { .. })
+    }
+
+    /// Library source path, if any.
+    #[allow(dead_code)] // consumed by Slice B/C
+    pub fn lib_source(&self) -> Option<&Path> {
+        match self {
+            Self::Lib { lib_source } | Self::LibAndBin { lib_source, .. } => Some(lib_source),
+            Self::Bin { .. } => None,
+        }
+    }
+
+    /// Binary source path, if any.
+    #[allow(dead_code)] // consumed by Slice B/C
+    pub fn bin_source(&self) -> Option<&Path> {
+        match self {
+            Self::Bin { bin_source } | Self::LibAndBin { bin_source, .. } => Some(bin_source),
+            Self::Lib { .. } => None,
+        }
     }
 }
 
@@ -552,7 +726,7 @@ pub fn validate_package_name(name: &str) -> std::result::Result<(), &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_dep_spec, validate_package_name, Manifest};
+    use super::{validate_dep_spec, validate_package_name, CrateKind, Manifest};
 
     #[test]
     fn accepts_typical_names() {
@@ -753,5 +927,171 @@ members = ["a", "a"]
             validate_dep_spec("foo", &toml::Value::Table(t)).unwrap_err()
         );
         assert!(e.contains("missing `path"), "{e}");
+    }
+
+    // ─── Slice A (v0.3.1): [[bin]] + CrateKind ──────────────────
+
+    /// Stage a crate root with a manifest and an optional pair of
+    /// `src/lib.c` / `src/main.c`. Returns a `(tempdir, crate_root)`
+    /// so the temp dir's lifetime outlives the test.
+    fn stage_crate(
+        manifest_text: &str,
+        lib_c: Option<&str>,
+        main_c: Option<&str>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("Cust.toml"), manifest_text).unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        if let Some(body) = lib_c {
+            std::fs::write(src.join("lib.c"), body).unwrap();
+        }
+        if let Some(body) = main_c {
+            std::fs::write(src.join("main.c"), body).unwrap();
+        }
+        (tmp, root)
+    }
+
+    const PKG_TOML: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+
+    #[test]
+    fn resolve_kind_lib_only_from_disk() {
+        let (_tmp, root) = stage_crate(PKG_TOML, Some("int x;\n"), None);
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        assert!(kind.has_lib() && !kind.has_bin(), "{kind:?}");
+        assert_eq!(kind.lib_source().unwrap(), root.join("src/lib.c"));
+        assert_eq!(kind.bin_source(), None);
+        assert!(matches!(kind, CrateKind::Lib { .. }));
+    }
+
+    #[test]
+    fn resolve_kind_bin_only_from_disk() {
+        let (_tmp, root) = stage_crate(PKG_TOML, None, Some("int main(void){return 0;}\n"));
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        assert!(kind.has_bin() && !kind.has_lib(), "{kind:?}");
+        assert_eq!(kind.bin_source().unwrap(), root.join("src/main.c"));
+        assert!(matches!(kind, CrateKind::Bin { .. }));
+    }
+
+    #[test]
+    fn resolve_kind_lib_and_bin_when_both_files_present() {
+        let (_tmp, root) = stage_crate(
+            PKG_TOML,
+            Some("int x;\n"),
+            Some("int main(void){return 0;}\n"),
+        );
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        assert!(kind.has_lib() && kind.has_bin(), "{kind:?}");
+        assert!(matches!(kind, CrateKind::LibAndBin { .. }));
+    }
+
+    #[test]
+    fn resolve_kind_neither_source_is_error() {
+        let (_tmp, root) = stage_crate(PKG_TOML, None, None);
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let e = format!("{:#}", m.resolve_kind(&root).unwrap_err());
+        assert!(e.contains("no library or binary source"), "{e}");
+        assert!(e.contains("src/lib.c"), "{e}");
+        assert!(e.contains("src/main.c"), "{e}");
+    }
+
+    #[test]
+    fn explicit_lib_table_requires_lib_source() {
+        // [lib] table present but src/lib.c missing — even when
+        // src/main.c exists. User declared they want a lib;
+        // missing source is an error, not a silent demotion.
+        let manifest = format!("{PKG_TOML}[lib]\n");
+        let (_tmp, root) = stage_crate(&manifest, None, Some("int main(void){return 0;}\n"));
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let e = format!("{:#}", m.resolve_kind(&root).unwrap_err());
+        assert!(e.contains("library source"), "{e}");
+        assert!(e.contains("not found"), "{e}");
+    }
+
+    #[test]
+    fn explicit_bin_table_requires_bin_source() {
+        let manifest = format!("{PKG_TOML}[[bin]]\n");
+        let (_tmp, root) = stage_crate(&manifest, Some("int x;\n"), None);
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let e = format!("{:#}", m.resolve_kind(&root).unwrap_err());
+        assert!(e.contains("binary source"), "{e}");
+        assert!(e.contains("not found"), "{e}");
+    }
+
+    #[test]
+    fn explicit_bin_path_override_resolves_to_custom_file() {
+        let manifest = format!("{PKG_TOML}[[bin]]\npath = \"src/app.c\"\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("Cust.toml"), &manifest).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        assert_eq!(kind.bin_source().unwrap(), root.join("src/app.c"));
+    }
+
+    #[test]
+    fn multiple_bin_entries_rejected_in_v0_3_1() {
+        let manifest = format!("{PKG_TOML}[[bin]]\n[[bin]]\npath = \"src/other.c\"\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cust.toml");
+        std::fs::write(&path, &manifest).unwrap();
+        let e = format!("{:#}", Manifest::load(&path).unwrap_err());
+        assert!(e.contains("v0.3.1"), "{e}");
+        assert!(e.contains("multi-bin") || e.contains("v0.4+"), "{e}");
+    }
+
+    #[test]
+    fn bin_table_without_package_rejected() {
+        // [[bin]] in a virtual workspace root is meaningless.
+        let manifest = "[workspace]\nmembers = [\"app\"]\n[[bin]]\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cust.toml");
+        std::fs::write(&path, manifest).unwrap();
+        let e = format!("{:#}", Manifest::load(&path).unwrap_err());
+        assert!(e.contains("[[bin]]"), "{e}");
+        assert!(e.contains("[package]"), "{e}");
+    }
+
+    #[test]
+    fn lib_crate_type_bin_rejected_with_v0_3_1_pointer() {
+        // V31D-5: bin output is via [[bin]], not [lib]
+        // crate-type. The error message should make that clear.
+        let manifest = format!("{PKG_TOML}[lib]\ncrate-type = [\"bin\"]\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cust.toml");
+        std::fs::write(&path, &manifest).unwrap();
+        let e = format!("{:#}", Manifest::load(&path).unwrap_err());
+        assert!(e.contains("staticlib"), "{e}");
+        assert!(e.contains("[[bin]]"), "{e}");
+    }
+
+    #[test]
+    fn lib_crate_type_cdylib_still_rejected() {
+        // cdylib is v0.4+; v0.3.1 doesn't change that.
+        let manifest = format!("{PKG_TOML}[lib]\ncrate-type = [\"cdylib\"]\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cust.toml");
+        std::fs::write(&path, &manifest).unwrap();
+        let e = format!("{:#}", Manifest::load(&path).unwrap_err());
+        assert!(e.contains("staticlib"), "{e}");
+        assert!(e.contains("v0.4+"), "{e}");
+    }
+
+    #[test]
+    fn bin_with_unknown_subkey_rejected() {
+        // [[bin]] currently only accepts `path`; `name` is
+        // derived from the package name in v0.3.1.
+        let manifest = format!("{PKG_TOML}[[bin]]\nname = \"override\"\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cust.toml");
+        std::fs::write(&path, &manifest).unwrap();
+        let e = format!("{:#}", Manifest::load(&path).unwrap_err());
+        assert!(e.contains("unknown field") || e.contains("name"), "{e}");
     }
 }
