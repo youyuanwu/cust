@@ -732,15 +732,18 @@ fn compile_one_module(
 /// `target/<profile>/.h-fragments/<crate>/<qname>.cust.h` before
 /// the codegen pass needs to `#include` them. Tolerant of compile
 /// failures — cross-module references in this pass are *expected*
-/// to be unresolved (that's why we're emitting fragments in the
-/// first place); the codegen pass will fail loudly if any genuine
-/// errors remain.
+/// to be unresolved on iter 1 (that's why we're emitting fragments
+/// in the first place); the codegen pass will fail loudly if any
+/// genuine errors remain.
 ///
-/// We deliberately do NOT lower `#cust use crate::X;` to an
-/// `#include` here because the imported fragment may not exist
-/// yet. V40D-11 wraps this in a fixed-point loop;
-/// `surface_pass_fixed_point` is the entry point callers should
-/// use.
+/// `#cust use crate::X;` is lowered to an `#include` of `X`'s
+/// fragment header **iff that fragment already exists on disk** —
+/// otherwise blanked. On iter 1 of the fixed-point loop most
+/// sibling fragments are missing, so clang sees unresolved
+/// typedefs and falls back to implicit-int recovery (correct
+/// fragments arrive on iter 2). V40D-11 wraps this in a fixed-
+/// point loop; `surface_pass_fixed_point` is the entry point
+/// callers should use.
 fn surface_pass(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -754,9 +757,52 @@ fn surface_pass(
         let src_text = fs::read_to_string(&m.source_path)
             .with_context(|| format!("reading `{}`", m.source_path.display()))?;
         let scan = mod_scanner::scan(&src_text, &m.source_path)?;
-        // Blank all directives — no fragment includes in surface
-        // pass.
-        let rewritten = mod_scanner::rewrite(&src_text, &m.source_path, &scan);
+        // Lower `#cust use` directives to `#include`s of the
+        // matching fragment / dep header **when the target file
+        // already exists on disk**. On iteration 1 of the fixed-
+        // point loop, sibling fragments don't exist yet and the
+        // directive is blanked (clang sees undeclared identifiers,
+        // recovers, and the plugin emits a best-effort fragment).
+        // Subsequent iterations pick up the now-written fragments
+        // and re-resolve typedef/struct names properly. Without
+        // this lowering the fixed-point loop is structurally
+        // inert — surface_pass would never see imported types,
+        // so a `[[cust::pub]] usize foo(void)` in module M would
+        // be exported as `int foo(void)` (clang's implicit-int
+        // recovery for undeclared identifiers in declarator
+        // position), silently corrupting the published ABI.
+        //
+        // Cross-crate `#cust use <dep>;` is always included
+        // because workspace topo-sort guarantees deps are built
+        // (and therefore their headers exist) before this pass
+        // runs. Unknown deps are not validated here — codegen
+        // does that with a proper line:column diagnostic — and
+        // are blanked so a missing path doesn't produce an
+        // include-resolution error during the tolerant surface
+        // compile.
+        let rewritten =
+            mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| match &d.kind {
+                crate::mod_scanner::DirectiveKind::UseCrate { name } => {
+                    let frag = layout.fragment_path(crate_name, name);
+                    if frag.is_file() {
+                        Some(format!("#include \"{}\"", frag.display()))
+                    } else {
+                        None
+                    }
+                }
+                crate::mod_scanner::DirectiveKind::UseDep { name } => {
+                    if plan.deps.iter().any(|n| n == name) {
+                        let dep_header = layout
+                            .dep_dir(name)
+                            .join("include")
+                            .join(format!("{name}.h"));
+                        Some(format!("#include \"{}\"", dep_header.display()))
+                    } else {
+                        None
+                    }
+                }
+                crate::mod_scanner::DirectiveKind::Mod { .. } => None,
+            });
 
         let surface_path = crate_build_dir.join(format!("{}.surface.c", m.qualified_name));
         fs::write(&surface_path, &rewritten)

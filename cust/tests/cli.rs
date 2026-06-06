@@ -579,6 +579,58 @@ fn build_emits_concatenated_crate_header() {
 }
 
 #[test]
+fn surface_pass_resolves_cross_module_typedef() {
+    // Regression for the bug fixed alongside this test: the
+    // surface pass used to blank every `#cust use` directive
+    // unconditionally, so when module M referenced a
+    // `[[cust::pub]] typedef` exported by sibling N, clang saw
+    // an undeclared identifier in a declarator position and
+    // recovered with implicit-int. The plugin then exported the
+    // wrong return / parameter type (`int` instead of the real
+    // underlying primitive), silently corrupting the ABI of the
+    // published `<crate>.h`. The fix lowers `#cust use crate::X;`
+    // to an `#include` of X's fragment header **iff** the fragment
+    // exists, and relies on the V40D-11 fixed-point loop to
+    // converge (iter 1: best-effort blanking; iter 2+: real
+    // includes). See [v0.4.0.md](docs/design/v0.4.0.md) V40D-11.
+    //
+    // Plugin-dependent: skip when not built.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("cross_module_typedef");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+
+    let hdr = dir.join("target/debug/build/cross_module_typedef/include/cross_module_typedef.h");
+    assert!(hdr.is_file(), "missing crate header at {}", hdr.display());
+    let body = fs::read_to_string(&hdr).unwrap();
+
+    // The typedef must propagate to the published header. Either
+    // the alias name wins (clang preserves the typedef when it's
+    // visible — the common case) or the printer desugars to the
+    // underlying primitive (`unsigned long` on every cust-
+    // supported platform today). The failure mode this regression
+    // pins is the `int` fallback that the pre-fix surface pass
+    // produced.
+    let signature_ok = body.contains("cmt_usize cmt_mem_size(void);")
+        || body.contains("unsigned long cmt_mem_size(void);");
+    assert!(
+        signature_ok,
+        "cross-module typedef regression: published header does not \
+         expose `cmt_usize` (or `unsigned long`) for `cmt_mem_size`. \
+         Header body:\n{body}"
+    );
+    // Tight assertion on the failure mode: must NOT be `int`.
+    assert!(
+        !body.contains("int cmt_mem_size(void);"),
+        "regression: `cmt_mem_size` exported with the implicit-int \
+         recovery type, not the imported typedef. Header body:\n{body}"
+    );
+}
+
+#[test]
 fn build_without_plugin_emits_v40d12_error() {
     // V0.4.0 V40D-12: plugin is mandatory for `cust build`. With
     // no discoverable plugin the build must hard-error with the

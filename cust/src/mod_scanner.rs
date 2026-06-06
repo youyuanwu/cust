@@ -633,7 +633,11 @@ fn parse_use(tokens: &[Token], file: &Path, line: u32, col: u32) -> Result<Direc
 /// clang diagnostics still point at the original source.
 ///
 /// Convenience wrapper around `rewrite_with` for callers that
-/// want to blank every directive without substitution.
+/// want to blank every directive without substitution. Currently
+/// used only by unit tests — the production build pipeline always
+/// goes through `rewrite_with` so it can lower `#cust use` to
+/// `#include` directives.
+#[allow(dead_code)] // unit tests + reserved as the symmetric "blank everything" entry point
 pub fn rewrite(src: &str, file: &Path, result: &ScanResult) -> String {
     rewrite_with(src, file, result, |_| None)
 }
