@@ -1292,20 +1292,27 @@ Roadmap bullets here are deliberately short:
     v0.3.2 close, +3 from the new geom module).
   Full shipped details, locked V40D-N decisions, slice-by-slice
   deltas, and verification in [v0.4.0.md](v0.4.0.md). v0.4.0
-  is the first milestone in the v0.4 series; v0.4.1+ continues
-  with registry, build scripts, parallelism, and the
-  `cust test` follow-ups.
+  is the first milestone in the v0.4 series; v0.4.2+ continues
+  with build scripts, parallelism, multi-bin, and the
+  `cust test` follow-ups. (v0.4.1 was briefly slotted for
+  FFI work, then deferred — see the v0.4.x bullet below.)
 * **v0.4.x — rest of the v0.4 series** (post-v0.4.0; planned).
   v0.4.0 shipped plugin v1 (above); the remaining v0.4.x
   milestones split out from the original "v0.4 carries
-  everything" bullet:
-  - **v0.4.1** — dependency resolver + registry. Initial
-    registry wire protocol (`Index` trait, `file://` first
-    per V3D-1's deferral), `cust add`, semver version
-    resolution, `Cust.lock` source hashes,
-    `[workspace.dependencies]` inheritance (OQ-6).
+  everything" bullet. The next-up slot was once "v0.4.1
+  registry"; then briefly "v0.4.1 FFI & system types"
+  (design locked 2026-06-06, [v0.4.1.md](v0.4.1.md));
+  then deferred (2026-06-06) on the FFI work — see
+  [v0.4.1.md](v0.4.1.md) deferral notice for the LLVM
+  [#45791](https://github.com/llvm/llvm-project/issues/45791)
+  rationale. Effective ordering now:
+  - **v0.4.1 — ⏸️ DEFERRED.** Design locked but not
+    scheduled. Resumes when upstream LLVM #45791 lands or
+    when concrete dogfooding pressure forces the
+    `[[clang::annotate(...)]]` workaround. See
+    [v0.4.1.md](v0.4.1.md).
   - **v0.4.2** — build scripts (`build.cust.c`) with the
-    §12 hang-protection timeout.
+    §12 hang-protection timeout. **Next-up.**
   - **v0.4.3** — `-jN` parallelism (within and across
     crates).
   - **v0.4.4** — multi-bin per crate (`src/bin/*.c`,
@@ -1315,8 +1322,19 @@ Roadmap bullets here are deliberately short:
     `should_panic`, per-test timeout, `--nocapture` /
     `--exact` / multi-filter / `--test-threads N`,
     `[profile.test]` plumbing.
+  - **v0.4.6** — dependency resolver + registry. Initial
+    registry wire protocol (`Index` trait, `file://` first
+    per V3D-1's deferral), `cust add`, semver version
+    resolution, `Cust.lock` source hashes,
+    `[workspace.dependencies]` inheritance (OQ-6). This
+    work was twice displaced from the v0.4.1 slot (first by
+    FFI, then by the FFI deferral); it's now slotted after
+    the rest of the v0.4.x line.
+  - **v0.4.7+** — when v0.4.1's FFI design resumes, it
+    picks up here (or sooner if a resumption criterion
+    fires earlier — see [v0.4.1.md](v0.4.1.md)).
   Each lands as its own `docs/design/v0.4.<N>.md`. The
-  v0.4.x ordering is a draft; the locking criterion is
+  v0.4.x ordering remains a draft; the locking criterion is
   "each milestone independently shippable and dogfooded
   against cwork."
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
