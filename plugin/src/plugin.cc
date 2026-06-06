@@ -26,11 +26,16 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "clang/Basic/AttributeCommonInfo.h"
+#include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/LangOptions.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/FrontendOptions.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -65,6 +70,22 @@ CustPubKind getCustPubKind(const Decl *D) {
         if (ann == "cust::pub_repr") return CustPubKind::PubRepr;
     }
     return CustPubKind::None;
+}
+
+// V40D-7 + V40D-14 test attribute kind.
+enum class CustTestKind {
+    None,
+    Test,
+    TestIgnore,
+};
+
+CustTestKind getCustTestKind(const Decl *D) {
+    for (const auto *attr : D->specific_attrs<AnnotateAttr>()) {
+        llvm::StringRef ann = attr->getAnnotation();
+        if (ann == "cust::test") return CustTestKind::Test;
+        if (ann == "cust::test_ignore") return CustTestKind::TestIgnore;
+    }
+    return CustTestKind::None;
 }
 
 // V40D-4 error: pub_repr only applies to records/enums.
@@ -254,6 +275,97 @@ std::string buildFragmentContents(ASTContext &ctx,
     return contents;
 }
 
+// V40D-6 + RQ-V40-2: emit one TSV line per discovered cust::test /
+// cust::test_ignore decl. Format:
+//
+//   <qname>\t<fn_kind>\t<ignored>\t<file>\t<line>
+//
+// where qname = `<module>::<name>` (module passed in by the driver
+// via the `module=...` plugin arg), fn_kind is the literal string
+// `int` or `void`, ignored is `0` or `1`, file is an absolute path,
+// line is a 1-based decimal. RQ-V40-2 rejects file paths containing
+// literal tab or newline.
+//
+// Functions tagged but whose signature is not `int (void)` or
+// `void (void)` are rejected here with a clear diagnostic. This
+// matches the v0.3.2 pre-pass behaviour and keeps the runner
+// template's switch on fn_kind closed (V40D-14 fn_ptr cast site).
+std::string buildSidecarContents(ASTContext &ctx,
+                                 llvm::StringRef module,
+                                 DiagnosticsEngine &diags) {
+    std::string contents;
+    SourceManager &sm = ctx.getSourceManager();
+
+    for (Decl *D : ctx.getTranslationUnitDecl()->decls()) {
+        if (D->isImplicit()) {
+            continue;
+        }
+        const auto *fd = dyn_cast<FunctionDecl>(D);
+        if (!fd) {
+            continue;
+        }
+        CustTestKind kind = getCustTestKind(fd);
+        if (kind == CustTestKind::None) {
+            continue;
+        }
+
+        // V40D-14 signature check. Test functions must take `void`
+        // and return `int` or `void`; anything else is rejected.
+        QualType ret = fd->getReturnType();
+        llvm::StringRef fnKind;
+        if (ret->isVoidType()) {
+            fnKind = "void";
+        } else if (ret->isSpecificBuiltinType(BuiltinType::Int)) {
+            fnKind = "int";
+        } else {
+            unsigned id = diags.getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "`[[cust::test]]` function `%0` must return `int` or "
+                "`void` (got `%1`)");
+            diags.Report(fd->getLocation(), id)
+                << fd->getName().str() << ret.getAsString();
+            continue;
+        }
+        if (fd->getNumParams() != 0) {
+            unsigned id = diags.getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "`[[cust::test]]` function `%0` must take no parameters "
+                "(declared with `(void)`)");
+            diags.Report(fd->getLocation(), id) << fd->getName().str();
+            continue;
+        }
+
+        // RQ-V40-2 source-location -> file + line.
+        PresumedLoc ploc = sm.getPresumedLoc(fd->getLocation());
+        if (ploc.isInvalid()) {
+            continue; // shouldn't happen for non-implicit decls
+        }
+        llvm::StringRef file = ploc.getFilename();
+        if (file.contains('\t') || file.contains('\n')) {
+            unsigned id = diags.getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "sidecar file path contains illegal character "
+                "(tab or newline): %0");
+            diags.Report(fd->getLocation(), id) << file.str();
+            continue;
+        }
+
+        contents += module.str();
+        contents += "::";
+        contents += fd->getName().str();
+        contents += '\t';
+        contents += fnKind.str();
+        contents += '\t';
+        contents += (kind == CustTestKind::TestIgnore) ? "1" : "0";
+        contents += '\t';
+        contents += file.str();
+        contents += '\t';
+        contents += std::to_string(ploc.getLine());
+        contents += '\n';
+    }
+    return contents;
+}
+
 // Atomic write with skip-on-identical. Returns true on success.
 bool writeFragmentIfChanged(const std::string &path,
                             const std::string &contents,
@@ -305,24 +417,66 @@ bool writeFragmentIfChanged(const std::string &path,
 
 class CustASTConsumer : public ASTConsumer {
 public:
-    CustASTConsumer(CompilerInstance &ci, std::string fragmentOut)
-        : CI(ci), FragmentOut(std::move(fragmentOut)) {}
+    CustASTConsumer(CompilerInstance &ci, std::string fragmentOut,
+                    std::string testSidecarOut, std::string module)
+        : CI(ci),
+          FragmentOut(std::move(fragmentOut)),
+          TestSidecarOut(std::move(testSidecarOut)),
+          Module(std::move(module)) {}
 
     void HandleTranslationUnit(ASTContext &ctx) override {
-        if (FragmentOut.empty()) {
-            // Plugin loaded but driver passed no destination —
-            // happens for clangd/IDE compilations that should
-            // share flags but skip the fragment-header side
-            // effect. Silent no-op.
+        // V40D-5 phase isolation. Fragment headers AND test
+        // discovery sidecars are written **only** in phase 1
+        // (`ParseSyntaxOnly`). Phase 2 (`EmitLLVMOnly` /
+        // `EmitObj`) with either path set is a driver bug —
+        // hard error so the regression is impossible to miss.
+        DiagnosticsEngine &diags = CI.getDiagnostics();
+        bool phaseOne = CI.getFrontendOpts().ProgramAction ==
+                        frontend::ParseSyntaxOnly;
+        bool wantFragment = !FragmentOut.empty();
+        bool wantSidecar = !TestSidecarOut.empty();
+
+        if (!phaseOne && (wantFragment || wantSidecar)) {
+            unsigned id = diags.getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "cust plugin: phase-2 invocation must not write "
+                "fragment headers or sidecar files (driver bug — "
+                "drop -fplugin-arg-cust-{fragment-out,test-sidecar-out} "
+                "for codegen invocations)");
+            diags.Report(id);
             return;
         }
-        std::string contents = buildFragmentContents(ctx, CI.getDiagnostics());
-        writeFragmentIfChanged(FragmentOut, contents, CI.getDiagnostics());
+
+        // Phase 1 with no paths set is a silent no-op — IDE-side
+        // clangd invocations want to share flags without the
+        // side effects.
+        if (!wantFragment && !wantSidecar) {
+            return;
+        }
+
+        if (wantFragment) {
+            std::string contents = buildFragmentContents(ctx, diags);
+            writeFragmentIfChanged(FragmentOut, contents, diags);
+        }
+        if (wantSidecar) {
+            if (Module.empty()) {
+                unsigned id = diags.getCustomDiagID(
+                    DiagnosticsEngine::Error,
+                    "cust plugin: -fplugin-arg-cust-test-sidecar-out set "
+                    "without -fplugin-arg-cust-module (driver bug)");
+                diags.Report(id);
+                return;
+            }
+            std::string contents = buildSidecarContents(ctx, Module, diags);
+            writeFragmentIfChanged(TestSidecarOut, contents, diags);
+        }
     }
 
 private:
     CompilerInstance &CI;
     std::string FragmentOut;
+    std::string TestSidecarOut;
+    std::string Module;
 };
 
 // ---------------------------------------------------------------------------
@@ -460,20 +614,136 @@ struct CustPubReprAttrInfo : public ParsedAttrInfo {
     }
 };
 
+// V40D-14: in non-test builds (`CUST_TEST_BUILD` undefined), test
+// functions get `InternalLinkageAttr + UnusedAttr` so they don't
+// leak into the regular artifact (no `nm` matches, no missing-
+// reference warnings). In test builds (`CUST_TEST_BUILD` defined)
+// they keep external linkage so the generated runner TU can
+// reference them via `extern`.
+//
+// Macro detection from inside `handleDeclAttribute` (which runs
+// during parsing, before `CustASTConsumer` exists):
+//
+//   S.getPreprocessor().getMacroInfo(
+//       S.getPreprocessor().getIdentifierInfo("CUST_TEST_BUILD"))
+//
+// Returns non-null iff the macro is defined. Cached per-Sema via
+// a static `llvm::DenseMap<Sema *, bool>` so a TU with many
+// `[[cust::test]]` decls doesn't re-walk the macro table for
+// each one. Sema lifetime is one TU; entries are short-lived.
+bool isCustTestBuildDefined(Sema &S) {
+    static llvm::DenseMap<Sema *, bool> cache;
+    auto it = cache.find(&S);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    Preprocessor &pp = S.getPreprocessor();
+    IdentifierInfo *ii = pp.getIdentifierInfo("CUST_TEST_BUILD");
+    bool defined = ii != nullptr && pp.getMacroInfo(ii) != nullptr;
+    cache[&S] = defined;
+    return defined;
+}
+
+void attachTestAttrs(Sema &S, Decl *D, const ParsedAttr &Attr,
+                     llvm::StringRef payload) {
+    ASTContext &ctx = S.getASTContext();
+    D->addAttr(AnnotateAttr::Create(ctx, payload.str(),
+                                    /*Args=*/nullptr, /*NumArgs=*/0,
+                                    Attr.getRange()));
+    if (!isCustTestBuildDefined(S)) {
+        D->addAttr(InternalLinkageAttr::CreateImplicit(ctx, Attr.getRange()));
+        D->addAttr(UnusedAttr::CreateImplicit(ctx, Attr.getRange()));
+    }
+}
+
+// `[[cust::test]]` — function decls only. Validation of return
+// type / param count lives in `buildSidecarContents` (richer
+// diagnostic with the actual type); diagAppertainsToDecl just
+// rejects non-functions.
+struct CustTestAttrInfo : public ParsedAttrInfo {
+    CustTestAttrInfo() {
+        NumArgs = 0;
+        OptArgs = 0;
+        static constexpr Spelling kSpellings[] = {
+            {ParsedAttr::AS_CXX11, "cust::test"},
+            {ParsedAttr::AS_C23, "cust::test"},
+        };
+        Spellings = kSpellings;
+    }
+
+    bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                              const Decl *D) const override {
+        if (!isa<FunctionDecl>(D)) {
+            unsigned id = S.getDiagnostics().getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "`[[cust::test]]` only applies to function declarations");
+            S.Diag(Attr.getLoc(), id);
+            return false;
+        }
+        return true;
+    }
+
+    AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                     const ParsedAttr &Attr) const override {
+        attachTestAttrs(S, D, Attr, "cust::test");
+        return AttributeApplied;
+    }
+};
+
+// `[[cust::test_ignore]]` — same as test, just routes the sidecar
+// `ignored` column to `1`.
+struct CustTestIgnoreAttrInfo : public ParsedAttrInfo {
+    CustTestIgnoreAttrInfo() {
+        NumArgs = 0;
+        OptArgs = 0;
+        static constexpr Spelling kSpellings[] = {
+            {ParsedAttr::AS_CXX11, "cust::test_ignore"},
+            {ParsedAttr::AS_C23, "cust::test_ignore"},
+        };
+        Spellings = kSpellings;
+    }
+
+    bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                              const Decl *D) const override {
+        if (!isa<FunctionDecl>(D)) {
+            unsigned id = S.getDiagnostics().getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "`[[cust::test_ignore]]` only applies to function "
+                "declarations");
+            S.Diag(Attr.getLoc(), id);
+            return false;
+        }
+        return true;
+    }
+
+    AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                     const ParsedAttr &Attr) const override {
+        attachTestAttrs(S, D, Attr, "cust::test_ignore");
+        return AttributeApplied;
+    }
+};
+
 class CustPluginAction : public PluginASTAction {
 protected:
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                    llvm::StringRef) override {
-        return std::make_unique<CustASTConsumer>(CI, FragmentOut);
+        return std::make_unique<CustASTConsumer>(CI, FragmentOut,
+                                                 TestSidecarOut, Module);
     }
 
     bool ParseArgs(const CompilerInstance &CI,
                    const std::vector<std::string> &args) override {
         static constexpr llvm::StringRef kFragOut = "fragment-out=";
+        static constexpr llvm::StringRef kSidecarOut = "test-sidecar-out=";
+        static constexpr llvm::StringRef kModule = "module=";
         for (const auto &a : args) {
             llvm::StringRef sa = a;
             if (sa.starts_with(kFragOut)) {
                 FragmentOut = sa.drop_front(kFragOut.size()).str();
+            } else if (sa.starts_with(kSidecarOut)) {
+                TestSidecarOut = sa.drop_front(kSidecarOut.size()).str();
+            } else if (sa.starts_with(kModule)) {
+                Module = sa.drop_front(kModule.size()).str();
             } else {
                 auto &diags = CI.getDiagnostics();
                 auto id = diags.getCustomDiagID(
@@ -493,6 +763,8 @@ protected:
 
 private:
     std::string FragmentOut;
+    std::string TestSidecarOut;
+    std::string Module;
 };
 
 } // namespace
@@ -500,11 +772,15 @@ private:
 static FrontendPluginRegistry::Add<CustPluginAction>
     X("cust", "cust clang plugin (surface extraction)");
 
-// V40D-7 five-name model. test + test_ignore land in slice C.
+// V40D-7 five-name model.
 static ParsedAttrInfoRegistry::Add<CustPubAttrInfo>
     Y1("cust_pub", "cust [[cust::pub]] attribute recogniser (V40D-7)");
 static ParsedAttrInfoRegistry::Add<CustPubCrateAttrInfo>
     Y2("cust_pub_crate", "cust [[cust::pub_crate]] attribute recogniser (V40D-7)");
 static ParsedAttrInfoRegistry::Add<CustPubReprAttrInfo>
     Y3("cust_pub_repr", "cust [[cust::pub_repr]] attribute recogniser (V40D-7)");
+static ParsedAttrInfoRegistry::Add<CustTestAttrInfo>
+    Y4("cust_test", "cust [[cust::test]] attribute recogniser (V40D-7)");
+static ParsedAttrInfoRegistry::Add<CustTestIgnoreAttrInfo>
+    Y5("cust_test_ignore", "cust [[cust::test_ignore]] attribute recogniser (V40D-7)");
 

@@ -664,14 +664,19 @@ fn build_with_plugin_injects_fplugin_flag() {
         cc.contains(&expected),
         "expected `{expected}` in compile_commands.json:\n{cc}"
     );
-    // The driver passes the fragment-out arg per TU.
+    // V40D-5: fragment headers are emitted by the dedicated
+    // surface_pass (phase 1 / -fsyntax-only) and the plugin
+    // hard-errors if `fragment-out` arrives during codegen.
+    // `compile_commands.json` records codegen invocations, so
+    // it must NOT contain the fragment-out arg.
     assert!(
-        cc.contains("-fplugin-arg-cust-fragment-out="),
-        "expected fragment-out arg in compile_commands.json:\n{cc}"
+        !cc.contains("-fplugin-arg-cust-fragment-out="),
+        "compile_commands.json contains codegen fragment-out arg (V40D-5 violation):\n{cc}"
     );
 
     // Strongest proof the plugin actually ran: the fragment
-    // header for the root module exists on disk.
+    // header for the root module exists on disk (written by
+    // surface_pass).
     let frag = dir.join("target/debug/.h-fragments/hello/lib.cust.h");
     assert!(
         frag.is_file(),

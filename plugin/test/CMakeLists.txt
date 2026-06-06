@@ -73,3 +73,65 @@ add_test(
         "repr_on_variable"
         "repr_on_typedef"
 )
+
+# Slice C — V40D-6 + RQ-V40-2 sidecar emission.
+# Expected entries are passed as flat (qname, fn_kind, ignored)
+# triples; the runner reconstructs the tab-delimited needle.
+# This sidesteps CMake `add_test` not honouring bash ANSI-C
+# `$'...\t...'` quoting.
+add_test(
+    NAME test_test_sidecar
+    COMMAND
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_sidecar_test.sh"
+        "${CLANG_C_EXECUTABLE}"
+        "$<TARGET_FILE:cust_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/test_test_sidecar.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/test_test_sidecar.tsv"
+        "test_module::test_alpha"          "int"  "0"
+        "test_module::test_beta"           "void" "0"
+        "test_module::test_gamma_ignored"  "int"  "1"
+)
+
+# Slice C — V40D-14 non-test-build linkage attachment. The fixture
+# uses [[cust::test]] decls; without -DCUST_TEST_BUILD the plugin
+# attaches InternalLinkageAttr + UnusedAttr so the symbols don't
+# leak into the regular artifact.
+add_test(
+    NAME test_test_internal_linkage
+    COMMAND
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_internal_linkage_test.sh"
+        "${CLANG_C_EXECUTABLE}"
+        "$<TARGET_FILE:cust_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/test_test_sidecar.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/test_test_internal_linkage.o"
+        "test_alpha"
+        "test_beta"
+        "test_gamma_ignored"
+)
+
+# Slice C — V40D-5 phase isolation.
+add_test(
+    NAME test_phase_isolation
+    COMMAND
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_phase_isolation_test.sh"
+        "${CLANG_C_EXECUTABLE}"
+        "$<TARGET_FILE:cust_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/test_phase_isolation.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/test_phase_isolation.cust.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/test_phase_isolation.o"
+)
+
+# Slice C — V40D-14 signature validation. [[cust::test]] functions
+# must take `void` and return `int` or `void`.
+add_test(
+    NAME test_test_signature_errors
+    COMMAND
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_test_errors_test.sh"
+        "${CLANG_C_EXECUTABLE}"
+        "$<TARGET_FILE:cust_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/test_test_signature_errors.c"
+        "must (return|take)"
+        "test_takes_args"
+        "test_wrong_return"
+        "test_pointer_return"
+)

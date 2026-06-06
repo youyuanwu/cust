@@ -180,11 +180,15 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
             modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
 
         // Surface-extraction pass for cross-module fragment
-        // headers, only relevant for the lib half (the bin half
-        // doesn't publish fragments).
-        let needs_surface_pass =
-            plan.plugin.is_some() && lib_modules.iter().any(|m| !m.imports.is_empty());
-        if needs_surface_pass {
+        // headers. V40D-5 makes fragment emission phase-1-only;
+        // v0.3 used to emit fragments as a side effect of the
+        // codegen invocation when no cross-module imports were
+        // present, but that's no longer permitted (the plugin
+        // hard-errors if `fragment-out` arrives in phase 2). We
+        // run surface_pass unconditionally whenever the plugin
+        // is loaded so the per-crate header concat step in
+        // `write_crate_header` below has fragments to read.
+        if plan.plugin.is_some() {
             surface_pass(
                 plan,
                 &profile,
@@ -202,7 +206,6 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
             &crate_build_dir,
             &layout,
             &lib_modules,
-            /* emit_fragments = */ true,
             /* extra_includes = */ &[],
             /* is_bin_half = */ false,
             &mut compile_entries,
@@ -268,7 +271,6 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
             &crate_build_dir,
             &layout,
             &bin_modules,
-            /* emit_fragments = */ false,
             &extra_includes,
             /* is_bin_half = */ true,
             &mut compile_entries,
@@ -368,10 +370,10 @@ fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
 
     // Same surface pass + crate-header sequence the lib half
     // normally runs. Tests can `#cust use crate::<sibling>;`
-    // exactly like production code.
-    let needs_surface_pass =
-        plan.plugin.is_some() && lib_modules.iter().any(|m| !m.imports.is_empty());
-    if needs_surface_pass {
+    // exactly like production code. V40D-5: surface_pass runs
+    // unconditionally when the plugin is loaded (see the
+    // matching change in `run`).
+    if plan.plugin.is_some() {
         surface_pass(
             plan,
             &profile,
@@ -393,7 +395,6 @@ fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
         &test_dir,
         &layout,
         &lib_modules,
-        /* emit_fragments = */ true,
         /* extra_includes = */ &[],
         /* is_bin_half = */ false,
         &mut compile_entries,
@@ -505,14 +506,15 @@ fn build_runner_cflags(
     flags
 }
 
-/// `emit_fragments = true` makes the plugin write per-module
-/// fragment headers (lib half); `false` skips that (bin half).
-/// `extra_includes` is prepended to clang's `-I` set so per-half
-/// concerns (e.g. bin → lib include dir) propagate.
-/// `is_bin_half` controls intra-crate self-import semantics:
-/// when `true`, `#cust use <own-package-name>;` is accepted as
-/// Cargo-style "bin reaches its own lib" and lowered to the
-/// crate's own lib include (Slice C, V31D-1 follow-up).
+/// Codegen-phase compile of every module in `modules`. Does NOT
+/// emit fragment headers: V40D-5 makes fragment emission
+/// phase-1-only, and the dedicated `surface_pass` (run before
+/// this) takes that job. `extra_includes` is prepended to clang's
+/// `-I` set so per-half concerns (e.g. bin → lib include dir)
+/// propagate. `is_bin_half` controls intra-crate self-import
+/// semantics: when `true`, `#cust use <own-package-name>;` is
+/// accepted as Cargo-style "bin reaches its own lib" and lowered
+/// to the crate's own lib include (Slice C, V31D-1 follow-up).
 #[allow(clippy::too_many_arguments)] // tightly coupled to compile_one_module's surface
 fn compile_tree(
     plan: &BuildPlan<'_>,
@@ -521,27 +523,20 @@ fn compile_tree(
     crate_build_dir: &Path,
     layout: &TargetLayout,
     modules: &[Module],
-    emit_fragments: bool,
     extra_includes: &[&Path],
     is_bin_half: bool,
     compile_entries: &mut Vec<CompileEntry>,
 ) -> Result<Vec<PathBuf>> {
-    let crate_name = plan.manifest.package_name();
     let mut objects: Vec<PathBuf> = Vec::with_capacity(modules.len());
 
     for m in modules {
-        let fragment_path = if emit_fragments && plan.plugin.is_some() {
-            Some(layout.fragment_path(crate_name, &m.qualified_name))
-        } else {
-            None
-        };
         let (rewritten_path, object_path, cflags) = compile_one_module(
             plan,
             profile,
             prelude,
             crate_build_dir,
             layout,
-            fragment_path.as_deref(),
+            /* fragment_out = */ None,
             extra_includes,
             is_bin_half,
             m,
