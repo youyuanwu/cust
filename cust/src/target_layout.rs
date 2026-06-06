@@ -73,7 +73,7 @@ impl TargetLayout {
     /// (profile-level, single-crate-only). v0.3 moves it under
     /// the member's own build dir so workspace builds can point
     /// the `deps/<name>` symlink at it without collisions
-    /// (cust-design.md §5 + v0.3.md scope item 6).
+    /// (cust-design.md §5 + v0.3.0.md scope item 6).
     pub fn crate_header_path(&self, crate_name: &str) -> PathBuf {
         self.build_dir(crate_name)
             .join("include")

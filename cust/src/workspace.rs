@@ -1,6 +1,6 @@
 //! Workspace discovery and member resolution.
 //!
-//! v0.3 ([docs/design/v0.3.md]) adds `[workspace]` to `Cust.toml`.
+//! v0.3 ([docs/design/v0.3.0.md]) adds `[workspace]` to `Cust.toml`.
 //! A workspace consists of:
 //!
 //! * A **workspace root** — the directory containing the `Cust.toml`
@@ -469,7 +469,7 @@ impl Workspace {
     /// (dependencies before dependents). Cycle detection raises
     /// `error: dependency cycle: a → b → a` with the cycle
     /// canonicalised to start at the alphabetically-first name
-    /// (per scope item 5 in docs/design/v0.3.md). Self-cycles
+    /// (per scope item 5 in docs/design/v0.3.0.md). Self-cycles
     /// produce `error: dependency cycle: a → a`.
     ///
     /// The returned vector contains every member exactly once.

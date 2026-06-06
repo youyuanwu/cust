@@ -1,6 +1,6 @@
 //! `Cust.lock` schema and emission.
 //!
-//! v0.3 (V3D-8 in `docs/design/v0.3.md`) emits a minimal lock at
+//! v0.3 (V3D-8 in `docs/design/v0.3.0.md`) emits a minimal lock at
 //! the workspace root containing the resolved member list and
 //! their edges. There are no version pins or source hashes
 //! because path deps don't need them; those land in v0.4

@@ -213,7 +213,7 @@ over modules; phase 3 is the link.
 3. **Crate header + link.** Concatenate every module's `[[cust::pub]]`
    (not `pub(crate)`) fragment into
    `target/<profile>/build/<crate>/include/<crate>.h`
-   (path migration shipped in v0.3 — see v0.3.md scope item 6).
+   (path migration shipped in v0.3 — see v0.3.0.md scope item 6).
    Modules are emitted in **topological order over intra-crate
    `#cust use crate::<mod>;` edges** (Kahn's algorithm, stable on
    ties so the existing DFS-preorder behaviour is preserved for
@@ -1094,7 +1094,7 @@ Roadmap bullets here are deliberately short:
   / `--package` scopes to one member + transitive deps. Per-member
   outputs moved to `target/<profile>/build/<member>/`. Full
   shipped details, locked V3D-N decisions, deferrals, and
-  verification in [v0.3.md](v0.3.md).
+  verification in [v0.3.0.md](v0.3.0.md).
 * **v0.3.1 — binary crates & `cust run`.** ✅ **shipped.**
   Small single-purpose milestone slotted between v0.3 and v0.4.
   `[[bin]]` table (single entry; multi-bin via `src/bin/*.c`

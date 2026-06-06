@@ -6,7 +6,7 @@
 //! error. Known-but-unimplemented sections (`[features]`,
 //! `[build-dependencies]`, etc.) are accepted only when empty/absent.
 //!
-//! v0.3 ([docs/design/v0.3.md]) adds `[workspace]` and accepts a
+//! v0.3 ([docs/design/v0.3.0.md]) adds `[workspace]` and accepts a
 //! strictly-whitelisted shape of `[dependencies]` entries (path
 //! deps only); see `validate_v0_3` below for the exact rules.
 //!
@@ -253,7 +253,7 @@ impl Manifest {
 
     /// `true` when this manifest declares a `[workspace]` table.
     /// A workspace-only manifest (no `[package]`) is *virtual* in
-    /// the sense used by [docs/design/v0.3.md](../../../docs/design/v0.3.md).
+    /// the sense used by [docs/design/v0.3.0.md](../../../docs/design/v0.3.0.md).
     pub const fn declares_workspace(&self) -> bool {
         self.workspace.is_some()
     }
@@ -637,7 +637,7 @@ impl CrateKind {
 }
 
 /// Validate one `[dependencies]` entry's shape. Accepted v0.3
-/// shapes (V3D-3 in `docs/design/v0.3.md`):
+/// shapes (V3D-3 in `docs/design/v0.3.0.md`):
 ///
 /// * `dep = { path = "…" }`
 /// * `dep = { path = "…", features = […] }`

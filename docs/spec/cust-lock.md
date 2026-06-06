@@ -3,7 +3,7 @@
 **Status:** v1 (shipped in cust v0.3).
 **Owning contract:** OQ-12 (contract surface versioning) in
 [../design/cust-design.md](../design/cust-design.md).
-**Driven by:** V3D-8 in [../design/v0.3.md](../design/v0.3.md).
+**Driven by:** V3D-8 in [../design/v0.3.0.md](../design/v0.3.0.md).
 
 `Cust.lock` records the resolved workspace dependency graph. v0.3
 ships the v1 schema below; v0.4 will **extend** the same schema
@@ -86,7 +86,7 @@ implicit root is `"."`.
 
 ### Example
 
-For the headline-outcome workspace in v0.3.md (`app` depending on
+For the headline-outcome workspace in v0.3.0.md (`app` depending on
 `util`):
 
 ```toml
