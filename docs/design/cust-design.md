@@ -571,10 +571,21 @@ plugin; the plugin (§10) layers extra semantics on top.
 ## 9. Custom `cust::` attribute catalogue
 
 All cust attributes are spelled with C23 attribute syntax
-`[[cust::name(...)]]`. The prelude maps each to a portable expansion
-that combines `__attribute__((annotate("cust::name(...)")))` (so the
-plugin can see them) with the appropriate real clang attribute (so they
-have semantic teeth even without the plugin loaded).
+`[[cust::name]]`. **v0.4.0 (V40D-7) made C23 the only
+supported spelling for decl annotation** — the v0.3.x
+macro fallbacks (`cust_pub`, `cust_pub_t`, `cust_pub_crate`,
+`cust_test`, `cust_test_ignore`) were retired; the
+plugin's `ParsedAttrInfo` recognisers attach a sentinel
+`AnnotateAttr` that the AST consumer requires before
+firing, so even a user-written
+`__attribute__((annotate("cust::pub")))` is ignored
+(verified by the `test_annotate_rejected` plugin test).
+Function-like helpers (`cust_assert`, `cust_panic`,
+`cust_main`, future `defer!` / `unreachable!` / `likely!`)
+stay as prelude macros forever — they need use-site
+expansion (sourceloc capture, conditional eval, control-flow
+injection) that the AST layer can't reach. See
+[v0.4.0.md](v0.4.0.md) V40D-7 for the full rationale.
 
 ### Where each attribute is processed
 
@@ -597,11 +608,12 @@ attribute:
 
 | Attribute | Applies to | Phase | Meaning |
 |---|---|---|---|
-| `[[cust::pub]]` | any decl | plugin | Exported from the crate; lifts visibility, adds to generated `.h`. |
-| `[[cust::pub(crate)]]` | any decl | plugin | Exported to other modules in this crate only. |
-| `[[cust::pub(repr)]]` | struct/enum | plugin | Like `pub`, but exports the *body* of the type (not just the opaque tag) into the fragment header. Forces importer rebuilds on layout change — use sparingly. See §4. |
-| `[[cust::pub_macro]]` | object‑like macro | **driver pre‑pass** | Exported via generated `.h`. Because macro definitions are erased by clang's preprocessor before the plugin sees the AST, the driver pre‑pass tokenises the source itself and extracts the macro definitions verbatim into the fragment header. (Future: switch to clang `PPCallbacks` once the surface is stable.) |
-| `[[cust::test]]` | function returning `void` or `int` | plugin | Test fn; auto‑collected by `cust test` harness (§11). |
+| `[[cust::pub]]` | function / var / typedef / record / enum | plugin | Exported from the crate; lifts visibility on functions/vars, adds to generated `.h`. Decl-kind-aware: the plugin attaches `visibility("default")` only on functions/vars; type decls skip it (avoids the `-Wignored-attributes` warning that v0.3.x worked around with a separate `cust_pub_t` macro). |
+| `[[cust::pub_crate]]` | any decl | plugin | Exported to other modules in this crate only. (No parens; clang's expression-parser silently drops identifier args from C23 attributes — V40D-7.) |
+| `[[cust::pub_repr]]` | struct/union/enum | plugin | Like `pub`, but exports the *body* of the type (not just the opaque tag) into the fragment header. Forces importer rebuilds on layout change — use sparingly. See §4 and v0.4.0.md V40D-4. |
+| `[[cust::pub_macro]]` | object‑like macro | **driver pre‑pass** | Exported via generated `.h`. Because macro definitions are erased by clang's preprocessor before the plugin sees the AST, the driver pre‑pass tokenises the source itself and extracts the macro definitions verbatim into the fragment header. (V40D-13: extractor not yet implemented; pinned architecturally to land when first needed.) |
+| `[[cust::test]]` | function `int(void)` / `void(void)` | plugin | Test fn; auto‑collected by `cust test` harness (§11). In non-test builds the plugin attaches `InternalLinkageAttr + UnusedAttr` so the symbol doesn't leak into the regular artifact (V40D-14). |
+| `[[cust::test_ignore]]` | function `int(void)` / `void(void)` | plugin | Like `test`, but the runner lists the test then skips it (Cargo `#[ignore]` parity). |
 | `[[cust::bench]]` | function | plugin | Discoverable benchmark. |
 | `[[cust::cfg(expr)]]` | any decl/stmt | **driver pre‑pass** | Compile‑in‑or‑out based on features/targets. The driver evaluates `expr` against the resolved feature set and rewrites the attribute to a conventional `#if CUST_CFG_<hash>` / `#endif` region *before* invoking clang, so it gates parsing the same way hand‑written `#ifdef` would. |
 | `[[cust::feature(name)]]` | any decl | **driver pre‑pass** | Shorthand for `cfg(feature = "name")`; same mechanism. |
@@ -619,55 +631,68 @@ attribute:
 
 ### Fallback when the plugin is not loaded
 
-Why both `annotate(...)` *and* a real clang attribute? Because the
-plugin may be disabled (`cust check --no-plugin`, or a downstream user
-importing our generated `.h` with their own toolchain). When the
-plugin is loaded you get the full semantics. When it is not:
+v0.4.0 (V40D-10) made the plugin mandatory for `cust build`
+and `cust test` (V40D-12 hard error otherwise). `cust check`
+is the only subcommand that still works without the plugin,
+and even there `--no-plugin` is a **syntax-only escape hatch**
+with no decl-annotation promises:
 
-* `clang`‑native attributes (e.g. `must_use` → `warn_unused_result`)
-  still enforce their portion of the contract.
-* `[[cust::pub]]` and `[[cust::pub(crate)]]` still get visibility
-  lifting via the prelude macro (which expands unconditionally to
-  `__attribute__((visibility("default")))`); fragment header synthesis
-  is skipped, so the crate cannot be built but `cust check` still
-  type‑checks single TUs.
-* `[[cust::test]]`, `[[cust::derive]]`, `[[cust::pub_macro]]`,
-  `[[cust::no_panic]]`, `[[cust::const]]` all become **silent no‑ops**.
-  This is acceptable for `cust check --no-plugin` (a fast lint pass)
-  but not for `cust build`, which requires the plugin.
-* Driver pre‑pass attributes (`cfg`, `feature`) work either way —
-  they're processed before clang is invoked at all.
+* `clang`‑native attributes (e.g. `must_use` →
+  `warn_unused_result`) still enforce their portion of the
+  contract — those are plain clang attributes that don't
+  need the plugin.
+* `[[cust::pub]]` / `[[cust::pub_crate]]` /
+  `[[cust::pub_repr]]` / `[[cust::test]]` /
+  `[[cust::test_ignore]]` are silently inert. Visibility
+  is not lifted, fragment headers are not emitted, test
+  symbols still appear in the artifact, etc. `cust check
+  --no-plugin` adds `-Wno-unknown-attributes` so the
+  unrecognised attribute names don't drown the output in
+  warnings; everything else is on the user to handle.
+* `cust build --no-plugin` and `cust test --no-plugin` are
+  hard-rejected by the driver with the V40D-10 wording.
+* Driver pre‑pass attributes (`cfg`, `feature`) work either
+  way — they're processed before clang is invoked at all.
 
-Dual‑path correctness is enforced by a test matrix: each attribute has
-`test_<attr>_with_plugin`, `test_<attr>_without_plugin`, and
-`test_<attr>_fallback_behavior` tests; divergences are documented in
-`docs/ATTRIBUTE-SEMANTICS.md`.
+The pre-v0.4.0 "both spellings, with-plugin / without-plugin
+/ fallback_behavior" test matrix is moot under the V40D-10
+contract. The v0.4.0 plugin-test suite
+(`plugin/test/CMakeLists.txt`) is the single source of truth
+for per-attribute behaviour; `docs/ATTRIBUTE-SEMANTICS.md`
+is unnecessary for v1 (we'll file it if v0.5+'s per-TU
+semantic checks introduce genuine `with/without` divergences).
 
-### Prelude macro shape for `[[cust::pub]]` (and why there are two)
+### Prelude macros (what stays after v0.4.0 retired the decl-annotation set)
 
-The v0.x prelude exposes `[[cust::pub]]` via two macro spellings,
-picked by decl kind:
+The v0.3.x prelude carried five decl-annotation macros
+(`cust_pub`, `cust_pub_t`, `cust_pub_crate`, `cust_test`,
+`cust_test_ignore`) whose only job was to attach an
+`__attribute__((annotate("cust::*")))` payload the plugin
+could recognise. V40D-7 deleted them in v0.4.0 slice E:
+the C23 attribute spelling is the only form `cust build`
+recognises today.
 
-* `cust_pub` — for **functions and variables**. Expands to
-  `__attribute__((visibility("default"), annotate("cust::pub")))`.
-  Visibility lifts the symbol over the crate-wide
-  `-fvisibility=hidden`; the annotate carries the plugin signal.
-* `cust_pub_t` — for **type declarations** (`typedef`, `struct`,
-  `union`, `enum`). Expands to
-  `__attribute__((annotate("cust::pub")))` only — no visibility.
-  Type decls have no linkage; applying `visibility("default")`
-  to a `typedef` produces a clang
-  `'visibility' attribute ignored [-Wignored-attributes]`
-  warning. cstd's `types` module hits this 12 times if you use
-  the wrong macro.
+What stays in [`cust/src/prelude.h`](../../cust/src/prelude.h):
 
-Both forms expand to the same plugin annotation, so the plugin
-(§10) treats `cust_pub` and `cust_pub_t` decls identically when
-building the fragment header. The macro split is purely about
-which underlying clang attribute is meaningful for the decl
-kind. A future plugin v2 that makes `[[cust::pub]]` decl-kind-aware
-(emitting the right combination automatically) can collapse
-these into a single macro (§16 OQ — to be filed).
+* Simple convenience aliases that map to native clang
+  attributes without any plugin involvement:
+  `cust_must_use`, `cust_deprecated(msg)`, `cust_unused`,
+  `cust_noreturn`.
+* The assertion family that needs use-site expansion to
+  capture `__FILE__` / `__LINE__`, gate behaviour on the
+  `CUST_TEST_BUILD` macro, and inject control flow:
+  `cust_panic`, `cust_assert`, `cust_assert_eq`,
+  `cust_assert_ne`. The plugin literally cannot replace
+  these — they're textbook macro work — so this family
+  stays as macros forever.
+* `cust_main`, an alias to `main` that keeps the
+  `cust_*` naming consistent and leaves room for a future
+  cust runtime that wraps `main` and calls `cust_main`
+  from inside.
+
+The decl-kind-awareness logic the old `cust_pub` /
+`cust_pub_t` split encoded manually now lives in the plugin
+(see `[[cust::pub]]` row in the catalogue above).
 
 ---
 
@@ -713,30 +738,28 @@ driver‑side in‑process callbacks required):
    (§4 phase 1). The driver later concatenates the `[[cust::pub]]`
    subset across all modules into the crate header
    `target/<profile>/include/<crate>.h` (§5). Output channel: files.
-3. **Test discovery.** Collects `[[cust::test]]` / `cust_test`
-   functions and serialises them into a static
-   `__cust_tests[]` table emitted into the per‑crate generated
-   runner TU (`cust_test_main.c`), one entry per discovered
-   test (`(qname, fn_ptr, fn_kind, ignored, file, line)`).
-   The runner's `main` iterates the table and forks per test
-   (§11). Two backends sit behind this same table contract:
-   * **Driver pre‑pass** (shipped in v0.3.2) — a line‑oriented
-     regex scanner over module sources. Restrictions: the
-     marker, return type (`int` or `void`), and function name
-     must all appear on one source line. Lives forever as the
-     `cust check --no-plugin` discovery path (§9 fallback).
-     See [v0.3.2.md](v0.3.2.md) V32D‑2 for the full contract.
-   * **Plugin v1** (v0.4) — walks the AST, no single‑line
-     restriction, recognises both the `cust_test` macro and
-     the `[[cust::test]]` attribute spelling. Joins as a
-     second backend; the pre‑pass stays in tree.
+3. **Test discovery.** Collects `[[cust::test]]` /
+   `[[cust::test_ignore]]` function decls and emits one
+   TSV line per discovery into a per-module sidecar file
+   `target/<profile>/.test-discovery/<crate>/<module>.cust.tests`
+   with shape `<qname>\t<fn_kind>\t<ignored>\t<file>\t<line>`
+   (RQ-V40-2). The driver reads those files in
+   `run_test_build` and emits a static `__cust_tests[]` table
+   into the per-crate generated runner TU
+   (`cust_test_main.c`), one entry per discovered test
+   (`(qname, fn_ptr, fn_kind, ignored, file, line)`). The
+   runner's `main` iterates the table and forks per test
+   (§11). v0.4.0 (V40D-6) made the plugin the **only**
+   discovery backend; the v0.3.2 pre-pass scanner
+   (`cust/src/test_scanner.rs`) was deleted in slice D.
    Earlier drafts of this paragraph proposed ctor‑based
-   registration as a workaround for section‑layout instability
-   across object formats; the static‑table emission both
-   backends use today sidesteps that problem entirely (driver
-   or plugin already knows the full test list at TU generation
+   registration as a workaround for section‑layout
+   instability across object formats; the static‑table
+   emission sidesteps that problem entirely (plugin
+   already knows the full test list at TU generation
    time, no runtime registration required).
-   Output channel: emitted C, compiled into the test binary.
+   Output channel: TSV sidecar files → driver-generated
+   C → compiled into the test binary.
 4. **Derive‑style codegen.** For `[[cust::derive(...)]]`, the plugin
    appends new top‑level decls (e.g. `T_eq`, `T_hash`, `T_debug`) to
    the AST before codegen. Strictly additive: never mutates user code.
@@ -813,41 +836,72 @@ and code generators run via `build.cust.c`.
   comments as standalone TUs, the way `rustdoc` does. Powered by a
   separate libclang‑based doc‑comment extractor.
 
-### v0.3.2 implementation — driver pre‑pass discovery
+### v0.4.0 implementation — plugin v1 AST discovery
 
-What ships today (v0.3.2) is the unit‑test subset of the above:
+What ships today (v0.4.0, completed in slice F):
 
-* Tests colocated in `src/**.c`, marked with the `cust_test` or
-  `cust_test_ignore` macros (the `[[cust::test]]` attribute
-  spelling arrives with plugin v1 in v0.4 — RQ‑V32‑1).
-* Discovery via the **driver pre‑pass** scanner
-  (`cust/src/test_scanner.rs`) — line‑oriented regex; the marker,
-  return type (`int` or `void`), and function name must fit on
-  one source line. V32D‑2 trade‑off; plugin v1 lifts it.
-* Cargo‑shape CLI: `cust test [-p <member>] [<filter>] [-- --list]`
-  with substring filter, exit code 0/1, and a Cargo‑format
-  per‑binary summary (`test result: ok. N passed; M failed; …`).
+* Tests colocated in `src/**.c`, marked with the
+  `[[cust::test]]` or `[[cust::test_ignore]]` C23 attribute
+  spelling. The v0.3.x macro forms (`cust_test`,
+  `cust_test_ignore`) were retired in V40D-7; they no
+  longer exist in `cust/src/prelude.h`. The plugin's
+  `ParsedAttrInfo` recognisers (V40D-7 five-name model)
+  handle both attributes; non-test builds additionally get
+  `InternalLinkageAttr + UnusedAttr` attached so the test
+  symbols don't leak into the regular artifact (V40D-14,
+  verified by the `test_test_internal_linkage` plugin
+  test).
+* Discovery via the **plugin** (V40D-6) — the v0.3.2
+  pre-pass scanner's single-line restriction is gone. The
+  plugin walks the AST during §4 phase 1 (`-fsyntax-only`)
+  and writes one TSV line per discovered test into a
+  sidecar file (RQ-V40-2 format). The driver consumes
+  those sidecars in `run_test_build` to populate the
+  generated runner template.
+* Cargo‑shape CLI: `cust test [-p <member>] [<filter>]
+  [-- --list]` with substring filter, exit code 0/1, and
+  a Cargo‑format per‑binary summary (unchanged from
+  v0.3.2).
 * **Fork‑per‑test** isolation (V32D‑7) — Linux only,
-  `fork`/`waitpid`/`_exit(101)`. This is stricter than stock
-  `cargo test` (which runs threads inside one process); it matches
-  `cargo‑nextest`'s "one test per process" model and survives a
-  test‑side `SIGSEGV` / `abort()` without taking the binary down.
-* No `[profile.test]`, no per‑test timeout, no `--nocapture`,
-  no `--exact`, no multi‑filter, no parallel test execution, no
-  integration tests under `tests/` — all deferred to v0.4.
+  `fork`/`waitpid`/`_exit(101)`. Stricter than stock
+  `cargo test`; matches `cargo‑nextest`'s "one test per
+  process" model and survives a test‑side `SIGSEGV` /
+  `abort()`.
+* V40D-12 hard error if the plugin is missing for
+  `cust test`; V40D-10 rejects `cust test --no-plugin`.
+* No `[profile.test]`, no per‑test timeout, no
+  `--nocapture`, no `--exact`, no multi‑filter, no
+  parallel test execution, no integration tests under
+  `tests/`, no `[[cust::test(inline)]]` — all deferred to
+  later v0.4.x milestones (see v0.4.0.md deferrals table).
 
-The runner template lives in `cust/src/test_runner_template.c`
-(included into the driver via `include_str!`) and is concatenated
-ahead of per‑test `extern` decls + a static `__cust_tests[]`
+The runner template lives in
+`cust/src/test_runner_template.c` (included into the
+driver via `include_str!`) and is concatenated ahead of
+per‑test `extern` decls + a static `__cust_tests[]`
 table + the runner's `main`. Output path:
-`target/<profile>/test/<crate>/<crate>` (V32D‑4 + V32D‑5,
-resolved in favour of V32D‑4's "fully fresh build tree").
+`target/<profile>/test/<crate>/<crate>` (V32D‑4 + V32D‑5).
 
-Full locked V32D‑N decisions, deferrals, and the verification
-target live in [v0.3.2.md](v0.3.2.md). Plugin v1 in v0.4 joins
-as a *second* discovery backend behind the same
-`__cust_tests[]` contract; the v0.3.2 pre‑pass stays in tree as
-the `cust check --no-plugin` discovery path (§9).
+Full locked V40D‑N decisions, sentinel-marker mechanics,
+sidecar format, fixed-point loop semantics, and the
+verification target live in [v0.4.0.md](v0.4.0.md).
+
+### v0.3.2 implementation — driver pre‑pass discovery (historical)
+
+v0.3.2 shipped the unit-test subset of §11 using a
+**driver pre‑pass** scanner instead of the plugin (V32D-2),
+because plugin v1 wasn't yet built. The scanner had a
+single-line restriction (marker + return type + name on one
+source line) and the macro spellings `cust_test` /
+`cust_test_ignore` were the only entry. v0.4.0 (V40D-6)
+replaced the pre-pass with the AST-driven plugin path
+described in the previous subsection and deleted
+`cust/src/test_scanner.rs` outright; v0.3.2's promise that
+the pre-pass would stay in tree as the
+`cust check --no-plugin` discovery path was explicitly
+revoked when V40D-10 redefined `--no-plugin` as a
+syntax-only escape hatch with no discovery promises.
+v0.3.2.md preserves the historical V32D-N record.
 
 ---
 
@@ -1120,9 +1174,7 @@ Roadmap bullets here are deliberately short:
   summary. Tests colocated in `src/**.c`, discovered by a
   **driver pre-pass** scanner (V32D-2) — the macro,
   return type (`int` or `void`), and function name fit on one
-  source line. Plugin v1 in v0.4 joins as a *second* discovery
-  backend behind the same `__cust_tests[]` table contract; the
-  pre-pass stays in tree as the `cust check --no-plugin` path.
+  source line. (Subsequently retired in v0.4.0 — see below.)
   **Fork-per-test** isolation (V32D-7) — Linux only,
   `fork`/`waitpid`/`_exit(101)`, stricter than stock `cargo
   test` (matches `cargo-nextest`'s "one test per process"
@@ -1138,27 +1190,80 @@ Roadmap bullets here are deliberately short:
   `[[cust::test(inline)]]` all deferred to v0.4. Full shipped
   details, locked V32D-N decisions, and verification in
   [v0.3.2.md](v0.3.2.md).
-* **v0.4 — dependency resolver, registry, plugin v1, tests.**
-  Brings the *network* half of dep work that v0.3 deferred:
-  initial registry wire protocol (`Index` trait, `file://` first
-  per V3D-1's deferral), `cust add`, semver version resolution,
-  `Cust.lock` source hashes, `[workspace.dependencies]`
-  inheritance (OQ-6). Plus build scripts (`build.cust.c`) with
-  the §12 hang-protection timeout, plugin v1 (full AST-based
-  fragment header synthesis, `[[cust::pub(repr)]]` opt-in body
-  export), circular-dep fixed-point loop with the convergence
-  criterion (§4), plugin-v1 second test-discovery backend
-  (replaces the v0.3.2 pre-pass scanner's single-line regex
-  with an AST walk; both backends coexist behind the same
-  `__cust_tests[]` contract — V32D-2), `tests/` integration
-  tests, `[[cust::test(inline)]]` + `should_panic` + per-test
-  timeout (need `[profile.test]` plumbing), `--nocapture` /
-  `--exact` / multi-filter / `--test-threads N`, and `-jN`
-  parallelism (within and across crates). Multi-bin per crate
-  (`src/bin/*.c`, `[[bin]]` arrays) also lands here (V31D-3
-  deferral from v0.3.1). v0.3.1 + v0.3.2 are the prerequisites
-  for the multi-target / parallel-test-harness work in this
-  milestone.
+* **v0.4.0 — plugin v1 (AST-based surface, pub_repr, test discovery).**
+  ✅ **shipped.** Six-slice milestone (A–F) that grows
+  `libcust_plugin.so` from the v0.2 surface-extraction stub
+  into the full AST-driven plugin this document has been
+  describing. Headline changes:
+  - **Decl annotation is C23 attributes only** (V40D-7).
+    `[[cust::pub]]`, `[[cust::pub_crate]]`, `[[cust::pub_repr]]`,
+    `[[cust::test]]`, `[[cust::test_ignore]]` recognised via
+    five `ParsedAttrInfo` registrars (not parameterised —
+    clang's expression-parser silently drops identifier args
+    from C23 attributes). v0.3.x macro forms
+    (`cust_pub`/`cust_pub_t`/`cust_pub_crate`/`cust_test`/
+    `cust_test_ignore`) deleted from `cust/src/prelude.h`.
+    Sentinel `__cust_v40_marker__` `AnnotateAttr` attached by
+    the recognisers so user-written
+    `__attribute__((annotate("cust::pub")))` is ignored.
+  - **`pub_repr` body export** (V40D-4) — plugin
+    pretty-prints full struct/union/enum bodies into the
+    fragment header (bitfields, packing, alignment,
+    anonymous nested, explicit enum discriminants).
+    cwork's cstd grows `[[cust::pub_repr]] struct cstd_point`
+    + `cstd_point_distance_sq` dogfood; hello-cstd consumes
+    the body by value (impossible in v0.3.x).
+  - **Plugin-only test discovery** (V40D-6) — the v0.3.2
+    pre-pass scanner (`cust/src/test_scanner.rs`) was
+    deleted; plugin emits per-module TSV sidecar files
+    `target/<profile>/.test-discovery/<crate>/<module>.cust.tests`
+    (RQ-V40-2) that the driver consumes in `run_test_build`.
+  - **V40D-5 phase isolation** — fragment headers AND
+    sidecars are written only in `ParseSyntaxOnly` (phase 1).
+    Phase 2 with either output arg is a hard plugin error.
+  - **V40D-11 fixed-point loop** — `surface_pass_fixed_point`
+    wraps `surface_pass` with cap=3 (overridable via
+    `CUST_FIXED_POINT_CAP`). Acyclic crates converge in 1
+    iteration; the loop is in place for the moment a
+    `pub_repr` cycle appears.
+  - **V40D-10 `--no-plugin` flag** — global flag accepted
+    only on `cust check` (syntax-only escape hatch with
+    `-Wno-unknown-attributes`); `cust build --no-plugin` /
+    `cust test --no-plugin` rejected with the verbatim
+    V40D-10 wording. **V40D-12 hard error** if the plugin
+    is missing for `build` / `test` / `run`.
+  - Cwork rewrite as part of slice E — cstd + hello-cstd
+    version bumps to 0.4.0; 10 unit tests pass (was 7 at
+    v0.3.2 close, +3 from the new geom module).
+  Full shipped details, locked V40D-N decisions, slice-by-slice
+  deltas, and verification in [v0.4.0.md](v0.4.0.md). v0.4.0
+  is the first milestone in the v0.4 series; v0.4.1+ continues
+  with registry, build scripts, parallelism, and the
+  `cust test` follow-ups.
+* **v0.4.x — rest of the v0.4 series** (post-v0.4.0; planned).
+  v0.4.0 shipped plugin v1 (above); the remaining v0.4.x
+  milestones split out from the original "v0.4 carries
+  everything" bullet:
+  - **v0.4.1** — dependency resolver + registry. Initial
+    registry wire protocol (`Index` trait, `file://` first
+    per V3D-1's deferral), `cust add`, semver version
+    resolution, `Cust.lock` source hashes,
+    `[workspace.dependencies]` inheritance (OQ-6).
+  - **v0.4.2** — build scripts (`build.cust.c`) with the
+    §12 hang-protection timeout.
+  - **v0.4.3** — `-jN` parallelism (within and across
+    crates).
+  - **v0.4.4** — multi-bin per crate (`src/bin/*.c`,
+    `[[bin]]` arrays — V31D-3 deferral from v0.3.1).
+  - **v0.4.5** — `cust test` follow-ups: `tests/`
+    integration tests, `[[cust::test(inline)]]`,
+    `should_panic`, per-test timeout, `--nocapture` /
+    `--exact` / multi-filter / `--test-threads N`,
+    `[profile.test]` plumbing.
+  Each lands as its own `docs/design/v0.4.<N>.md`. The
+  v0.4.x ordering is a draft; the locking criterion is
+  "each milestone independently shippable and dogfooded
+  against cwork."
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
 * **v0.6 — ThinLTO across the dep graph, bitcode rlib format with
   `metadata.json` including `rlib_format_version` and `llvm_version`
@@ -1167,7 +1272,7 @@ Roadmap bullets here are deliberately short:
   (per-TU heuristic) plugin checks; clang-tidy integration.**
 * **v0.8 — `cust export cmake --consumable` and generated-source
   splicing beyond `include_generated!`.** (Workspaces shipped in
-  v0.3, build scripts in v0.4.)
+  v0.3, plugin v1 in v0.4.0, build scripts in v0.4.2.)
 * **v0.9 — `cust export ninja` for our own use** plus any deferred
   cmake-export polish from v0.8.
 * **v0.10 — close the v1-blocking open questions (§16 OQ-3, OQ-4,
