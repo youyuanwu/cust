@@ -46,46 +46,171 @@ using namespace clang;
 
 namespace {
 
-// True if `D` carries `[[clang::annotate("cust::pub")]]`.
-bool hasCustPub(const Decl *D) {
+// V40D-7 attribute kind. None = decl is not pub-tagged.
+// PubCrate is recognised but treated as None for fragment
+// emission in slice B; slice D adds the concat-step filter
+// + the /*p*/ vs /*c*/ prefix per V40D-3.
+enum class CustPubKind {
+    None,
+    Pub,
+    PubCrate,
+    PubRepr,
+};
+
+CustPubKind getCustPubKind(const Decl *D) {
     for (const auto *attr : D->specific_attrs<AnnotateAttr>()) {
-        if (attr->getAnnotation() == "cust::pub") {
-            return true;
-        }
+        llvm::StringRef ann = attr->getAnnotation();
+        if (ann == "cust::pub") return CustPubKind::Pub;
+        if (ann == "cust::pub_crate") return CustPubKind::PubCrate;
+        if (ann == "cust::pub_repr") return CustPubKind::PubRepr;
     }
-    return false;
+    return CustPubKind::None;
+}
+
+// V40D-4 error: pub_repr only applies to records/enums.
+void diagPubReprOnNonRecord(DiagnosticsEngine &diags, SourceLocation loc,
+                            llvm::StringRef name, llvm::StringRef kindNoun) {
+    unsigned id = diags.getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "cannot export body of `%0`: `[[cust::pub_repr]]` is only "
+        "meaningful on struct, union, or enum decls (this is %1)\n"
+        "  hint: drop `pub_repr` and use `[[cust::pub]]`");
+    diags.Report(loc, id) << name.str() << kindNoun.str();
+}
+
+// V40D-4 enum body emission. Custom (not clang's print()) because
+// V40D-4 requires every discriminant be explicit ("a future
+// enum-variant reorder doesn't change the public ABI silently"),
+// and clang's printer preserves explicit-vs-implicit as-written.
+void renderEnumBody(const EnumDecl *ed, llvm::raw_ostream &os,
+                    const PrintingPolicy &policy) {
+    os << "enum " << ed->getName();
+    if (ed->isFixed()) {
+        os << " : ";
+        ed->getIntegerType().print(os, policy);
+    }
+    os << " {\n";
+    for (const auto *ec : ed->enumerators()) {
+        os << "    " << ec->getName() << " = ";
+        llvm::SmallString<32> valStr;
+        ec->getInitVal().toString(valStr, /*Radix=*/10);
+        os << valStr;
+        os << ",\n";
+    }
+    os << "};\n";
 }
 
 // Render one decl into its fragment-header form. Returns the
-// empty string for kinds we don't know how to handle today.
-std::string renderDecl(const Decl *D, ASTContext &ctx) {
+// empty string for kinds we don't emit (anonymous records,
+// unknown decl kinds). pub_repr on the wrong decl kind emits
+// a diagnostic and returns empty.
+std::string renderDecl(const Decl *D, CustPubKind kind, ASTContext &ctx,
+                       DiagnosticsEngine &diags) {
     PrintingPolicy policy(ctx.getLangOpts());
-    policy.TerseOutput = true;          // no function/var bodies
-    policy.SuppressInitializers = true;
     policy.PolishForDeclaration = true;
+    policy.SuppressInitializers = true;
     policy.SuppressTagKeyword = false;
 
     std::string out;
     llvm::raw_string_ostream os(out);
 
     if (const auto *fd = dyn_cast<FunctionDecl>(D)) {
+        if (kind == CustPubKind::PubRepr) {
+            diagPubReprOnNonRecord(diags, fd->getLocation(),
+                                   fd->getName(), "a function");
+            return {};
+        }
+        policy.TerseOutput = true;          // no function body
         fd->print(os, policy);
         os << ";\n";
     } else if (const auto *td = dyn_cast<TypedefDecl>(D)) {
+        if (kind == CustPubKind::PubRepr) {
+            diagPubReprOnNonRecord(diags, td->getLocation(),
+                                   td->getName(), "a typedef");
+            return {};
+        }
+        policy.TerseOutput = true;
         // Prints as `typedef X name` — append `;` for a valid decl.
         td->print(os, policy);
         os << ";\n";
     } else if (const auto *rd = dyn_cast<RecordDecl>(D)) {
-        // Opaque tag forward declaration. The body stays private
-        // to the defining module (cust-design.md §4); `cust_pub`
-        // *with* body export needs a future `cust_pub_repr` that
-        // emits the full struct. Not yet.
         if (!rd->getIdentifier()) {
             return {}; // anonymous struct/union — skip
         }
-        os << (rd->isUnion() ? "union " : "struct ");
-        os << rd->getName() << ";\n";
+        if (kind == CustPubKind::PubRepr) {
+            // V40D-4: full body. Clang's RecordDecl::print() with
+            // TerseOutput = false walks the AST and emits a full,
+            // self-contained body (handles bitfields, anonymous
+            // nested struct/union in one shot). This IS the
+            // "custom pretty-printer over the AST" V40D-4
+            // specifies — clang's printer is AST-driven, NOT
+            // source-text copy, which is the property V40D-4
+            // actually cares about. Slice B pre-validated via
+            // `clang -Xclang -ast-print` that the output matches
+            // V40D-4 §"Coverage" for most bullets.
+            //
+            // Two coverage gaps require manual emission because
+            // clang's printer drops the attributes:
+            //   * `__attribute__((packed))` — RecordDecl::hasAttr
+            //   * `__attribute__((aligned(N)))` — AlignedAttr
+            // Without these, the consumer TU sees a different
+            // layout than the producer (ABI hazard). Emitted
+            // after the closing `}` per V40D-4 ("after the
+            // closing brace if … alignment exceeds the natural
+            // alignment").
+            policy.TerseOutput = false;
+            rd->print(os, policy);
+            // Strip trailing newline that print() emits so our
+            // attribute suffix sits before the `;` on the same
+            // closing-brace line. The trailing-newline behaviour
+            // is consistent across clang versions covered by
+            // V0.4.0's "Minimum clang: 19" header bullet.
+            if (!out.empty() && out.back() == '\n') {
+                out.pop_back();
+            }
+            if (rd->hasAttr<PackedAttr>()) {
+                os << " __attribute__((packed))";
+            }
+            // AlignedAttr: a struct may carry multiple (per
+            // `__attribute__((aligned(N)))` + `_Alignas`). Take
+            // the maximum alignment specified.
+            unsigned maxAlignBits = 0;
+            for (const auto *aa : rd->specific_attrs<AlignedAttr>()) {
+                if (aa->isAlignmentExpr()) {
+                    unsigned a = aa->getAlignment(ctx);
+                    if (a > maxAlignBits) maxAlignBits = a;
+                }
+            }
+            if (maxAlignBits > 0) {
+                os << " __attribute__((aligned(" << (maxAlignBits / 8)
+                   << ")))";
+            }
+            os << ";\n";
+        } else {
+            // Opaque tag (plain pub).
+            os << (rd->isUnion() ? "union " : "struct ");
+            os << rd->getName() << ";\n";
+        }
+    } else if (const auto *ed = dyn_cast<EnumDecl>(D)) {
+        if (!ed->getIdentifier()) {
+            return {}; // anonymous enum — skip
+        }
+        if (kind == CustPubKind::PubRepr) {
+            renderEnumBody(ed, os, policy);
+        } else {
+            // Plain pub: forward decl. C23 with fixed underlying
+            // type accepts this directly; older standards / no
+            // fixed type need a clang extension. Users who hit
+            // C-compat issues here should use pub_repr.
+            os << "enum " << ed->getName() << ";\n";
+        }
     } else if (const auto *vd = dyn_cast<VarDecl>(D)) {
+        if (kind == CustPubKind::PubRepr) {
+            diagPubReprOnNonRecord(diags, vd->getLocation(),
+                                   vd->getName(), "a variable");
+            return {};
+        }
+        policy.TerseOutput = true;
         // Variable declarations become `extern <type> <name>;`.
         os << "extern ";
         vd->print(os, policy);
@@ -97,7 +222,8 @@ std::string renderDecl(const Decl *D, ASTContext &ctx) {
 }
 
 // Collect the fragment-header contents for one TU.
-std::string buildFragmentContents(ASTContext &ctx) {
+std::string buildFragmentContents(ASTContext &ctx,
+                                  DiagnosticsEngine &diags) {
     std::string contents;
     contents += "/* @generated by cust plugin — DO NOT EDIT */\n";
     contents += "/* Forward declarations of [[cust::pub]] items. */\n\n";
@@ -106,10 +232,21 @@ std::string buildFragmentContents(ASTContext &ctx) {
         if (D->isImplicit()) {
             continue;
         }
-        if (!hasCustPub(D)) {
+        CustPubKind kind = getCustPubKind(D);
+        // Slice B emits Pub and PubRepr decls into the
+        // fragment header. PubCrate is recognised by the
+        // ParsedAttrInfo but its routing into the per-module
+        // fragment header (with the /*c*/ prefix for the
+        // concat-step filter) is slice D driver work; for
+        // now PubCrate decls are silently dropped, matching
+        // plugin v0's effective behaviour (today's
+        // `hasCustPub` only matches the bare `cust::pub`
+        // payload, so cust_pub_crate macros aren't emitted
+        // anywhere today either).
+        if (kind == CustPubKind::None || kind == CustPubKind::PubCrate) {
             continue;
         }
-        std::string s = renderDecl(D, ctx);
+        std::string s = renderDecl(D, kind, ctx, diags);
         if (!s.empty()) {
             contents += s;
         }
@@ -179,7 +316,7 @@ public:
             // effect. Silent no-op.
             return;
         }
-        std::string contents = buildFragmentContents(ctx);
+        std::string contents = buildFragmentContents(ctx, CI.getDiagnostics());
         writeFragmentIfChanged(FragmentOut, contents, CI.getDiagnostics());
     }
 
@@ -189,30 +326,68 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// v0.4.0 slice A — `ParsedAttrInfo` recogniser for `[[cust::pub]]`.
+// v0.4.0 slice A+B — `ParsedAttrInfo` recognisers for the five cust
+// decl-annotation attributes.
 //
-// Dispatches on `getArg(0)` per V40D-7 (one recogniser per attribute name,
-// not name + args — clang's `ParsedAttrInfoRegistry` registers by name).
-// Both forms produce the same `AnnotateAttr` payload string that the
-// existing `CustASTConsumer` / `hasCustPub` path already recognises, so
-// the C23-attribute and macro spellings remain interchangeable through
-// slices A–D; slice E retires the macros and removes the legacy
-// `annotate("cust::*")` recognition.
+// V40D-7 five-name model: one recogniser per attribute name (`cust::pub`,
+// `cust::pub_crate`, `cust::pub_repr`, `cust::test`, `cust::test_ignore`),
+// each accepting zero arguments. Earlier slice A draft used a
+// parameterised `cust::pub` with `getArg(0)` dispatch on `crate` / `repr`;
+// abandoned during slice A when AST-dump showed clang's expression-parser
+// silently drops the identifier args (no scope binding for `crate` /
+// `repr` → 0 ParsedAttr args at handleDeclAttribute time). The
+// `ParsedAttrInfo` API has no hook to override the parser, so the
+// five-separate-names model is the practical answer.
 //
-// Decl-kind-aware visibility lift (V40D-7 bullet 3): when `[[cust::pub]]`
-// (no modifier) is attached to a function or variable decl, the recogniser
-// also attaches `VisibilityAttr(Default)` to lift the symbol over the
-// crate-wide `-fvisibility=hidden`. Type decls (typedef/record/enum) get
-// no visibility lift — visibility on a typedef warns
-// (`-Wignored-attributes`), and tagged types have no linkage of their own
-// anyway. This subsumes what cust_pub vs cust_pub_t encoded manually in
-// the v0.3.x prelude.
+// Each recogniser attaches an `AnnotateAttr` with the corresponding
+// `cust::*` payload string. The AST consumer (`getCustPubKind`) has a
+// single recognition path keyed on the string. The legacy
+// `annotate("cust::*")` macro path stays in place through slices A–D so
+// cwork's prelude macros (which expand to the same payload strings) keep
+// working; slice E retires the macros and removes the legacy path.
+//
+// Decl-kind-aware visibility lift (V40D-7): plain `[[cust::pub]]` on a
+// FunctionDecl or VarDecl also gets `VisibilityAttr(Default)` to lift the
+// symbol over the crate-wide `-fvisibility=hidden`. Type decls
+// (typedef/record/enum) skip the lift (visibility on a typedef warns
+// under -Wignored-attributes anyway). pub_crate / pub_repr never lift
+// (V40D-3, V40D-4).
 
+// Shared decl-kind check for all five recognisers.
+bool custAttrAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                              const Decl *D, llvm::StringRef attrName) {
+    if (!isa<FunctionDecl>(D) && !isa<VarDecl>(D) &&
+        !isa<TypedefDecl>(D) && !isa<RecordDecl>(D) &&
+        !isa<EnumDecl>(D)) {
+        unsigned id = S.getDiagnostics().getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "`[[%0]]` only applies to functions, variables, typedefs, "
+            "structs, unions, and enums");
+        S.Diag(Attr.getLoc(), id) << attrName.str();
+        return false;
+    }
+    return true;
+}
+
+// Shared attach helper. liftVis = true for plain `[[cust::pub]]`; the
+// recogniser caller filters by decl kind before passing true.
+void custAttrAttach(Sema &S, Decl *D, const ParsedAttr &Attr,
+                    llvm::StringRef payload, bool liftVis) {
+    ASTContext &ctx = S.getASTContext();
+    D->addAttr(AnnotateAttr::Create(ctx, payload.str(),
+                                    /*Args=*/nullptr, /*NumArgs=*/0,
+                                    Attr.getRange()));
+    if (liftVis && (isa<FunctionDecl>(D) || isa<VarDecl>(D))) {
+        D->addAttr(VisibilityAttr::CreateImplicit(
+            ctx, VisibilityAttr::Default, Attr.getRange()));
+    }
+}
+
+// `[[cust::pub]]` — plain. Lifts visibility on function/var.
 struct CustPubAttrInfo : public ParsedAttrInfo {
     CustPubAttrInfo() {
-        OptArgs = 1;
         NumArgs = 0;
-        // `[[cust::pub]]` (C23 / C++11 attribute spelling).
+        OptArgs = 0;
         static constexpr Spelling kSpellings[] = {
             {ParsedAttr::AS_CXX11, "cust::pub"},
             {ParsedAttr::AS_C23, "cust::pub"},
@@ -222,69 +397,65 @@ struct CustPubAttrInfo : public ParsedAttrInfo {
 
     bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
                               const Decl *D) const override {
-        if (!isa<FunctionDecl>(D) && !isa<VarDecl>(D) &&
-            !isa<TypedefDecl>(D) && !isa<RecordDecl>(D) && !isa<EnumDecl>(D)) {
-            unsigned id = S.getDiagnostics().getCustomDiagID(
-                DiagnosticsEngine::Error,
-                "`[[cust::pub]]` only applies to functions, variables, "
-                "typedefs, structs, unions, and enums");
-            S.Diag(Attr.getLoc(), id);
-            return false;
-        }
-        return true;
+        return custAttrAppertainsToDecl(S, Attr, D, "cust::pub");
     }
 
     AttrHandling handleDeclAttribute(Sema &S, Decl *D,
                                      const ParsedAttr &Attr) const override {
-        llvm::StringRef payload;
-        bool plainPub = false;
+        custAttrAttach(S, D, Attr, "cust::pub", /*liftVis=*/true);
+        return AttributeApplied;
+    }
+};
 
-        if (Attr.getNumArgs() == 0) {
-            payload = "cust::pub";
-            plainPub = true;
-        } else if (Attr.getNumArgs() == 1) {
-            if (!Attr.isArgIdent(0)) {
-                unsigned id = S.getDiagnostics().getCustomDiagID(
-                    DiagnosticsEngine::Error,
-                    "`[[cust::pub]]` modifier must be an identifier "
-                    "(`crate` or `repr`)");
-                S.Diag(Attr.getLoc(), id);
-                return AttributeNotApplied;
-            }
-            llvm::StringRef arg =
-                Attr.getArgAsIdent(0)->getIdentifierInfo()->getName();
-            if (arg == "crate") {
-                payload = "cust::pub_crate";
-            } else if (arg == "repr") {
-                payload = "cust::pub_repr";
-            } else {
-                unsigned id = S.getDiagnostics().getCustomDiagID(
-                    DiagnosticsEngine::Error,
-                    "unknown `pub` modifier `%0`; expected `crate` or `repr`");
-                S.Diag(Attr.getLoc(), id) << arg;
-                return AttributeNotApplied;
-            }
-        } else {
-            unsigned id = S.getDiagnostics().getCustomDiagID(
-                DiagnosticsEngine::Error,
-                "`[[cust::pub]]` takes 0 or 1 arguments, got %0");
-            S.Diag(Attr.getLoc(), id) << Attr.getNumArgs();
-            return AttributeNotApplied;
-        }
+// `[[cust::pub_crate]]` — no visibility lift (V40D-3: symbol will be
+// localised at the crate-link step).
+struct CustPubCrateAttrInfo : public ParsedAttrInfo {
+    CustPubCrateAttrInfo() {
+        NumArgs = 0;
+        OptArgs = 0;
+        static constexpr Spelling kSpellings[] = {
+            {ParsedAttr::AS_CXX11, "cust::pub_crate"},
+            {ParsedAttr::AS_C23, "cust::pub_crate"},
+        };
+        Spellings = kSpellings;
+    }
 
-        ASTContext &ctx = S.getASTContext();
-        D->addAttr(AnnotateAttr::Create(ctx, payload.str(),
-                                        /*Args=*/nullptr, /*NumArgs=*/0,
-                                        Attr.getRange()));
+    bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                              const Decl *D) const override {
+        return custAttrAppertainsToDecl(S, Attr, D, "cust::pub_crate");
+    }
 
-        // Decl-kind-aware visibility lift. Only plain `[[cust::pub]]` on
-        // a function or variable; type decls and `pub(crate)` / `pub(repr)`
-        // don't lift.
-        if (plainPub && (isa<FunctionDecl>(D) || isa<VarDecl>(D))) {
-            D->addAttr(VisibilityAttr::CreateImplicit(
-                ctx, VisibilityAttr::Default, Attr.getRange()));
-        }
+    AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                     const ParsedAttr &Attr) const override {
+        custAttrAttach(S, D, Attr, "cust::pub_crate", /*liftVis=*/false);
+        return AttributeApplied;
+    }
+};
 
+// `[[cust::pub_repr]]` — body export for record/enum (V40D-4). Validation
+// of decl kind (must be record/enum, not function/var/typedef) happens in
+// renderDecl with a richer diagnostic; here we accept any of the standard
+// decl kinds and let renderDecl reject inappropriate ones with the
+// V40D-4 hint wording.
+struct CustPubReprAttrInfo : public ParsedAttrInfo {
+    CustPubReprAttrInfo() {
+        NumArgs = 0;
+        OptArgs = 0;
+        static constexpr Spelling kSpellings[] = {
+            {ParsedAttr::AS_CXX11, "cust::pub_repr"},
+            {ParsedAttr::AS_C23, "cust::pub_repr"},
+        };
+        Spellings = kSpellings;
+    }
+
+    bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                              const Decl *D) const override {
+        return custAttrAppertainsToDecl(S, Attr, D, "cust::pub_repr");
+    }
+
+    AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                     const ParsedAttr &Attr) const override {
+        custAttrAttach(S, D, Attr, "cust::pub_repr", /*liftVis=*/false);
         return AttributeApplied;
     }
 };
@@ -329,5 +500,11 @@ private:
 static FrontendPluginRegistry::Add<CustPluginAction>
     X("cust", "cust clang plugin (surface extraction)");
 
+// V40D-7 five-name model. test + test_ignore land in slice C.
 static ParsedAttrInfoRegistry::Add<CustPubAttrInfo>
-    Y("cust_pub", "cust [[cust::pub]] attribute recogniser (V40D-7)");
+    Y1("cust_pub", "cust [[cust::pub]] attribute recogniser (V40D-7)");
+static ParsedAttrInfoRegistry::Add<CustPubCrateAttrInfo>
+    Y2("cust_pub_crate", "cust [[cust::pub_crate]] attribute recogniser (V40D-7)");
+static ParsedAttrInfoRegistry::Add<CustPubReprAttrInfo>
+    Y3("cust_pub_repr", "cust [[cust::pub_repr]] attribute recogniser (V40D-7)");
+

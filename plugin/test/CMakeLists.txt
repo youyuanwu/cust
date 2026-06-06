@@ -40,4 +40,36 @@ function(cust_plugin_add_recognition_test name)
     )
 endfunction()
 
+# Goldenfile variant (V40D-8): emits the fragment header and
+# diffs it against a checked-in golden. Used for slice B's
+# pub_repr body coverage where the *exact bytes* matter, not
+# just identifier presence.
+function(cust_plugin_add_golden_test name)
+    add_test(
+        NAME ${name}
+        COMMAND
+            "${CMAKE_CURRENT_SOURCE_DIR}/run_golden_test.sh"
+            "${CLANG_C_EXECUTABLE}"
+            "$<TARGET_FILE:cust_plugin>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/${name}.c"
+            "${CMAKE_CURRENT_BINARY_DIR}/${name}.cust.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/goldens/${name}.cust.h"
+    )
+endfunction()
+
 cust_plugin_add_recognition_test(test_c23_pub_recognition)
+cust_plugin_add_golden_test(test_pub_repr_body)
+
+# V40D-4 error cases (slice B): pub_repr on function / variable /
+# typedef must each produce the V40D-4 error wording.
+add_test(
+    NAME test_pub_repr_errors
+    COMMAND
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_repr_errors_test.sh"
+        "${CLANG_C_EXECUTABLE}"
+        "$<TARGET_FILE:cust_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/test_pub_repr_errors.c"
+        "repr_on_function"
+        "repr_on_variable"
+        "repr_on_typedef"
+)
