@@ -18,7 +18,7 @@
 
 use std::fmt::Write as _;
 
-use crate::test_scanner::{FnKind, TestEntry};
+use crate::test_discovery::{FnKind, TestEntry};
 
 /// The fixed runner template (preamble + `cust_panic_impl` + fork
 /// loop + `main`). Inserted verbatim ahead of the generated

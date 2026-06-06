@@ -579,8 +579,11 @@ fn build_emits_concatenated_crate_header() {
 }
 
 #[test]
-fn build_without_plugin_skips_crate_header() {
-    // No plugin => no fragments => no concatenated header.
+fn build_without_plugin_emits_v40d12_error() {
+    // V0.4.0 V40D-12: plugin is mandatory for `cust build`. With
+    // no discoverable plugin the build must hard-error with the
+    // verbatim wording (replaces v0.2's silent-skip behaviour
+    // that the v0.3.x tests relied on).
     let (_tmp, dir) = stage("hello");
     let out = Command::new(env!("CARGO_BIN_EXE_cust"))
         .args(["build"])
@@ -589,12 +592,20 @@ fn build_without_plugin_skips_crate_header() {
         .stdin(Stdio::null())
         .output()
         .expect("spawn cust");
-    assert_success(&out);
-    let hdr = dir.join("target/debug/build/hello/include/hello.h");
     assert!(
-        !hdr.exists(),
-        "expected NO crate header without plugin, but found {}",
-        hdr.display()
+        !out.status.success(),
+        "expected cust build to fail without plugin, got success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cust plugin (libcust_plugin.so) not found"),
+        "V40D-12 wording missing from stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cargo run -p plugin-build"),
+        "V40D-12 hint missing from stderr:\n{stderr}"
     );
 }
 
@@ -619,24 +630,107 @@ fn plugin_path() -> Option<PathBuf> {
 }
 
 #[test]
-fn build_without_plugin_skips_fplugin_flag() {
-    // Override discovery to point at a nonexistent path — the
-    // driver should silently skip the plugin (v0.2 behaviour:
-    // plugin is opt-in until cross-module imports require it).
+fn check_without_plugin_warns_but_succeeds() {
+    // V0.4.0 V40D-12: `cust check` keeps its silent-skip path
+    // (single-TU syntax-only doesn't strictly need the plugin)
+    // but emits a heads-up warning so users discover the
+    // problem before `cust build` hard-errors on them.
     let (_tmp, dir) = stage("hello");
     let out = Command::new(env!("CARGO_BIN_EXE_cust"))
-        .args(["build"])
+        .args(["check"])
         .env("CUST_PLUGIN", "/definitely/does/not/exist")
         .current_dir(&dir)
         .stdin(Stdio::null())
         .output()
         .expect("spawn cust");
     assert_success(&out);
-
-    let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !cc.contains("-fplugin="),
-        "expected NO -fplugin flag with CUST_PLUGIN=/definitely/does/not/exist, got:\n{cc}"
+        stderr.contains("libcust_plugin.so) not found"),
+        "expected plugin-missing warning on stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("hard-error"),
+        "warning should mention the build/test hard-error contract:\n{stderr}"
+    );
+
+    // `cust check --no-plugin` is also accepted and succeeds
+    // silently (no warning, since the user explicitly opted
+    // out). Fragment headers are NOT emitted.
+    let out2 = Command::new(env!("CARGO_BIN_EXE_cust"))
+        .args(["check", "--no-plugin"])
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn cust");
+    assert_success(&out2);
+    let frag_dir = dir.join("target/debug/.h-fragments");
+    assert!(
+        !frag_dir.exists(),
+        "--no-plugin check should NOT create fragment headers, but {} exists",
+        frag_dir.display()
+    );
+}
+
+#[test]
+fn build_no_plugin_flag_is_rejected_with_v40d10_wording() {
+    let (_tmp, dir) = stage("hello");
+    let out = cust(&dir, ["build", "--no-plugin"]);
+    assert!(
+        !out.status.success(),
+        "cust build --no-plugin should be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`--no-plugin` is incompatible with `cust build`"),
+        "V40D-10 wording missing:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_no_plugin_flag_is_rejected_with_v40d10_wording() {
+    let (_tmp, dir) = stage("hello");
+    let out = cust(&dir, ["test", "--no-plugin"]);
+    assert!(
+        !out.status.success(),
+        "cust test --no-plugin should be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`--no-plugin` is incompatible with `cust test`"),
+        "V40D-10 wording missing:\n{stderr}"
+    );
+}
+
+#[test]
+fn build_without_plugin_skips_fplugin_flag() {
+    // Only meaningful when the plugin is built — skip otherwise so
+    // CI without `cargo run -p plugin-build` doesn't choke.
+    let Some(plugin) = plugin_path() else {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    };
+    let _ = plugin; // not used; we want to verify --no-plugin suppresses -fplugin
+
+    // `cust build --no-plugin` is rejected by V40D-10 and `cust
+    // check` doesn't write compile_commands.json. The cleanest
+    // observable in-tree signal is the fragment-headers dir:
+    // present after `cust build`, absent after `cust check
+    // --no-plugin`.
+    let (_tmp, dir) = stage("hello");
+    let out = Command::new(env!("CARGO_BIN_EXE_cust"))
+        .args(["check", "--no-plugin"])
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn cust");
+    assert_success(&out);
+
+    let frag_dir = dir.join("target/debug/.h-fragments");
+    assert!(
+        !frag_dir.exists(),
+        "--no-plugin should suppress fragment header emission, but {} exists",
+        frag_dir.display()
     );
 }
 

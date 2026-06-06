@@ -33,8 +33,8 @@ use crate::{
     plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
     target_layout::TargetLayout,
+    test_discovery::{self, TestEntry},
     test_runner,
-    test_scanner::{self, TestEntry},
 };
 
 /// Inputs handed to `run` by the CLI layer.
@@ -188,8 +188,13 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
         // run surface_pass unconditionally whenever the plugin
         // is loaded so the per-crate header concat step in
         // `write_crate_header` below has fragments to read.
+        // V40D-11 wraps the call in a fixed-point loop so
+        // circular `[[cust::pub_repr]]` dependencies converge
+        // (no pub_repr cycles in cwork today — iter 1 always
+        // wins — but the loop is in place for the moment one
+        // appears).
         if plan.plugin.is_some() {
-            surface_pass(
+            surface_pass_fixed_point(
                 plan,
                 &profile,
                 &prelude_path,
@@ -308,14 +313,17 @@ pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     })
 }
 
-/// v0.3.2 test-build pipeline. Per V32D-2 / V32D-3 / V32D-4 /
-/// V32D-6 / V32D-7 / V32D-11:
+/// v0.3.2 test-build pipeline, V40D-6 sidecar-driven.
+/// Per V32D-2 / V32D-3 / V32D-4 / V32D-6 / V32D-7 / V32D-11
+/// (still the v0.3.2 framing) and v0.4.0 V40D-6 (plugin-only
+/// discovery):
 ///
 /// 1. Compile the lib half's TUs with `-DCUST_TEST_BUILD=1` into
 ///    a fresh `target/<profile>/test/<crate>/` tree. Bin half is
 ///    skipped (V32D-11 — v0.3.2 only tests the library half).
-/// 2. Run `test_scanner` over each module's source to collect
-///    `Vec<TestEntry>`.
+/// 2. Read the per-module test-discovery sidecars the plugin
+///    wrote during `surface_pass` (V40D-6, V40D-5: phase-1 only)
+///    into `Vec<TestEntry>`.
 /// 3. Render + write + compile the `cust_test_main.c` runner
 ///    TU with the per-test extern decls and the
 ///    `__cust_tests[]` table (V32D-6).
@@ -372,9 +380,9 @@ fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
     // normally runs. Tests can `#cust use crate::<sibling>;`
     // exactly like production code. V40D-5: surface_pass runs
     // unconditionally when the plugin is loaded (see the
-    // matching change in `run`).
+    // matching change in `run`). V40D-11 fixed-point wrapper.
     if plan.plugin.is_some() {
-        surface_pass(
+        surface_pass_fixed_point(
             plan,
             &profile,
             &prelude_path,
@@ -400,16 +408,23 @@ fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
         &mut compile_entries,
     )?;
 
-    // Run the driver pre-pass test scanner over every module's
-    // ORIGINAL source (not the rewritten preprocessed copy —
-    // line numbers must match what the user wrote so failure
-    // diagnostics resolve correctly). Errors propagate as-is.
+    // V40D-6: read test entries from the plugin-emitted
+    // sidecars. Each module's sidecar lives at
+    // `target/<profile>/.test-discovery/<crate>/<qname>.cust.tests`;
+    // surface_pass populated them when plan.test_build is true.
+    // A module with zero tests still has a (possibly empty)
+    // sidecar after surface_pass, so a missing file means
+    // surface_pass didn't run that module — bug, hard error.
     let mut tests: Vec<TestEntry> = Vec::new();
     for m in &lib_modules {
-        let src = fs::read_to_string(&m.source_path)
-            .with_context(|| format!("reading `{}`", m.source_path.display()))?;
-        let mut found = test_scanner::scan(&src, &m.qualified_name, &m.source_path)
-            .with_context(|| format!("scanning tests in `{}`", m.source_path.display()))?;
+        let sidecar_path = layout.test_sidecar_path(crate_name, &m.qualified_name);
+        let contents = fs::read_to_string(&sidecar_path).with_context(|| {
+            format!(
+                "reading test-discovery sidecar `{}`",
+                sidecar_path.display()
+            )
+        })?;
+        let mut found = test_discovery::parse(&contents, &sidecar_path)?;
         tests.append(&mut found);
     }
 
@@ -536,7 +551,6 @@ fn compile_tree(
             prelude,
             crate_build_dir,
             layout,
-            /* fragment_out = */ None,
             extra_includes,
             is_bin_half,
             m,
@@ -571,7 +585,6 @@ fn compile_one_module(
     prelude: &Path,
     crate_build_dir: &Path,
     layout: &TargetLayout,
-    fragment_out: Option<&Path>,
     extra_includes: &[&Path],
     is_bin_half: bool,
     m: &Module,
@@ -659,17 +672,6 @@ fn compile_one_module(
 
     let object_path = crate_build_dir.join(format!("{}.o", m.qualified_name));
 
-    // Make sure the fragment-header destination dir exists before
-    // the plugin tries to atomic-rename into it. The plugin can
-    // create it too, but doing it driver-side keeps the per-TU
-    // critical path lean.
-    if let Some(frag) = fragment_out {
-        if let Some(parent) = frag.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating `{}`", parent.display()))?;
-        }
-    }
-
     // Honour `#include "x.h"` from the *original* source location —
     // the rewritten file lives in `target/`, so without -I clang
     // resolves relative includes against `target/` rather than the
@@ -688,7 +690,7 @@ fn compile_one_module(
         &rewritten_path,
         &object_path,
         &includes,
-        fragment_out,
+        PluginOutputs::default(),
     );
 
     // In syntax-only mode (cust check), replace the trailing
@@ -736,8 +738,9 @@ fn compile_one_module(
 ///
 /// We deliberately do NOT lower `#cust use crate::X;` to an
 /// `#include` here because the imported fragment may not exist
-/// yet. v0.2 caps at one surface pass; v0.4 may iterate to a
-/// fixed point per cust-design.md §4.
+/// yet. V40D-11 wraps this in a fixed-point loop;
+/// `surface_pass_fixed_point` is the entry point callers should
+/// use.
 fn surface_pass(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -765,6 +768,23 @@ fn surface_pass(
                 .with_context(|| format!("creating `{}`", parent.display()))?;
         }
 
+        // V40D-6 + RQ-V40-2: in test-build mode, also request
+        // the per-module test-discovery sidecar. Always emit
+        // even when the module has zero tests (writer skips
+        // identical bytes, so empty stays empty). The driver
+        // reads these in `run_test_build` to populate
+        // __cust_tests[].
+        let sidecar_path = if plan.test_build {
+            let p = layout.test_sidecar_path(crate_name, &m.qualified_name);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating `{}`", parent.display()))?;
+            }
+            Some(p)
+        } else {
+            None
+        };
+
         let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
         // Build flags but adjust: -fsyntax-only instead of `-c -o`.
         // Demote a couple of errors to warnings so unresolved
@@ -779,7 +799,11 @@ fn surface_pass(
             &surface_path,
             &dummy_obj,
             &includes,
-            Some(&fragment_path),
+            PluginOutputs {
+                fragment: Some(&fragment_path),
+                test_sidecar: sidecar_path.as_deref(),
+                module: sidecar_path.as_ref().map(|_| m.qualified_name.as_str()),
+            },
         );
         // Strip trailing `-c -o <obj> <src>` (4 args), replace
         // with `-fsyntax-only -Wno-error -Wno-implicit-function-declaration <src>`.
@@ -817,14 +841,120 @@ fn surface_pass(
     Ok(())
 }
 
+/// V40D-11 fixed-point loop wrapping `surface_pass`. Iterates
+/// the surface pass until the per-module fragment header bytes
+/// stop changing, or until the cap (default 3, overridable via
+/// `CUST_FIXED_POINT_CAP=<n>` env var) is exceeded.
+///
+/// Empirically: acyclic crates (every cust crate today) converge
+/// in 1 iteration; a 2-cycle of `[[cust::pub_repr]]` types needs
+/// 2; longer cycles either converge in 3 or diverge (the cap
+/// catches the divergent case and surfaces the §4 verbatim
+/// error). Plugin-side `writeFragmentIfChanged` already skips
+/// identical bytes, so the per-iteration cost when nothing has
+/// changed is one stat + one read + memcmp per module — cheap.
+///
+/// Implementation note: the design doc V40D-11 specifies scratch
+/// `.iter-N/` subdirs with atomic rename on convergence. That's
+/// equivalent to the in-memory snapshot used here: both detect
+/// "no module's fragment bytes changed between iter N-1 and N."
+/// The in-memory variant avoids any directory churn at all,
+/// which matches what `writeFragmentIfChanged`'s skip already
+/// gives us. If the eventual fixed-point invariant ever needs
+/// stronger guarantees (e.g. cross-process visibility) we can
+/// revisit; for v0.4.0 the simpler shape is correct.
+fn surface_pass_fixed_point(
+    plan: &BuildPlan<'_>,
+    profile: &ResolvedProfile,
+    prelude: &Path,
+    crate_build_dir: &Path,
+    layout: &TargetLayout,
+    modules: &[Module],
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let cap: usize = std::env::var("CUST_FIXED_POINT_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let crate_name = plan.manifest.package_name();
+
+    // Snapshot of "fragment bytes after iteration N" keyed by
+    // qualified module name. None on iter 0 (no prior bytes).
+    let mut prev: Option<HashMap<String, Vec<u8>>> = None;
+
+    for iter in 1..=cap {
+        surface_pass(plan, profile, prelude, crate_build_dir, layout, modules)?;
+
+        // Snapshot the fragments. Missing files become an empty
+        // byte vec (a module with no [[cust::pub*]] decls still
+        // gets a "header + banner" fragment via the plugin's
+        // writer; the only path to a literally-missing file is
+        // a clang crash before HandleTranslationUnit, which
+        // would have errored above).
+        let mut curr: HashMap<String, Vec<u8>> = HashMap::with_capacity(modules.len());
+        for m in modules {
+            let path = layout.fragment_path(crate_name, &m.qualified_name);
+            let bytes = fs::read(&path).unwrap_or_default();
+            curr.insert(m.qualified_name.clone(), bytes);
+        }
+
+        if let Some(prev_snap) = &prev {
+            // Identify still-wobbling modules: fragment bytes
+            // differ from previous iteration.
+            let wobbling: Vec<&str> = modules
+                .iter()
+                .filter(|m| {
+                    prev_snap.get(&m.qualified_name).map(Vec::as_slice)
+                        != curr.get(&m.qualified_name).map(Vec::as_slice)
+                })
+                .map(|m| m.qualified_name.as_str())
+                .collect();
+
+            if wobbling.is_empty() {
+                // Converged.
+                return Ok(());
+            }
+
+            // Cap exceeded — emit the §4 verbatim error.
+            if iter == cap {
+                bail!(
+                    "circular `[[cust::pub_repr]]` dependency did not converge\n  \
+                     in {cap} iterations between modules: {}\n  \
+                     hint: break the cycle by exporting one side as `[[cust::pub]]`\n        \
+                     (opaque) instead of `[[cust::pub_repr]]`",
+                    wobbling.join(", ")
+                );
+            }
+        }
+        prev = Some(curr);
+    }
+
+    // Single-iteration case (cap == 1): we ran once and never
+    // had a "previous" to compare against, so we're done.
+    Ok(())
+}
+
+/// Per-TU plugin output paths threaded through `build_cflags`.
+/// All fields are optional; the plugin treats absent paths as
+/// "skip that output." `module` is required whenever
+/// `test_sidecar` is `Some` (the plugin errors otherwise) so
+/// `qname = <module>::<name>` can be emitted; for non-test
+/// builds we leave both `None`.
+#[derive(Default, Clone, Copy)]
+pub struct PluginOutputs<'a> {
+    pub fragment: Option<&'a Path>,
+    pub test_sidecar: Option<&'a Path>,
+    pub module: Option<&'a str>,
+}
+
 /// Build the clang argv for a single TU. `extra_includes` is a
 /// list of dirs that become `-I<dir>` flags before the prelude
 /// `-include`. For lib compiles this is the original source dir
 /// only; for bin compiles in a lib+bin crate it's the lib's
 /// include dir followed by the bin source dir.
-/// `fragment_out` (when `Some` and a plugin is also configured)
-/// becomes `-fplugin-arg-cust-fragment-out=<path>` so the plugin
-/// emits a per-module fragment header.
+/// `plugin_out` carries the per-TU plugin-arg flags (fragment
+/// header path, test-discovery sidecar path, module name).
 pub fn build_cflags(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -832,7 +962,7 @@ pub fn build_cflags(
     source: &Path,
     object: &Path,
     extra_includes: &[&Path],
-    fragment_out: Option<&Path>,
+    plugin_out: PluginOutputs<'_>,
 ) -> Vec<String> {
     let mut flags: Vec<String> = Vec::new();
 
@@ -859,9 +989,28 @@ pub fn build_cflags(
     }
     if let Some(plugin) = plan.plugin {
         flags.push(plugin.fplugin_flag());
-        if let Some(path) = fragment_out {
+        if let Some(path) = plugin_out.fragment {
             flags.push(format!("-fplugin-arg-cust-fragment-out={}", path.display()));
         }
+        if let Some(path) = plugin_out.test_sidecar {
+            flags.push(format!(
+                "-fplugin-arg-cust-test-sidecar-out={}",
+                path.display()
+            ));
+        }
+        if let Some(module) = plugin_out.module {
+            flags.push(format!("-fplugin-arg-cust-module={module}"));
+        }
+    } else {
+        // V40D-10: without the plugin, clang doesn't know about
+        // `[[cust::*]]` attributes — suppress
+        // `-Wunknown-attributes` so cust-attribute decls don't
+        // drown a `cust check --no-plugin` run in warnings.
+        // (Compiles without the plugin still get the cust_*
+        // prelude macros, which expand to `annotate(...)` —
+        // those work without the plugin; only literal C23
+        // `[[cust::*]]` attributes are unrecognised.)
+        flags.push("-Wno-unknown-attributes".to_string());
     }
     for dir in extra_includes {
         flags.push(format!("-I{}", dir.display()));

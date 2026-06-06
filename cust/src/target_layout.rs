@@ -66,6 +66,20 @@ impl TargetLayout {
             .join(format!("{qualified_name}.cust.h"))
     }
 
+    /// V0.4.0 RQ-V40-2: root directory for test-discovery
+    /// sidecar files for `crate_name`.
+    /// `target/<profile>/.test-discovery/<crate>/`.
+    pub fn test_discovery_dir(&self, crate_name: &str) -> PathBuf {
+        self.profile_root.join(".test-discovery").join(crate_name)
+    }
+
+    /// V0.4.0 RQ-V40-2: per-module test-discovery sidecar path.
+    /// `target/<profile>/.test-discovery/<crate>/<qname>.cust.tests`.
+    pub fn test_sidecar_path(&self, crate_name: &str, qualified_name: &str) -> PathBuf {
+        self.test_discovery_dir(crate_name)
+            .join(format!("{qualified_name}.cust.tests"))
+    }
+
     /// Per-member crate header
     /// (`target/<profile>/build/<crate>/include/<crate>.h`).
     ///
