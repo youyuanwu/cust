@@ -1,1 +1,1 @@
-cust_pub int cust_main(void) { return 0; }
+[[cust::pub]] int cust_main(void) { return 0; }

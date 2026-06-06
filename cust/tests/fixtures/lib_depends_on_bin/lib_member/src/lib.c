@@ -1,1 +1,1 @@
-cust_pub int lib_member_value(void) { return 7; }
+[[cust::pub]] int lib_member_value(void) { return 7; }

@@ -60,6 +60,20 @@ endfunction()
 cust_plugin_add_recognition_test(test_c23_pub_recognition)
 cust_plugin_add_golden_test(test_pub_repr_body)
 
+# V40D-7 slice E sentinel-marker enforcement: user-written
+# `annotate("cust::pub")` is silently ignored; only decls that
+# went through the plugin's ParsedAttrInfo recognisers (which
+# attach the sentinel) are picked up.
+add_test(
+    NAME test_annotate_rejected
+    COMMAND
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_annotate_rejected_test.sh"
+        "${CLANG_C_EXECUTABLE}"
+        "$<TARGET_FILE:cust_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/test_annotate_rejected.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/test_annotate_rejected.cust.h"
+)
+
 # V40D-4 error cases (slice B): pub_repr on function / variable /
 # typedef must each produce the V40D-4 error wording.
 add_test(

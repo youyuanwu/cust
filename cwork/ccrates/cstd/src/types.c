@@ -1,10 +1,11 @@
 /* cstd::types — Rust-aligned primitive type aliases.
  *
  * Defines `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`usize`/
- * `isize`/`f32`/`f64` as `cust_pub typedef`s so consumers reach
- * them by `#cust use cstd;` rather than by `#include <stdint.h>`
- * themselves. This is the Cargo-parity move: any type a consumer
- * uses must be reachable through the producing crate's surface.
+ * `isize`/`f32`/`f64` as `[[cust::pub]] typedef`s so consumers
+ * reach them by `#cust use cstd;` rather than by `#include
+ * <stdint.h>` themselves. This is the Cargo-parity move: any
+ * type a consumer uses must be reachable through the producing
+ * crate's surface.
  *
  * Implementation note: we use clang's `__INT32_TYPE__` /
  * `__UINT64_TYPE__` / `__SIZE_TYPE__` builtin macros (each
@@ -27,26 +28,26 @@
  * directly.
  */
 
-cust_pub_t typedef __INT8_TYPE__   i8;
-cust_pub_t typedef __INT16_TYPE__  i16;
-cust_pub_t typedef __INT32_TYPE__  i32;
-cust_pub_t typedef __INT64_TYPE__  i64;
+[[cust::pub]] typedef __INT8_TYPE__   i8;
+[[cust::pub]] typedef __INT16_TYPE__  i16;
+[[cust::pub]] typedef __INT32_TYPE__  i32;
+[[cust::pub]] typedef __INT64_TYPE__  i64;
 
-cust_pub_t typedef __UINT8_TYPE__  u8;
-cust_pub_t typedef __UINT16_TYPE__ u16;
-cust_pub_t typedef __UINT32_TYPE__ u32;
-cust_pub_t typedef __UINT64_TYPE__ u64;
+[[cust::pub]] typedef __UINT8_TYPE__  u8;
+[[cust::pub]] typedef __UINT16_TYPE__ u16;
+[[cust::pub]] typedef __UINT32_TYPE__ u32;
+[[cust::pub]] typedef __UINT64_TYPE__ u64;
 
 /* Pointer-sized integers. `usize` is the unsigned address-width
  * type (Rust's `usize` / C's `size_t` / `uintptr_t`); `isize` is
  * the signed counterpart (Rust's `isize` / C's `ssize_t` /
  * `intptr_t`). */
-cust_pub_t typedef __SIZE_TYPE__   usize;
-cust_pub_t typedef __INTPTR_TYPE__ isize;
+[[cust::pub]] typedef __SIZE_TYPE__   usize;
+[[cust::pub]] typedef __INTPTR_TYPE__ isize;
 
 /* IEEE-754 binary32 and binary64. clang has no `__FLOAT_TYPE__`
  * builtin (floats aren't size-parameterised in the same way), so
  * these are spelled directly. Every cust-supported platform has
  * `float` = binary32 and `double` = binary64. */
-cust_pub_t typedef float           f32;
-cust_pub_t typedef double          f64;
+[[cust::pub]] typedef float           f32;
+[[cust::pub]] typedef double          f64;

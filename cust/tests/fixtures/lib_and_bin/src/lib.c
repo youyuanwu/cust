@@ -1,1 +1,1 @@
-cust_pub int demo_answer(void) { return 42; }
+[[cust::pub]] int demo_answer(void) { return 42; }

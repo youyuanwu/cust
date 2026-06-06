@@ -62,7 +62,30 @@ enum class CustPubKind {
     PubRepr,
 };
 
+// V40D-7 marker: slice E removed user-facing `annotate("cust::*")`
+// source recognition. The `ParsedAttrInfo` recognisers below
+// attach this sentinel alongside the actual `cust::pub` /
+// `cust::test` payload; `getCustPubKind` / `getCustTestKind`
+// require the sentinel to fire. A user-written
+// `__attribute__((annotate("cust::pub")))` lacks the sentinel
+// and is silently ignored — the only way to be recognised is
+// the C23 `[[cust::*]]` spelling that goes through the
+// `ParsedAttrInfo` recognisers.
+constexpr llvm::StringLiteral kCustMarker = "__cust_v40_marker__";
+
+bool hasCustMarker(const Decl *D) {
+    for (const auto *attr : D->specific_attrs<AnnotateAttr>()) {
+        if (attr->getAnnotation() == kCustMarker) {
+            return true;
+        }
+    }
+    return false;
+}
+
 CustPubKind getCustPubKind(const Decl *D) {
+    if (!hasCustMarker(D)) {
+        return CustPubKind::None;
+    }
     for (const auto *attr : D->specific_attrs<AnnotateAttr>()) {
         llvm::StringRef ann = attr->getAnnotation();
         if (ann == "cust::pub") return CustPubKind::Pub;
@@ -80,6 +103,9 @@ enum class CustTestKind {
 };
 
 CustTestKind getCustTestKind(const Decl *D) {
+    if (!hasCustMarker(D)) {
+        return CustTestKind::None;
+    }
     for (const auto *attr : D->specific_attrs<AnnotateAttr>()) {
         llvm::StringRef ann = attr->getAnnotation();
         if (ann == "cust::test") return CustTestKind::Test;
@@ -531,6 +557,12 @@ void custAttrAttach(Sema &S, Decl *D, const ParsedAttr &Attr,
     D->addAttr(AnnotateAttr::Create(ctx, payload.str(),
                                     /*Args=*/nullptr, /*NumArgs=*/0,
                                     Attr.getRange()));
+    // V40D-7 slice E: marker required for AST consumer to
+    // recognise the decl. Distinguishes plugin-attached payloads
+    // from user-written `annotate("cust::pub")` strings.
+    D->addAttr(AnnotateAttr::Create(ctx, kCustMarker.str(),
+                                    /*Args=*/nullptr, /*NumArgs=*/0,
+                                    Attr.getRange()));
     if (liftVis && (isa<FunctionDecl>(D) || isa<VarDecl>(D))) {
         D->addAttr(VisibilityAttr::CreateImplicit(
             ctx, VisibilityAttr::Default, Attr.getRange()));
@@ -648,6 +680,10 @@ void attachTestAttrs(Sema &S, Decl *D, const ParsedAttr &Attr,
                      llvm::StringRef payload) {
     ASTContext &ctx = S.getASTContext();
     D->addAttr(AnnotateAttr::Create(ctx, payload.str(),
+                                    /*Args=*/nullptr, /*NumArgs=*/0,
+                                    Attr.getRange()));
+    // V40D-7 slice E marker; see custAttrAttach for rationale.
+    D->addAttr(AnnotateAttr::Create(ctx, kCustMarker.str(),
                                     /*Args=*/nullptr, /*NumArgs=*/0,
                                     Attr.getRange()));
     if (!isCustTestBuildDefined(S)) {

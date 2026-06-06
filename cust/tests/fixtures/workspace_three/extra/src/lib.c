@@ -1,1 +1,1 @@
-cust_pub int extra_thing(void) { return 99; }
+[[cust::pub]] int extra_thing(void) { return 99; }

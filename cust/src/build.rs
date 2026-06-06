@@ -980,11 +980,14 @@ pub fn build_cflags(
 
     flags.push("-fvisibility=hidden".to_string());
     if plan.test_build {
-        // v0.3.2 V32D-3: activate the prelude's test-build
-        // branch — cust_test stops decaying to `static unused`
-        // and gains its annotate attribute; cust_assert / panic
-        // forward-declare cust_panic_impl (defined in the
-        // generated runner TU).
+        // v0.3.2 V32D-3 / v0.4.0 V40D-14: -DCUST_TEST_BUILD=1
+        // tells the plugin to attach normal external linkage to
+        // `[[cust::test]]` decls (so the runner TU can extern
+        // them) instead of the InternalLinkageAttr + UnusedAttr
+        // it attaches in regular builds. Also gates the prelude's
+        // `cust_assert` / `cust_panic` macros to their real
+        // implementations (forward-declaring `cust_panic_impl`,
+        // defined in the generated runner TU).
         flags.push("-DCUST_TEST_BUILD=1".to_string());
     }
     if let Some(plugin) = plan.plugin {
@@ -1259,7 +1262,7 @@ fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
 /// guard pair so it's safe to `#include` from C and C++.
 ///
 /// Missing fragments are skipped silently — a module with zero
-/// `cust_pub` decls produces no fragment, which is fine.
+/// `[[cust::pub]]` decls produces no fragment, which is fine.
 ///
 /// **Module order.** Modules are emitted in topological order
 /// over their intra-crate `#cust use crate::<mod>;` edges so any
@@ -1291,7 +1294,7 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
     // No `#include` injection: the generated header is pure
     // declarations. Crates whose public surface mentions
     // fixed-width / size / bool types must export their own
-    // `cust_pub typedef`s (mirrors Rust's `pub use` story —
+    // `[[cust::pub]] typedef`s (mirrors Rust's `pub use` story —
     // every type a consumer reaches for must be reachable via
     // the producer's surface). See cust-design.md §5.
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
@@ -1299,7 +1302,7 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
     for m in &ordered {
         let frag = layout.fragment_path(crate_name, &m.qualified_name);
         let Ok(body) = fs::read_to_string(frag) else {
-            continue; // module had no cust_pub decls; plugin emitted nothing
+            continue; // module had no [[cust::pub]] decls; plugin emitted nothing
         };
         let _ = writeln!(out, "/* --- module `{}` --- */", m.qualified_name);
         out.push_str(strip_fragment_header_comment(&body));

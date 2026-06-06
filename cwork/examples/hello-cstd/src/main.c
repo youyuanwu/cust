@@ -22,20 +22,35 @@
  *
  *   max(3, 7) = 7
  *   strlen("hello, cstd") = 11
- *   cstd version = 0x000301 (0.3.1)
+ *   cstd version = 0x000400 (0.4.0)
+ *   distance_sq((0,0), (3,4)) = 25
  */
 
 #include <stdio.h>
 
 #cust use cstd;
 
-cust_pub int cust_main(void) {
+[[cust::pub]] int cust_main(void) {
     i32 a = 3, b = 7;
     printf("max(%d, %d) = %d\n", a, b, cstd_max_i32(a, b));
 
     const char *greeting = "hello, cstd";
-    printf("strlen(\"%s\") = %zu\n", greeting, cstd_strlen(greeting));
+    /* cstd_strlen returns `usize`, which is `unsigned long` per
+     * the resolved __SIZE_TYPE__ macro — %zu is the C-portable
+     * format specifier for that width. */
+    printf("strlen(\"%s\") = %zu\n",
+           greeting,
+           (unsigned long)cstd_strlen(greeting));
 
-    printf("cstd version = 0x%06x (0.3.1)\n", cstd_version());
+    /* v0.4.0 dogfood: construct a cstd_point by value (only
+     * possible because [[cust::pub_repr]] exports the body)
+     * and pass it through cstd_point_distance_sq. */
+    struct cstd_point origin = {0, 0};
+    struct cstd_point target = {3, 4};
+    printf("distance_sq((%d,%d), (%d,%d)) = %d\n",
+           origin.x, origin.y, target.x, target.y,
+           cstd_point_distance_sq(origin, target));
+
+    printf("cstd version = 0x%06x (0.4.0)\n", cstd_version());
     return 0;
 }

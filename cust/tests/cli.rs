@@ -373,7 +373,7 @@ fn build_multi_module_compiles_all_tus() {
     let archive = dir.join("target/debug/build/multi_module/libmulti_module.a");
     assert!(archive.is_file());
 
-    // All three `cust_pub` symbols should be in the archive.
+    // All three `[[cust::pub]]` symbols should be in the archive.
     let nm = Command::new("nm")
         .arg("--defined-only")
         .arg(&archive)
@@ -452,7 +452,7 @@ fn reports_missing_module_source() {
 
 #[test]
 fn use_crate_compiles_cross_module_call() {
-    // `lib.c` calls a `cust_pub` function defined in `util.c`
+    // `lib.c` calls a `[[cust::pub]]` function defined in `util.c`
     // purely via `#cust use crate::util;` — no manual `extern`
     // declarations. The build pipeline's surface pass + fragment-
     // header `#include` lowering should make this work.
@@ -466,7 +466,7 @@ fn use_crate_compiles_cross_module_call() {
     let out = cust(&dir, ["build"]);
     assert_success(&out);
 
-    // Both `cust_pub` symbols must end up in the archive.
+    // Both `[[cust::pub]]` symbols must end up in the archive.
     let archive = dir.join("target/debug/build/use_crate_works/libuse_crate_works.a");
     assert!(archive.is_file());
     let nm = Command::new("nm")
@@ -511,7 +511,7 @@ fn build_emits_concatenated_crate_header() {
     // pure declarations. Consumers that reach for system types
     // (stdint.h / stddef.h / stdbool.h) must include them
     // themselves, or the producing crate must export its own
-    // `cust_pub typedef`s (e.g. cstd's i32/usize aliases).
+    // `[[cust::pub]] typedef`s (e.g. cstd's i32/usize aliases).
     assert!(
         !body.contains("#include <stdint.h>"),
         "generated header injected <stdint.h>:\n{body}"
@@ -861,7 +861,7 @@ fn workspace_builds_all_members_in_topo_order() {
         resolved.display()
     );
 
-    // app's archive carries its own cust_pub symbol; util's
+    // app's archive carries its own [[cust::pub]] symbol; util's
     // remains in util.a (not bundled — library deps are rlib-
     // style per scope item 8).
     let nm = Command::new("nm")
@@ -1335,7 +1335,7 @@ fn lib_half_cannot_self_import_via_cust_use() {
     .unwrap();
     fs::write(
         dir.join("src/lib.c"),
-        "#cust use badlib;\ncust_pub int x(void) { return 0; }\n",
+        "#cust use badlib;\n[[cust::pub]] int x(void) { return 0; }\n",
     )
     .unwrap();
     let out = cust(&dir, ["build"]);
@@ -1444,10 +1444,10 @@ fn test_subcommand_failure_isolated_by_fork() {
     .unwrap();
     fs::write(
         dir.join("src/lib.c"),
-        "cust_pub int answer(void) { return 42; }\n\
-         cust_test int test_pass_first(void) { cust_assert_eq(answer(), 42); return 0; }\n\
-         cust_test int test_will_fail(void)  { cust_assert_eq(answer(), 0); return 0; }\n\
-         cust_test int test_pass_last(void)  { cust_assert_eq(answer(), 42); return 0; }\n",
+        "[[cust::pub]] int answer(void) { return 42; }\n\
+         [[cust::test]] int test_pass_first(void) { cust_assert_eq(answer(), 42); return 0; }\n\
+         [[cust::test]] int test_will_fail(void)  { cust_assert_eq(answer(), 0); return 0; }\n\
+         [[cust::test]] int test_pass_last(void)  { cust_assert_eq(answer(), 42); return 0; }\n",
     )
     .unwrap();
 
@@ -1512,8 +1512,8 @@ fn test_subcommand_silently_skips_bin_only_workspace_member() {
     .unwrap();
     fs::write(
         dir.join("lib_member/src/lib.c"),
-        "cust_pub int answer(void) { return 42; }\n\
-         cust_test int test_basic(void) { cust_assert_eq(answer(), 42); return 0; }\n",
+        "[[cust::pub]] int answer(void) { return 42; }\n\
+         [[cust::test]] int test_basic(void) { cust_assert_eq(answer(), 42); return 0; }\n",
     )
     .unwrap();
     fs::write(
@@ -1523,7 +1523,7 @@ fn test_subcommand_silently_skips_bin_only_workspace_member() {
     .unwrap();
     fs::write(
         dir.join("bin_member/src/main.c"),
-        "cust_pub int cust_main(void) { return 0; }\n",
+        "[[cust::pub]] int cust_main(void) { return 0; }\n",
     )
     .unwrap();
 
@@ -1549,7 +1549,7 @@ fn test_subcommand_silently_skips_bin_only_workspace_member() {
 fn test_subcommand_lib_and_bin_tests_lib_half_only() {
     // V32D-11 carve-out: a lib+bin crate tests the lib half.
     let (_tmp, dir) = stage("lib_and_bin");
-    // The existing fixture has no cust_test functions; we add
+    // The existing fixture has no [[cust::test]] functions; we add
     // one to the lib half to confirm the test binary discovers
     // it. The bin half's `cust_main` must NOT be reachable
     // from the test binary (it would clash with the runner's
@@ -1558,7 +1558,7 @@ fn test_subcommand_lib_and_bin_tests_lib_half_only() {
     let mut lib_src = fs::read_to_string(&lib).unwrap();
     lib_src.push_str(
         "\n\
-         cust_test int test_demo_answer(void) { cust_assert_eq(demo_answer(), 42); return 0; }\n",
+         [[cust::test]] int test_demo_answer(void) { cust_assert_eq(demo_answer(), 42); return 0; }\n",
     );
     fs::write(&lib, lib_src).unwrap();
 
@@ -1570,7 +1570,7 @@ fn test_subcommand_lib_and_bin_tests_lib_half_only() {
 
 #[test]
 fn test_subcommand_zero_tests_succeeds() {
-    // A library member with no cust_test functions produces a
+    // A library member with no [[cust::test]] functions produces a
     // valid (zero-test) binary. The runner prints
     // `running 0 tests` and `test result: ok. 0 passed; 0
     // failed; 0 ignored`, exit 0. Cargo parity.
@@ -1588,8 +1588,8 @@ fn test_subcommand_zero_tests_succeeds() {
 #[test]
 fn test_build_excludes_cust_test_symbols_from_normal_archive() {
     // Build the with_tests fixture in NORMAL (non-test) mode and
-    // confirm the resulting libwith_tests.a contains the cust_pub
-    // functions but NOT any test_* symbol. V32D-3: cust_test
+    // confirm the resulting libwith_tests.a contains the [[cust::pub]]
+    // functions but NOT any test_* symbol. V40D-14: [[cust::test]]
     // decays to `static unused` in non-test builds.
     let (_tmp, dir) = stage("with_tests");
     assert_success(&cust(&dir, ["build"]));
@@ -1604,7 +1604,7 @@ fn test_build_excludes_cust_test_symbols_from_normal_archive() {
         .expect("spawn nm");
     let symbols = String::from_utf8_lossy(&nm.stdout);
 
-    // cust_pub functions present:
+    // [[cust::pub]] functions present:
     assert!(
         symbols.contains("add"),
         "expected `add` in archive:\n{symbols}"
@@ -1613,7 +1613,7 @@ fn test_build_excludes_cust_test_symbols_from_normal_archive() {
         symbols.contains("mul"),
         "expected `mul` in archive:\n{symbols}"
     );
-    // cust_test functions absent — they're static unused outside
+    // [[cust::test]] functions absent — they're static unused outside
     // the test build.
     for needle in ["test_add_basic", "test_mul_void_kind", "test_skipped"] {
         assert!(

@@ -15,7 +15,7 @@
 //! ├── .gitignore        # just `/target`
 //! ├── Cust.toml         # [package] name + version = "0.1.0"
 //! └── src/
-//!     └── lib.c         # one cust_pub function so `cust build` works
+//!     └── lib.c         # one [[cust::pub]] function so `cust build` works
 //! ```
 //!
 //! Generated layout (bin):
@@ -163,7 +163,7 @@ fn lib_c(name: &str) -> String {
     format!(
         "#include <stdint.h>\n\
          \n\
-         cust_pub int32_t {sym}_add(int32_t a, int32_t b) {{\n    \
+         [[cust::pub]] int32_t {sym}_add(int32_t a, int32_t b) {{\n    \
              return a + b;\n\
          }}\n"
     )
@@ -176,7 +176,7 @@ fn main_c(name: &str) -> String {
     format!(
         "#include <stdio.h>\n\
          \n\
-         cust_pub int cust_main(void) {{\n    \
+         [[cust::pub]] int cust_main(void) {{\n    \
              printf(\"hello from {name}\\n\");\n    \
              return 0;\n\
          }}\n"
@@ -198,13 +198,13 @@ mod tests {
     fn lib_c_sanitises_dashes_in_symbol() {
         let c = lib_c("my-crate");
         assert!(c.contains("my_crate_add"), "{c}");
-        assert!(c.contains("cust_pub"), "{c}");
+        assert!(c.contains("[[cust::pub]]"), "{c}");
     }
 
     #[test]
     fn main_c_uses_cust_main_and_greets_with_name() {
         let c = main_c("greeter");
-        assert!(c.contains("cust_pub int cust_main"), "{c}");
+        assert!(c.contains("[[cust::pub]] int cust_main"), "{c}");
         assert!(c.contains("greeter"), "{c}");
         assert!(c.contains("return 0;"), "{c}");
     }

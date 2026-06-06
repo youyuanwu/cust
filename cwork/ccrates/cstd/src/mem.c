@@ -1,9 +1,9 @@
 /* cstd::mem — thin wrappers over libc memory/string primitives.
  *
  * Why wrap at all? Two reasons:
- *   1. Visibility: every export carries `cust_pub`, so the symbol
- *      table of the final binary documents exactly which libc
- *      surfaces a downstream crate actually reached for.
+ *   1. Visibility: every export carries `[[cust::pub]]`, so the
+ *      symbol table of the final binary documents exactly which
+ *      libc surfaces a downstream crate actually reached for.
  *   2. Stability: when cust grows a freestanding profile (OQ-8) the
  *      `cstd_*` names stay put while the underlying implementation
  *      swaps to a no-libc version.
@@ -20,28 +20,28 @@
 #include <stddef.h>
 #include <string.h>
 
-cust_pub usize cstd_strlen(const char *s) {
+[[cust::pub]] usize cstd_strlen(const char *s) {
     return strlen(s);
 }
 
-cust_pub i32 cstd_memcmp(const void *a, const void *b, usize n) {
+[[cust::pub]] i32 cstd_memcmp(const void *a, const void *b, usize n) {
     return memcmp(a, b, n);
 }
 
 /* ─── v0.3.2 unit tests ───────────────────────────────────── */
 
-cust_test int test_strlen_empty(void) {
+[[cust::test]] int test_strlen_empty(void) {
     cust_assert_eq(cstd_strlen(""), (usize)0);
     return 0;
 }
 
-cust_test int test_strlen_hello(void) {
+[[cust::test]] int test_strlen_hello(void) {
     cust_assert_eq(cstd_strlen("hello"), (usize)5);
     cust_assert_eq(cstd_strlen("hello, cstd"), (usize)11);
     return 0;
 }
 
-cust_test int test_memcmp_equal_and_diff(void) {
+[[cust::test]] int test_memcmp_equal_and_diff(void) {
     cust_assert_eq(cstd_memcmp("abc", "abc", 3), 0);
     /* Sign of memcmp is implementation-defined, only the
      * sign-vs-zero invariant is portable. */
