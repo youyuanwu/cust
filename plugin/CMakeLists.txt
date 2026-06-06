@@ -67,3 +67,8 @@ target_compile_options(cust_plugin PRIVATE
     -Wall
     -Wextra
 )
+
+# v0.4.0 slice A — plugin test scaffold. Enables `ctest` from the
+# CMake build dir; tests live under `plugin/test/`.
+enable_testing()
+add_subdirectory(test)

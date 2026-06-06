@@ -25,9 +25,12 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/PrettyPrinter.h"
+#include "clang/Basic/AttributeCommonInfo.h"
 #include "clang/Basic/LangOptions.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Sema/ParsedAttr.h"
+#include "clang/Sema/Sema.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -185,6 +188,107 @@ private:
     std::string FragmentOut;
 };
 
+// ---------------------------------------------------------------------------
+// v0.4.0 slice A — `ParsedAttrInfo` recogniser for `[[cust::pub]]`.
+//
+// Dispatches on `getArg(0)` per V40D-7 (one recogniser per attribute name,
+// not name + args — clang's `ParsedAttrInfoRegistry` registers by name).
+// Both forms produce the same `AnnotateAttr` payload string that the
+// existing `CustASTConsumer` / `hasCustPub` path already recognises, so
+// the C23-attribute and macro spellings remain interchangeable through
+// slices A–D; slice E retires the macros and removes the legacy
+// `annotate("cust::*")` recognition.
+//
+// Decl-kind-aware visibility lift (V40D-7 bullet 3): when `[[cust::pub]]`
+// (no modifier) is attached to a function or variable decl, the recogniser
+// also attaches `VisibilityAttr(Default)` to lift the symbol over the
+// crate-wide `-fvisibility=hidden`. Type decls (typedef/record/enum) get
+// no visibility lift — visibility on a typedef warns
+// (`-Wignored-attributes`), and tagged types have no linkage of their own
+// anyway. This subsumes what cust_pub vs cust_pub_t encoded manually in
+// the v0.3.x prelude.
+
+struct CustPubAttrInfo : public ParsedAttrInfo {
+    CustPubAttrInfo() {
+        OptArgs = 1;
+        NumArgs = 0;
+        // `[[cust::pub]]` (C23 / C++11 attribute spelling).
+        static constexpr Spelling kSpellings[] = {
+            {ParsedAttr::AS_CXX11, "cust::pub"},
+            {ParsedAttr::AS_C23, "cust::pub"},
+        };
+        Spellings = kSpellings;
+    }
+
+    bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                              const Decl *D) const override {
+        if (!isa<FunctionDecl>(D) && !isa<VarDecl>(D) &&
+            !isa<TypedefDecl>(D) && !isa<RecordDecl>(D) && !isa<EnumDecl>(D)) {
+            unsigned id = S.getDiagnostics().getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "`[[cust::pub]]` only applies to functions, variables, "
+                "typedefs, structs, unions, and enums");
+            S.Diag(Attr.getLoc(), id);
+            return false;
+        }
+        return true;
+    }
+
+    AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                     const ParsedAttr &Attr) const override {
+        llvm::StringRef payload;
+        bool plainPub = false;
+
+        if (Attr.getNumArgs() == 0) {
+            payload = "cust::pub";
+            plainPub = true;
+        } else if (Attr.getNumArgs() == 1) {
+            if (!Attr.isArgIdent(0)) {
+                unsigned id = S.getDiagnostics().getCustomDiagID(
+                    DiagnosticsEngine::Error,
+                    "`[[cust::pub]]` modifier must be an identifier "
+                    "(`crate` or `repr`)");
+                S.Diag(Attr.getLoc(), id);
+                return AttributeNotApplied;
+            }
+            llvm::StringRef arg =
+                Attr.getArgAsIdent(0)->getIdentifierInfo()->getName();
+            if (arg == "crate") {
+                payload = "cust::pub_crate";
+            } else if (arg == "repr") {
+                payload = "cust::pub_repr";
+            } else {
+                unsigned id = S.getDiagnostics().getCustomDiagID(
+                    DiagnosticsEngine::Error,
+                    "unknown `pub` modifier `%0`; expected `crate` or `repr`");
+                S.Diag(Attr.getLoc(), id) << arg;
+                return AttributeNotApplied;
+            }
+        } else {
+            unsigned id = S.getDiagnostics().getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "`[[cust::pub]]` takes 0 or 1 arguments, got %0");
+            S.Diag(Attr.getLoc(), id) << Attr.getNumArgs();
+            return AttributeNotApplied;
+        }
+
+        ASTContext &ctx = S.getASTContext();
+        D->addAttr(AnnotateAttr::Create(ctx, payload.str(),
+                                        /*Args=*/nullptr, /*NumArgs=*/0,
+                                        Attr.getRange()));
+
+        // Decl-kind-aware visibility lift. Only plain `[[cust::pub]]` on
+        // a function or variable; type decls and `pub(crate)` / `pub(repr)`
+        // don't lift.
+        if (plainPub && (isa<FunctionDecl>(D) || isa<VarDecl>(D))) {
+            D->addAttr(VisibilityAttr::CreateImplicit(
+                ctx, VisibilityAttr::Default, Attr.getRange()));
+        }
+
+        return AttributeApplied;
+    }
+};
+
 class CustPluginAction : public PluginASTAction {
 protected:
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
@@ -224,3 +328,6 @@ private:
 
 static FrontendPluginRegistry::Add<CustPluginAction>
     X("cust", "cust clang plugin (surface extraction)");
+
+static ParsedAttrInfoRegistry::Add<CustPubAttrInfo>
+    Y("cust_pub", "cust [[cust::pub]] attribute recogniser (V40D-7)");
