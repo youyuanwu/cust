@@ -450,8 +450,9 @@ C's default `extern` linkage is the equivalent of `pub` in Rust — i.e.
 the wrong default. We fix this with two layers:
 
 1. **Compile‑time:** pass `-fvisibility=hidden` to clang. Decls marked
-   `[[cust::pub]]` expand (via a prelude macro) to
-   `__attribute__((visibility("default")))`, restoring export.
+   `[[cust::pub]]` get `VisibilityAttr(Default)` attached by the plugin
+   (V40D-7 decl-kind-aware lift; previously a prelude macro expanded
+   to `__attribute__((visibility("default")))`), restoring export.
 2. **Link‑time:** generate a linker version script from the same
    `[[cust::pub]]` set and pass it via `-Wl,--version-script=...`. This
    catches the case where a dependency leaks symbols even if it forgot
@@ -461,12 +462,46 @@ For static‑lib output we additionally run `llvm-objcopy
 --localize-hidden` on each object, so users who link the `.a` into
 their own binary don't see internal symbols.
 
-`[[cust::pub(crate)]]` is the per‑module compilation analogue of
-Rust's `pub(crate)`: the symbol needs real external linkage at the
-`.o` level (so sibling modules in the same crate can resolve it at
-link time) but is hidden from the final artifact. Implemented by
-leaving visibility default during per‑module codegen, then localising
-those specific symbols at the crate link step.
+`[[cust::pub_crate]]` is the per‑module compilation analogue of
+Rust's `pub(crate)`: visible to sibling modules in the same crate
+but hidden from the final artifact. Today the plugin attaches
+**hidden** ELF visibility (no `Default` lift, V40D-3) — sibling
+modules still resolve the symbol at the crate link step because
+hidden visibility only affects the *dynamic* symbol table, not the
+link-time `.symtab` that `ld` consults when combining objects/
+archives. The intended end state — localising `pub_crate` symbols
+to `STB_LOCAL` at the crate link step so they disappear from the
+staticlib's symtab entirely — needs the `llvm-objcopy
+--localize-hidden` pass below to actually ship.
+
+### Status (2026-06-05) — only compile-time half ships today
+
+The link-time hardening described above is **not yet implemented**.
+Neither `--version-script` nor `llvm-objcopy --localize-hidden`
+appears in `cust/src/build.rs`. Only the `-fvisibility=hidden` +
+`[[cust::pub]]` lift half is live. Concrete consequences:
+
+* **`[[cust::pub]]` symbol names live in a single flat global
+  namespace shared by every linked crate.** Two crates each
+  exporting `[[cust::pub]] int init(void)` will fail to link
+  (`ld: multiple definition of init`) when both end up in the
+  same final binary.
+* **`[[cust::pub_crate]]` symbols are in the same namespace** for
+  link-time collision purposes (hidden visibility is dynamic-only;
+  the symbol still appears in the staticlib's `.symtab` with its
+  bare C name).
+* **`static` file-scope decls** are the only mechanism that
+  reliably avoids collisions today — internal linkage doesn't
+  enter the symbol table at all.
+
+**Convention until automatic mangling lands** (tracked as OQ-13
+below, slotted for v0.6): prefix every `[[cust::pub]]` and
+`[[cust::pub_crate]]` decl with the crate name. cstd dogfoods this
+(`cstd_version`, `cstd_alloc`, `cstd_point_distance_sq`, …); the
+`cust new` scaffolder emits `<cratename>_add` for the same reason
+([cust/src/new.rs](../../cust/src/new.rs)). Module-private helpers
+should be `static`, not relying on `-fvisibility=hidden` to
+disambiguate.
 
 ---
 
@@ -1109,6 +1144,26 @@ Unclassified questions are tracked but not yet triaged.
     silently corrupting). The `rlib_format_version` and
     `target/.cust-version` fields exist in v1; this OQ is about
     formalising the *policy*, not just the version slots.
+13. **OQ‑13 ⓐ Symbol namespace policy / automatic mangling.** §6's
+    compile-time half ships; the link-time half (version script +
+    `llvm-objcopy --localize-hidden`) does not. Until it does, every
+    `[[cust::pub]]` and `[[cust::pub_crate]]` symbol lives in a flat
+    global C namespace shared by every linked crate, and the only
+    collision-avoidance mechanism is the manual `<cratename>_` prefix
+    convention (§6 Status subsection). Before v1.0 we must decide:
+    (a) ship the §6 link-time hardening as-spec'd (localise hidden
+    symbols at the crate link, version-script the pub set) — keeps
+    the source-level user contract identical but removes the
+    cross-crate collision risk for *non*-pub symbols; (b) add
+    automatic name mangling for `[[cust::pub]]` (e.g.
+    `__cust_<crate>_<module>_<name>` with a stable hash suffix for
+    overloads) so users stop having to prefix manually — would
+    require an `[[cust::asm_export("…")]]` opt-out for FFI-stable
+    symbols and a cust-aware demangler in stack traces; or (c) both.
+    v1‑blocking because it bakes into every published rlib's exported
+    symbol set; changing the scheme after v1.0 is an ecosystem-wide
+    ABI break. Slotted into v0.6 in §17 alongside the bitcode-rlib
+    work that needs the link-time pass anyway.
 
 (CMake / GCC portability questions live in
 [cmake-and-portability.md](cmake-and-portability.md) §6.)
@@ -1267,7 +1322,13 @@ Roadmap bullets here are deliberately short:
 * **v0.5 — sanitizers, coverage, profiles, `cust check`.**
 * **v0.6 — ThinLTO across the dep graph, bitcode rlib format with
   `metadata.json` including `rlib_format_version` and `llvm_version`
-  (§7). Toolchain-swap rlib invalidation.**
+  (§7). Toolchain-swap rlib invalidation. Also closes OQ-13 (symbol
+  namespace policy): ships the §6 link-time hardening (linker
+  version script generated from the `[[cust::pub]]` set,
+  `llvm-objcopy --localize-hidden` over each `.o` before archiving)
+  so `[[cust::pub_crate]]` symbols actually disappear from the
+  staticlib symtab, and decides whether to add automatic
+  `[[cust::pub]]` name mangling on top.**
 * **v0.7 — `[[cust::derive]]`, `[[cust::must_use]]`, `[[cust::no_panic]]`
   (per-TU heuristic) plugin checks; clang-tidy integration.**
 * **v0.8 — `cust export cmake --consumable` and generated-source
