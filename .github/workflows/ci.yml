@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  ci:
+    name: build + test (linux, system clang)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system Clang + LLVM dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            clang-tools \
+            libclang-dev \
+            llvm-dev \
+            cmake \
+            ninja-build
+          clang --version
+          # Discover the installed LLVM prefix so plugin-build can find it.
+          LLVM_PREFIX="$(llvm-config --prefix)"
+          echo "CUST_LLVM_PREFIX=${LLVM_PREFIX}" >> "$GITHUB_ENV"
+          echo "Using LLVM prefix: ${LLVM_PREFIX}"
+
+      - name: Read toolchain version from rust-toolchain.toml
+        id: toolchain
+        run: |
+          channel=$(awk -F\" '/^channel/ {print $2}' rust-toolchain.toml)
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+          echo "Using Rust ${channel}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: just fmt-check
+
+      - name: Clippy
+        run: just clippy
+
+      - name: Build driver
+        run: just build
+
+      - name: Build clang plugin
+        run: just plugin
+
+      - name: Cargo tests
+        run: just test
+
+      - name: Plugin ctest
+        run: just test-plugin
+
+      - name: cwork in-tree tests
+        run: just test-cwork
