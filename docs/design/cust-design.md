@@ -195,6 +195,18 @@ rewritten form.
 A build of a crate runs in three phases. Phase 1 and 2 each parallelise
 over modules; phase 3 is the link.
 
+> **v0.4.2 update (V42D-2 / V42D-13 / V42D-16):** from v0.4.2 onward
+> phase 2 (codegen) and phase 3 (link) execute under one
+> `cmake -G Ninja` + `cmake --build` invocation per workspace.
+> The Rust driver still owns phase 1 (surface pass, fragment-header
+> emission, `<crate>.h` concatenation) and `#cust use` rewriting,
+> but stops shelling out to clang for per-TU compiles — Ninja
+> owns scheduling, depfile parsing, and the link command. See
+> [v0.4.2.md](v0.4.2.md) for the full boundary and
+> [cmake-and-portability.md](cmake-and-portability.md) (superseded
+> banner) for the long-term direct-Ninja-emitter direction
+> v0.4.2 reverses.
+
 1. **Surface extraction** (cheap). For every module: run clang with
    `-fsyntax-only -fplugin=libcust_plugin.so` plus the union of
    *already‑known* fragment headers from previously‑built sibling
@@ -295,6 +307,17 @@ The "executor" is Ninja by default ([cmake-and-portability.md
 requires *some* DAG‑based executor that consumes clang depfiles — a
 hand‑rolled scheduler, `samurai`, even `make -j` with `.d` files would
 satisfy the same contract.
+
+> **v0.4.2 (V42D-6 / V42D-13):** the executor *is* Ninja now,
+> driven by a workspace-level `CMakeLists.txt` cust generates at
+> `target/<profile>/cmake/`. Fragment-header invalidation lowers
+> to a `set_source_files_properties(... OBJECT_DEPENDS …)`
+> property per importing TU (one entry per `#cust use
+> crate::<importee>` edge), which Ninja honours via its standard
+> rebuild-on-change semantics. The driver still owns
+> *producing* fragments before each `cmake --build` invocation
+> (V42D-17) — `OBJECT_DEPENDS` is a rebuild-on-change edge, not
+> a produce-this-first edge.
 
 Finer‑grained incrementality (per‑function) is out of scope; whole‑module
 rebuilds are believed to be fast enough at the module sizes typical of
@@ -990,6 +1013,17 @@ tracked separately in §16 OQ‑10.
 * **clangd**: cust always writes a fresh `compile_commands.json` into
   `target/`. Symlink (or `.clangd` file) at the repo root points to
   it. No extra setup.
+  > **v0.4.2 (V42D-12):** CMake emits the canonical
+  > `compile_commands.json` at
+  > `target/<profile>/cmake/build/compile_commands.json`; the
+  > cust driver publishes both `target/<profile>/compile_commands.json`
+  > and the legacy `target/compile_commands.json` as symlinks to it.
+  > Flags clangd sees now match the compile invocation Ninja
+  > runs exactly, including CMake-injected `-MMD -MF` depfile
+  > flags. One entry per TU (the rewritten
+  > `target/<profile>/.rewrite/<crate>/<…>.c` file); the v0.3
+  > clangd-paired-entries trick that mirrored each entry against
+  > the user's original `src/<name>.c` is a v0.4.x follow-up.
 * **clang‑tidy**: `cust clippy` is just clang‑tidy with a curated
   config (`.clang-tidy` shipped in `~/.cust/`). The cust plugin
   contributes a few custom checks (`cust-no-raw-malloc`,
@@ -1009,13 +1043,29 @@ tracked separately in §16 OQ‑10.
 See the companion doc:
 [cmake-and-portability.md](cmake-and-portability.md).
 
+> **v0.4.2 update (V42D-1 / V42D-3 / V42D-13):** the first two
+> headline bullets below are **reversed for the near term** by
+> v0.4.2. From v0.4.2 onward CMake (Ninja generator only) IS
+> the build-time codegen backend; the Rust driver still owns
+> phase 1 + `#cust use` rewriting + plugin discovery, but
+> phases 2–3 run under one `cmake -G Ninja` + `cmake --build`
+> invocation per workspace. See [v0.4.2.md](v0.4.2.md) for the
+> full reversal (and the long-term direct-Ninja-emitter
+> position the companion doc preserved).
+> The export-only side and the GCC non-goal are unaffected.
+
 Headline decisions (full reasoning in that doc):
 
-* CMake is **never** in the build hot path — not as the driver, not as
-  a transient intermediate in `target/`. We drive clang directly and
-  emit `build.ninja` for larger crates.
+* CMake (Ninja generator) **is** the build-time codegen backend
+  from v0.4.2 onward. The "never in the build hot path" rule
+  applied through v0.4.1; v0.4.2 reversed it for the reasons
+  in [v0.4.2.md](v0.4.2.md) §"Why CMake now". The long-term
+  direct-Ninja-emitter direction is preserved as a future
+  option in [cmake-and-portability.md](cmake-and-portability.md).
 * CMake **is** a first‑class *export* format for downstream consumers
-  (`cust export cmake --consumable` / `--standalone`).
+  (`cust export cmake --consumable` / `--standalone`). Unchanged
+  by v0.4.2 — this is the *export* role, separate from the
+  *driver* role above.
 * GCC support is a deliberate non‑goal. CMake does not meaningfully
   ease a future GCC port; the hard parts (plugin parity, attribute
   survival, bitcode rlibs) are architectural. If GCC ever becomes a
@@ -1311,10 +1361,22 @@ Roadmap bullets here are deliberately short:
     when concrete dogfooding pressure forces the
     `[[clang::annotate(...)]]` workaround. See
     [v0.4.1.md](v0.4.1.md).
-  - **v0.4.2** — build scripts (`build.cust.c`) with the
-    §12 hang-protection timeout. **Next-up.**
-  - **v0.4.3** — `-jN` parallelism (within and across
-    crates).
+  - **v0.4.2** — CMake-driven build backend (V42D-1 through
+    V42D-18). Phases 2–3 move under
+    `cmake -G Ninja` + `cmake --build`; phase 1 + `#cust
+    use` rewriting stay in the Rust driver. Single
+    workspace-level `CMakeLists.txt` per V42D-13. `cust
+    check` bypasses CMake entirely (V42D-15). See
+    [v0.4.2.md](v0.4.2.md). The original v0.4.2 scope
+    (build scripts) is reslotted to v0.4.8+.
+  - **v0.4.3** — `--jobs` / `-jN` polish. The originally-
+    planned "write a parallel scheduler" milestone
+    collapsed to a tiny tuning slice once v0.4.2 V42D-13
+    let Ninja own intra-crate and inter-crate parallelism
+    in one graph; `cust build -jN` already lowers to
+    `cmake --build -j N` (shipped in v0.4.2 slice D as a
+    pull-forward). v0.4.3 itself becomes "polish + any
+    Ninja-side knob worth surfacing."
   - **v0.4.4** — multi-bin per crate (`src/bin/*.c`,
     `[[bin]]` arrays — V31D-3 deferral from v0.3.1).
   - **v0.4.5** — `cust test` follow-ups: `tests/`
@@ -1333,6 +1395,15 @@ Roadmap bullets here are deliberately short:
   - **v0.4.7+** — when v0.4.1's FFI design resumes, it
     picks up here (or sooner if a resumption criterion
     fires earlier — see [v0.4.1.md](v0.4.1.md)).
+  - **v0.4.8+** — build scripts (`build.cust.c`) with the
+    §12 hang-protection timeout. Pushed back from the
+    original v0.4.2 slot when v0.4.2 was repurposed for
+    the CMake backend; §12 design intact, only the
+    scheduled date moved. With CMake as the backend, much
+    of what users would have reached for build scripts
+    (link-flag overrides, system-dep probes, cflag
+    tweaking) can be expressed in `Cust.toml` directly,
+    softening the urgency.
   Each lands as its own `docs/design/v0.4.<N>.md`. The
   v0.4.x ordering remains a draft; the locking criterion is
   "each milestone independently shippable and dogfooded
