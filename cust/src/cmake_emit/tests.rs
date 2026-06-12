@@ -69,6 +69,7 @@ fn cwork_view() -> WorkspaceView {
                 lib_workspace_deps: vec![],
                 compile_options: compile_options.clone(),
                 bin_target_name: "cstd".to_string(),
+                test_target: None,
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -88,6 +89,7 @@ fn cwork_view() -> WorkspaceView {
                 lib_workspace_deps: vec![],
                 compile_options,
                 bin_target_name: "hello-cstd".to_string(),
+                test_target: None,
             },
         ],
     }
@@ -173,6 +175,7 @@ fn lib_and_bin_member_emits_both_targets() {
             lib_workspace_deps: vec![],
             compile_options: vec!["-O0".to_string()],
             bin_target_name: "app-bin".to_string(),
+            test_target: None,
         }],
     };
     let out = generate(&view);

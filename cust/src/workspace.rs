@@ -676,6 +676,7 @@ pub fn build_workspace(
         &crate::cmake_emit::DriveOptions {
             only: opts.only,
             jobs: None, // slice D wires -jN / CUST_JOBS
+            test_build: false,
         },
     )
     .context("driving cmake build")?;
@@ -728,27 +729,69 @@ fn run_check_path(
     Ok(WorkspaceBuildOutputs { per_member })
 }
 
-/// v0.3.2 / v0.4.0 test-build pipeline orchestrator. Kept
-/// untouched in slice B; slice C (V42D-14) moves the per-member
-/// test build into the workspace `CMakeLists` as an
-/// `add_executable(<crate>__test ...)` target.
+/// V42D-14: test-build pipeline lifted onto the `CMake` backend.
+/// Per-member phase 1 (with `plan.test_build = true` so the
+/// plugin writes test-discovery sidecars), then the runner-TU
+/// generator reads the sidecars + writes
+/// `target/<profile>/cmake/cust_test_main_<crate>.c`, then a
+/// single `cmake -G Ninja -DCUST_TEST_BUILD=ON` + `cmake --build
+/// --target <crate>__test ...` drives every member's test build
+/// in one `Ninja` graph. Test isolation (per-crate cwd, output
+/// capture) still applies at runtime — the executable just lives
+/// under the V42D-14 `target/<profile>/test/<crate>/<crate>`
+/// path that the existing test runner code already expects.
 fn run_test_build_path(
     ws: &Workspace,
     to_build: &[String],
     opts: &WorkspaceBuildOptions<'_>,
-    _layout: &TargetLayout,
+    layout: &TargetLayout,
 ) -> Result<WorkspaceBuildOutputs> {
+    // Phase 1 + rewrite tree + test runner TU for EVERY workspace
+    // member that has a lib half (V42D-13 single CMakeLists
+    // requires every referenced source to exist at configure
+    // time; we narrow which `<crate>__test` targets get BUILT
+    // via `--target` below). Members without a lib half are
+    // silently skipped per V32D-12.
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
-    for name in to_build {
-        let m = ws
-            .member(name)
-            .expect("build_order returned a member not in ws");
+    for m in &ws.members {
+        let name = &m.name;
         with_plan(ws, m, opts, |plan| {
-            let outputs = build::run(plan).with_context(|| format!("building member `{name}`"))?;
-            per_member.push((name.clone(), outputs));
+            build::run_phase1(plan).with_context(|| format!("phase 1 for member `{name}`"))?;
+            build::write_rewrite_tree(plan)
+                .with_context(|| format!("writing rewrite tree for member `{name}`"))?;
+            // V42D-14 runner TU. Returns None for bin-only
+            // members; the test runner won't try to spawn
+            // anything for them (V32D-12).
+            let test_exe = build::write_test_runner_tu(plan)
+                .with_context(|| format!("writing test runner TU for member `{name}`"))?;
+            // Only report `per_member` for members the caller
+            // asked about — siblings outside `-p` scope are
+            // built but stay silent (matches `cust build`
+            // shape).
+            if to_build.iter().any(|n| n == name) {
+                let mut outputs = build::cmake_outputs_for(plan, layout);
+                outputs.test_executable = test_exe;
+                per_member.push((name.clone(), outputs));
+            }
             Ok(())
         })?;
     }
+
+    // One CMake configure + build invocation drives every
+    // member's `<crate>__test` target in one Ninja graph.
+    crate::cmake_emit::emit_and_drive_cmake(
+        ws,
+        opts.profile_kind,
+        opts.clang,
+        opts.plugin,
+        &crate::cmake_emit::DriveOptions {
+            only: opts.only,
+            jobs: None,
+            test_build: true,
+        },
+    )
+    .context("driving cmake test build")?;
+
     Ok(WorkspaceBuildOutputs { per_member })
 }
 
@@ -764,11 +807,6 @@ fn with_plan<R>(
     f: impl FnOnce(&BuildPlan<'_>) -> Result<R>,
 ) -> Result<R> {
     let dep_strs: Vec<&str> = m.deps.iter().map(String::as_str).collect();
-    let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    collect_transitive_deps(ws, m, &mut closure);
-    closure.remove(&m.name);
-    let link_deps_owned: Vec<String> = closure.into_iter().collect();
-    let link_deps: Vec<&str> = link_deps_owned.iter().map(String::as_str).collect();
 
     let plan = BuildPlan {
         manifest: &m.manifest,
@@ -777,9 +815,7 @@ fn with_plan<R>(
         profile_kind: opts.profile_kind,
         clang: opts.clang,
         plugin: opts.plugin,
-        syntax_only: opts.syntax_only,
         deps: &dep_strs,
-        link_deps: &link_deps,
         kind: m.kind.clone(),
         test_build: opts.test_build,
     };

@@ -17,10 +17,9 @@
 //! 8. Stamp `target/.cust-version`.
 
 use std::{
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use anyhow::{bail, Context, Result};
@@ -37,7 +36,7 @@ use crate::{
     test_runner,
 };
 
-/// Inputs handed to `run` by the CLI layer.
+/// Inputs handed to driver entry points by the CLI layer.
 pub struct BuildPlan<'a> {
     pub manifest: &'a Manifest,
     pub crate_root: &'a Path,
@@ -49,22 +48,12 @@ pub struct BuildPlan<'a> {
     /// code path still works for single-module / no-cross-import
     /// crates.
     pub plugin: Option<&'a Plugin>,
-    /// When `true`, every TU is compiled with `-fsyntax-only`
-    /// instead of producing an object, and no archive / executable
-    /// / version stamp / `compile_commands.json` is written.
-    /// This is what `cust check` runs.
-    pub syntax_only: bool,
     /// Names of dep crates this consumer is allowed to import via
     /// `#cust use <name>;` (V3D-6). Validated against the
     /// scanner's `UseDep` directives. Empty for a crate that
     /// declares no `[dependencies]`. The workspace orchestrator
     /// populates this from the resolved edge list.
     pub deps: &'a [&'a str],
-    /// Transitive dep names whose archives must be linked into
-    /// this crate's executable (v0.3.1). For lib-only crates this
-    /// is unused. `Workspace` orchestrator computes this in topo
-    /// order; for non-workspace single-crate builds it's empty.
-    pub link_deps: &'a [&'a str],
     /// What this crate produces (lib / bin / lib+bin). Computed
     /// by `Manifest::resolve_kind` at the workspace orchestrator
     /// (or CLI) layer.
@@ -105,13 +94,6 @@ pub struct BuildOutputs {
     pub test_executable: Option<PathBuf>,
     #[allow(dead_code)]
     pub compile_commands: PathBuf,
-}
-
-/// One `compile_commands.json` entry.
-struct CompileEntry {
-    directory: PathBuf,
-    file: PathBuf,
-    arguments: Vec<String>,
 }
 
 // ─── v0.4.2 slice B: driver-side prebuild for the CMake path ─────
@@ -314,307 +296,33 @@ pub fn cmake_outputs_for(plan: &BuildPlan<'_>, layout: &TargetLayout) -> BuildOu
     }
 }
 
-#[allow(clippy::too_many_lines)] // staged lib+bin pipeline; splitting further hurts readability more than it helps
-pub fn run(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
-    if plan.test_build && !plan.syntax_only {
-        // V32D-11: bin-only members produce no test artefacts.
-        // The workspace orchestrator calls run() for every
-        // in-scope member, including bin-only ones; silently
-        // return an empty result for those (V32D-12 also
-        // requires this — bare `cust test` skips bin-only
-        // members without erroring).
-        if !plan.kind.has_lib() {
-            return Ok(BuildOutputs {
-                objects: Vec::new(),
-                archive: None,
-                executable: None,
-                test_executable: None,
-                compile_commands: plan
-                    .workspace_root
-                    .join("target")
-                    .join("compile_commands.json"),
-            });
-        }
-        return run_test_build(plan);
-    }
-
-    // Step 2: resolve profile.
-    let profile_override = match plan.profile_kind {
-        ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
-        ProfileKind::Release => plan.manifest.profile.release.as_ref(),
-    };
-    let profile = ResolvedProfile::resolve(plan.profile_kind, profile_override)?;
-
-    let layout = TargetLayout::for_workspace(plan.workspace_root, profile.kind);
-    layout.ensure_dirs()?;
-
-    // Step 3: materialise prelude.
-    let prelude_path = layout.prelude_path();
-    materialise_prelude(&prelude_path)?;
-
-    let crate_name = plan.manifest.package_name();
-    let crate_build_dir = layout.build_dir(crate_name);
-    fs::create_dir_all(&crate_build_dir)
-        .with_context(|| format!("creating `{}`", crate_build_dir.display()))?;
-
-    // Combined compile_commands.json entries from both halves
-    // (lib first, then bin). Two entries per module: one for the
-    // rewritten file we actually compiled, one for the original
-    // source clangd will open.
-    let mut compile_entries: Vec<CompileEntry> = Vec::new();
-    let mut all_objects: Vec<PathBuf> = Vec::new();
-
-    // ─── Lib half ───────────────────────────────────────────────
-    //
-    // Produces objects, an archive, and the concatenated crate
-    // header. Skipped for bin-only crates.
-    let mut archive_path: Option<PathBuf> = None;
-    if let Some(lib_src) = plan.kind.lib_source() {
-        if !lib_src.is_file() {
-            bail!(
-                "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
-                lib_src.display()
-            );
-        }
-        let lib_modules =
-            modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
-
-        // Surface-extraction pass for cross-module fragment
-        // headers. V40D-5 makes fragment emission phase-1-only;
-        // v0.3 used to emit fragments as a side effect of the
-        // codegen invocation when no cross-module imports were
-        // present, but that's no longer permitted (the plugin
-        // hard-errors if `fragment-out` arrives in phase 2). We
-        // run surface_pass unconditionally whenever the plugin
-        // is loaded so the per-crate header concat step in
-        // `write_crate_header` below has fragments to read.
-        // V40D-11 wraps the call in a fixed-point loop so
-        // circular `[[cust::pub_repr]]` dependencies converge
-        // (no pub_repr cycles in cwork today — iter 1 always
-        // wins — but the loop is in place for the moment one
-        // appears).
-        if plan.plugin.is_some() {
-            surface_pass_fixed_point(
-                plan,
-                &profile,
-                &prelude_path,
-                &crate_build_dir,
-                &layout,
-                &lib_modules,
-            )?;
-        }
-
-        let objects = compile_tree(
-            plan,
-            &profile,
-            &prelude_path,
-            &crate_build_dir,
-            &layout,
-            &lib_modules,
-            /* extra_includes = */ &[],
-            /* is_bin_half = */ false,
-            &mut compile_entries,
-        )?;
-
-        if !plan.syntax_only {
-            // v0.3 (workspaces) archive location:
-            // `target/<profile>/build/<crate>/lib<crate>.a` so
-            // per-member outputs don't collide. The dep-view
-            // symlink (V3D-5) exposes this to consumers.
-            let archive = crate_build_dir.join(format!("lib{crate_name}.a"));
-            archive_objects(&objects, &archive)?;
-            archive_path = Some(archive);
-        }
-        all_objects.extend(objects);
-
-        // Concatenate fragment headers into the user-facing crate
-        // header (cust-design.md §5). Runs in *both* build and
-        // check mode so downstream workspace members can resolve
-        // upstream `#cust use <name>;` includes during their own
-        // check pass. Only emit when fragments actually exist
-        // (plugin was loaded).
-        if plan.plugin.is_some() {
-            write_crate_header(&layout, crate_name, &lib_modules)?;
-        }
-    }
-
-    // ─── Bin half ───────────────────────────────────────────────
-    //
-    // Produces objects and an executable at
-    // `target/<profile>/<crate-name>` (V31D-4). For lib+bin
-    // crates the bin compile is given `-I<lib-include-dir>` so
-    // `main.c` can `#include "<crate>.h"` to reach the lib's
-    // exported surface. The bin half does NOT emit fragment
-    // headers (bins have no downstream consumers).
-    let mut executable: Option<PathBuf> = None;
-    if let Some(bin_src) = plan.kind.bin_source() {
-        if !bin_src.is_file() {
-            bail!(
-                "binary source `{}` not found (set `[[bin]] path` in Cust.toml to override)",
-                bin_src.display()
-            );
-        }
-        let bin_modules =
-            modules::discover(plan.crate_root, bin_src).context("discovering bin module graph")?;
-
-        // Extra include so the bin can reach the lib's
-        // concatenated public header at `<name>.h`.
-        let lib_include_dir = layout
-            .crate_header_path(crate_name)
-            .parent()
-            .map(Path::to_path_buf);
-        let extra_includes: Vec<&Path> = lib_include_dir
-            .as_deref()
-            .filter(|_| plan.kind.has_lib())
-            .into_iter()
-            .collect();
-
-        let objects = compile_tree(
-            plan,
-            &profile,
-            &prelude_path,
-            &crate_build_dir,
-            &layout,
-            &bin_modules,
-            &extra_includes,
-            /* is_bin_half = */ true,
-            &mut compile_entries,
-        )?;
-
-        if !plan.syntax_only {
-            let exe_path = layout.profile_root.join(crate_name);
-            link_executable(
-                plan,
-                &profile,
-                &objects,
-                archive_path.as_deref(),
-                &layout,
-                &exe_path,
-            )?;
-            executable = Some(exe_path);
-        }
-        all_objects.extend(objects);
-    }
-
-    // Step 7 + 8: compile_commands.json + version stamp. Always
-    // at `target/`, never per-profile.
-    let cc_path = layout.target_root.join("compile_commands.json");
-    if !plan.syntax_only {
-        write_compile_commands(&cc_path, &compile_entries)?;
-        write_version_stamp(&layout.target_root.join(".cust-version"), plan.clang)?;
-    }
-
-    Ok(BuildOutputs {
-        objects: all_objects,
-        archive: archive_path,
-        executable,
-        test_executable: None,
-        compile_commands: cc_path,
-    })
-}
-
-/// v0.3.2 test-build pipeline, V40D-6 sidecar-driven.
-/// Per V32D-2 / V32D-3 / V32D-4 / V32D-6 / V32D-7 / V32D-11
-/// (still the v0.3.2 framing) and v0.4.0 V40D-6 (plugin-only
-/// discovery):
+/// V42D-14 test-runner TU generator. Reads the per-module test-
+/// discovery sidecars `surface_pass` wrote (when `plan.test_build`
+/// is `true`) and renders one `cust_test_main_<crate>.c` into
+/// `target/<profile>/cmake/`, where the workspace `CMakeLists`
+/// expects to find it.
 ///
-/// 1. Compile the lib half's TUs with `-DCUST_TEST_BUILD=1` into
-///    a fresh `target/<profile>/test/<crate>/` tree. Bin half is
-///    skipped (V32D-11 — v0.3.2 only tests the library half).
-/// 2. Read the per-module test-discovery sidecars the plugin
-///    wrote during `surface_pass` (V40D-6, V40D-5: phase-1 only)
-///    into `Vec<TestEntry>`.
-/// 3. Render + write + compile the `cust_test_main.c` runner
-///    TU with the per-test extern decls and the
-///    `__cust_tests[]` table (V32D-6).
-/// 4. Link every test-build object plus any transitive dep
-///    archive into the test binary at
-///    `target/<profile>/test/<crate>/<crate>`.
-///
-/// No archive, no crate header, no `compile_commands.json`, no
-/// version stamp are emitted — those belong to the non-test
-/// `cust build` pipeline. The dep-view symlink farm refresh
-/// `build_workspace` does after each member-build is also
-/// harmless in test-build mode: it points at the *non-test*
-/// build dir which may or may not exist; consumers that
-/// `#cust use <dep>;` in test code see the dep's normal lib
-/// header just like any other consumer would.
-fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
-    let profile_override = match plan.profile_kind {
-        ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
-        ProfileKind::Release => plan.manifest.profile.release.as_ref(),
-    };
-    let profile = ResolvedProfile::resolve(plan.profile_kind, profile_override)?;
-
-    let layout = TargetLayout::for_workspace(plan.workspace_root, profile.kind);
-    layout.ensure_dirs()?;
-
-    let prelude_path = layout.prelude_path();
-    materialise_prelude(&prelude_path)?;
-
+/// Returns the absolute path of the per-member test executable
+/// `CMake` will produce (so the caller can plumb it into
+/// `BuildOutputs::test_executable` for the test runner to spawn).
+/// Returns `None` for bin-only members (V32D-11: those don't get
+/// tested in v0.4.x — `cust test` skips them).
+pub fn write_test_runner_tu(plan: &BuildPlan<'_>) -> Result<Option<PathBuf>> {
+    if !plan.kind.has_lib() {
+        return Ok(None);
+    }
+    let layout = TargetLayout::for_workspace(plan.workspace_root, plan.profile_kind);
     let crate_name = plan.manifest.package_name();
-    let test_dir = layout.test_build_dir(crate_name);
-    fs::create_dir_all(&test_dir).with_context(|| format!("creating `{}`", test_dir.display()))?;
-
-    // V32D-11: bin-only members are rejected by the CLI layer
-    // (slice D). Internally we just no-op when there's no lib
-    // half — the CLI layer is responsible for the user-facing
-    // error message.
     let Some(lib_src) = plan.kind.lib_source() else {
-        bail!(
-            "cust test internal: member `{crate_name}` has no library half — \
-             callers must reject bin-only members before invoking the test build"
-        );
+        return Ok(None);
     };
-    if !lib_src.is_file() {
-        bail!(
-            "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
-            lib_src.display()
-        );
-    }
-
     let lib_modules =
         modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
 
-    // Same surface pass + crate-header sequence the lib half
-    // normally runs. Tests can `#cust use crate::<sibling>;`
-    // exactly like production code. V40D-5: surface_pass runs
-    // unconditionally when the plugin is loaded (see the
-    // matching change in `run`). V40D-11 fixed-point wrapper.
-    if plan.plugin.is_some() {
-        surface_pass_fixed_point(
-            plan,
-            &profile,
-            &prelude_path,
-            &test_dir,
-            &layout,
-            &lib_modules,
-        )?;
-    }
-
-    // Compile the lib half's TUs into the test build dir with
-    // -DCUST_TEST_BUILD=1 (added by build_cflags when
-    // plan.test_build is true — see build_cflags above).
-    let mut compile_entries: Vec<CompileEntry> = Vec::new();
-    let mut objects = compile_tree(
-        plan,
-        &profile,
-        &prelude_path,
-        &test_dir,
-        &layout,
-        &lib_modules,
-        /* extra_includes = */ &[],
-        /* is_bin_half = */ false,
-        &mut compile_entries,
-    )?;
-
-    // V40D-6: read test entries from the plugin-emitted
-    // sidecars. Each module's sidecar lives at
-    // `target/<profile>/.test-discovery/<crate>/<qname>.cust.tests`;
-    // surface_pass populated them when plan.test_build is true.
-    // A module with zero tests still has a (possibly empty)
-    // sidecar after surface_pass, so a missing file means
-    // surface_pass didn't run that module — bug, hard error.
+    // V40D-6: read every module's test-discovery sidecar.
+    // surface_pass wrote these (in test_build mode) before us;
+    // a missing sidecar means surface_pass didn't visit that
+    // module — bug, hard error.
     let mut tests: Vec<TestEntry> = Vec::new();
     for m in &lib_modules {
         let sidecar_path = layout.test_sidecar_path(crate_name, &m.qualified_name);
@@ -628,303 +336,16 @@ fn run_test_build(plan: &BuildPlan<'_>) -> Result<BuildOutputs> {
         tests.append(&mut found);
     }
 
-    // Render + write the runner TU. Always emitted (even with
-    // zero discovered tests) so the link step has a concrete
-    // `main`; the runner prints `running 0 tests` and exits 0
-    // in that case, matching Cargo's empty-suite behaviour.
-    let main_c_src = test_runner::render_main_c(&tests);
-    let main_c_path = test_dir.join("cust_test_main.c");
-    fs::write(&main_c_path, main_c_src)
-        .with_context(|| format!("writing `{}`", main_c_path.display()))?;
+    // Render + write the runner TU at the V42D-14 path.
+    let cmake_dir = layout.profile_root.join("cmake");
+    fs::create_dir_all(&cmake_dir)
+        .with_context(|| format!("creating `{}`", cmake_dir.display()))?;
+    let runner_path = cmake_dir.join(format!("cust_test_main_{crate_name}.c"));
+    let runner_src = test_runner::render_main_c(&tests);
+    // Content-skip: keeps CMake's restat happy on no-op rebuilds.
+    write_if_byte_different(&runner_path, runner_src.as_bytes())?;
 
-    // Compile the runner TU. We bypass compile_one_module
-    // because the runner needs no #cust use rewriting, no
-    // fragment emission, no extra includes, and definitely no
-    // self-import carve-out. Straight clang -c -o.
-    let main_obj = test_dir.join("cust_test_main.o");
-    let main_cflags = build_runner_cflags(plan, &profile, &prelude_path, &main_c_path, &main_obj);
-    let status = plan
-        .clang
-        .command()
-        .args(&main_cflags)
-        .stdin(Stdio::null())
-        .status()
-        .with_context(|| {
-            format!(
-                "invoking `{}` to compile `cust_test_main.c`",
-                plan.clang.path.display()
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "clang exited with status {status} compiling the test runner TU `{}`",
-            main_c_path.display(),
-        );
-    }
-    objects.push(main_obj);
-
-    // Link everything into the test binary. Direct object link
-    // (no own-archive step — saves a write + matches how Cargo
-    // builds its own test binaries: cargo test for a lib crate
-    // doesn't go through libfoo.rlib, it links the test code
-    // against the lib's object files directly). Dep archives
-    // come from plan.link_deps as usual.
-    let exe_path = layout.test_executable_path(crate_name);
-    link_executable(
-        plan, &profile, &objects, /* own_archive = */ None, &layout, &exe_path,
-    )?;
-
-    Ok(BuildOutputs {
-        objects,
-        archive: None,
-        executable: None,
-        test_executable: Some(exe_path),
-        compile_commands: layout.target_root.join("compile_commands.json"),
-    })
-}
-
-/// Build the clang argv for the generated `cust_test_main.c`
-/// runner TU. Almost the same as `build_cflags` but without the
-/// plugin / fragment / module-include plumbing that doesn't
-/// apply to the runner.
-fn build_runner_cflags(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    prelude: &Path,
-    source: &Path,
-    object: &Path,
-) -> Vec<String> {
-    let mut flags: Vec<String> = Vec::new();
-
-    let std_flag = plan
-        .manifest
-        .clang
-        .std
-        .as_deref()
-        .unwrap_or_else(|| plan.clang.default_std());
-    flags.push(format!("-std={std_flag}"));
-
-    flags.extend(profile.cflags());
-    flags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
-
-    flags.push("-fvisibility=hidden".to_string());
-    flags.push("-DCUST_TEST_BUILD=1".to_string());
-
-    flags.push("-include".to_string());
-    flags.push(prelude.display().to_string());
-
-    flags.push("-c".to_string());
-    flags.push("-o".to_string());
-    flags.push(object.display().to_string());
-    flags.push(source.display().to_string());
-
-    flags
-}
-
-/// Codegen-phase compile of every module in `modules`. Does NOT
-/// emit fragment headers: V40D-5 makes fragment emission
-/// phase-1-only, and the dedicated `surface_pass` (run before
-/// this) takes that job. `extra_includes` is prepended to clang's
-/// `-I` set so per-half concerns (e.g. bin → lib include dir)
-/// propagate. `is_bin_half` controls intra-crate self-import
-/// semantics: when `true`, `#cust use <own-package-name>;` is
-/// accepted as Cargo-style "bin reaches its own lib" and lowered
-/// to the crate's own lib include (Slice C, V31D-1 follow-up).
-#[allow(clippy::too_many_arguments)] // tightly coupled to compile_one_module's surface
-fn compile_tree(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    prelude: &Path,
-    crate_build_dir: &Path,
-    layout: &TargetLayout,
-    modules: &[Module],
-    extra_includes: &[&Path],
-    is_bin_half: bool,
-    compile_entries: &mut Vec<CompileEntry>,
-) -> Result<Vec<PathBuf>> {
-    let mut objects: Vec<PathBuf> = Vec::with_capacity(modules.len());
-
-    for m in modules {
-        let (rewritten_path, object_path, cflags) = compile_one_module(
-            plan,
-            profile,
-            prelude,
-            crate_build_dir,
-            layout,
-            extra_includes,
-            is_bin_half,
-            m,
-        )?;
-        objects.push(object_path);
-
-        compile_entries.push(CompileEntry {
-            directory: plan.crate_root.to_path_buf(),
-            file: rewritten_path.clone(),
-            arguments: argv_with_clang(plan, &cflags),
-        });
-
-        let original_args = swap_source_arg(
-            &argv_with_clang(plan, &cflags),
-            &rewritten_path,
-            &m.source_path,
-        );
-        compile_entries.push(CompileEntry {
-            directory: plan.crate_root.to_path_buf(),
-            file: m.source_path.clone(),
-            arguments: original_args,
-        });
-    }
-
-    Ok(objects)
-}
-
-#[allow(clippy::too_many_arguments)] // tightly coupled to the per-TU pipeline; passing a struct would just move the same fields
-fn compile_one_module(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    prelude: &Path,
-    crate_build_dir: &Path,
-    layout: &TargetLayout,
-    extra_includes: &[&Path],
-    is_bin_half: bool,
-    m: &Module,
-) -> Result<(PathBuf, PathBuf, Vec<String>)> {
-    // Read + scan + rewrite. We always rewrite (even when the
-    // scanner finds zero directives) so the build pipeline has
-    // exactly one code path for "the bytes clang sees".
-    let src_text = fs::read_to_string(&m.source_path)
-        .with_context(|| format!("reading `{}`", m.source_path.display()))?;
-    let scan = mod_scanner::scan(&src_text, &m.source_path)?;
-
-    // For `#cust use crate::X;` directives, lower to an `#include`
-    // of X's fragment header so the compiler sees the imported
-    // module's [[cust::pub]] surface. The surface pass (when run)
-    // has already populated the fragments dir.
-    //
-    // For `#cust use <dep>;` directives (V3D-6, v0.3), lower to
-    // an `#include` of the dep's public crate header. The dep is
-    // looked up by name against `plan.deps`; an unknown name is
-    // a hard error pointing the user at [dependencies].
-    //
-    // v0.3.1 (Cargo parity): in the bin half of a lib+bin crate,
-    // `#cust use <own-package-name>;` is also accepted and lowers
-    // to the crate's own concatenated lib header. This is the
-    // analogue of Rust's `use my_crate::*;` in src/main.rs.
-    let crate_name = plan.manifest.package_name();
-    let own_lib_header = layout.crate_header_path(crate_name);
-    let rewritten = mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| {
-        match &d.kind {
-            crate::mod_scanner::DirectiveKind::UseCrate { name } => {
-                let frag = layout.fragment_path(crate_name, name);
-                Some(format!("#include \"{}\"", frag.display()))
-            }
-            crate::mod_scanner::DirectiveKind::UseDep { name } => {
-                // Bin half importing own lib: point at the local
-                // crate header directly (no dep-symlink hop —
-                // single-crate non-workspace lib+bin has no
-                // symlink farm to resolve through).
-                if is_bin_half && plan.kind.has_lib() && name == crate_name {
-                    return Some(format!("#include \"{}\"", own_lib_header.display()));
-                }
-                // External dep: validated below; substitute even
-                // when unknown so the diagnostic block below has
-                // a chance to point at line:column rather than
-                // surface a missing-header compile error.
-                let dep_header = layout
-                    .dep_dir(name)
-                    .join("include")
-                    .join(format!("{name}.h"));
-                Some(format!("#include \"{}\"", dep_header.display()))
-            }
-            crate::mod_scanner::DirectiveKind::Mod { .. } => None,
-        }
-    });
-
-    // Validate every `#cust use <name>;` resolves to either a
-    // declared dependency, or (bin half of lib+bin) the crate's
-    // own package name. We do this *after* the rewrite so the
-    // error message can include the line position, not after a
-    // confusing compile failure.
-    for d in &scan.directives {
-        if let crate::mod_scanner::DirectiveKind::UseDep { name } = &d.kind {
-            // Cargo parity carve-out: bin half may use own name.
-            if is_bin_half && plan.kind.has_lib() && name == crate_name {
-                continue;
-            }
-            if !plan.deps.iter().any(|n| n == name) {
-                bail!(
-                    "{}:{}:{}: `#cust use {name};` refers to a crate not \
-                     listed in [dependencies]; add `{name} = {{ path = \"…\" }}`",
-                    m.source_path.display(),
-                    d.span.line,
-                    d.span.column
-                );
-            }
-        }
-    }
-
-    let rewritten_path = crate_build_dir.join(format!("{}.preprocessed.c", m.qualified_name));
-    if let Some(parent) = rewritten_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
-    }
-    fs::write(&rewritten_path, &rewritten)
-        .with_context(|| format!("writing `{}`", rewritten_path.display()))?;
-
-    let object_path = crate_build_dir.join(format!("{}.o", m.qualified_name));
-
-    // Honour `#include "x.h"` from the *original* source location —
-    // the rewritten file lives in `target/`, so without -I clang
-    // resolves relative includes against `target/` rather than the
-    // user's source layout. `extra_includes` (lib+bin case: the
-    // lib's include dir) is prepended ahead of the original-dir
-    // include so `#include "<crate>.h"` from main.c hits the lib
-    // header rather than any same-named file in the source dir.
-    let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
-    let mut includes: Vec<&Path> = Vec::with_capacity(extra_includes.len() + 1);
-    includes.extend(extra_includes.iter().copied());
-    includes.push(original_dir);
-    let mut cflags = build_cflags(
-        plan,
-        profile,
-        prelude,
-        &rewritten_path,
-        &object_path,
-        &includes,
-        PluginOutputs::default(),
-    );
-
-    // In syntax-only mode (cust check), replace the trailing
-    // `-c -o <obj> <src>` (4 args, last entry of build_cflags)
-    // with `-fsyntax-only <src>` so clang validates without
-    // writing an object.
-    if plan.syntax_only {
-        let new_len = cflags.len().saturating_sub(4);
-        cflags.truncate(new_len);
-        cflags.push("-fsyntax-only".to_string());
-        cflags.push(rewritten_path.display().to_string());
-    }
-
-    let status = plan
-        .clang
-        .command()
-        .args(&cflags)
-        .stdin(Stdio::null())
-        .status()
-        .with_context(|| {
-            format!(
-                "invoking `{}` for module `{}`",
-                plan.clang.path.display(),
-                m.qualified_name
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "clang exited with status {status} compiling module `{}`",
-            m.qualified_name
-        );
-    }
-
-    Ok((rewritten_path, object_path, cflags))
+    Ok(Some(layout.test_executable_path(crate_name)))
 }
 
 /// Surface-extraction pass: compile every module with
@@ -1275,33 +696,6 @@ pub fn build_cflags(
     flags
 }
 
-fn argv_with_clang(plan: &BuildPlan<'_>, flags: &[String]) -> Vec<String> {
-    let mut argv = Vec::with_capacity(flags.len() + 1);
-    argv.push(plan.clang.path.display().to_string());
-    argv.extend(flags.iter().cloned());
-    argv
-}
-
-/// Return a copy of `argv` with any occurrence of `old` (as a full
-/// argument string) replaced by `new`. Used to derive the
-/// editor-facing `compile_commands` entry: same flags as the real
-/// compile, but with the source path (last positional argument,
-/// per `build_cflags`) swapped from the rewritten file to the
-/// user's original source so clangd matches the file it opened.
-fn swap_source_arg(argv: &[String], old: &Path, new: &Path) -> Vec<String> {
-    let old_s = old.display().to_string();
-    let new_s = new.display().to_string();
-    argv.iter()
-        .map(|a| {
-            if a == &old_s {
-                new_s.clone()
-            } else {
-                a.clone()
-            }
-        })
-        .collect()
-}
-
 fn materialise_prelude(dst: &Path) -> Result<()> {
     const PRELUDE: &str = include_str!("prelude.h");
     // Write only if missing or stale (content differs) — keeps the
@@ -1317,179 +711,6 @@ fn materialise_prelude(dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn archive_objects(objects: &[PathBuf], archive: &Path) -> Result<()> {
-    let ar = pick_ar();
-    // `rcs` = create archive, replace, add index. We pass all
-    // objects in one invocation so the archive is built atomically.
-    // Pre-remove any stale archive so `rcs` doesn't merge with
-    // leftover entries from a previous build with more modules.
-    let _ = fs::remove_file(archive);
-
-    let mut cmd = Command::new(&ar);
-    cmd.arg("rcs").arg(archive);
-    for o in objects {
-        cmd.arg(o);
-    }
-    let status = cmd
-        .stdin(Stdio::null())
-        .status()
-        .with_context(|| format!("invoking `{}`", ar.to_string_lossy()))?;
-    if !status.success() {
-        bail!("{} exited with status {status}", ar.to_string_lossy());
-    }
-    Ok(())
-}
-
-/// Link a binary crate's executable from the bin half's objects,
-/// the lib half's own archive (when `own_archive` is `Some`), and
-/// every transitive dep archive listed in `plan.link_deps` (paths
-/// resolved through the workspace dep-view symlink farm).
-///
-/// Static archives are wrapped in `-Wl,--start-group` /
-/// `-Wl,--end-group` so the linker re-scans them as needed,
-/// sparing the v0.3.1 driver from computing strict link-time
-/// dependency order. `ThinLTO` across crates (v0.6) will revisit
-/// this once bitcode rlibs replace `.a` files.
-fn link_executable(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    objects: &[PathBuf],
-    own_archive: Option<&Path>,
-    layout: &TargetLayout,
-    exe_path: &Path,
-) -> Result<()> {
-    let mut cmd = plan.clang.command();
-
-    // Profile-driven flags (debug/opt) propagate to the link line
-    // — they're harmless for `clang` driving the link step and
-    // match what Cargo does (link with the same `-O`/`-g` flags).
-    for f in profile.cflags() {
-        cmd.arg(f);
-    }
-    // User extra ldflags. cflags are intentionally NOT forwarded
-    // here — they're compile-only.
-    for f in &plan.manifest.clang.extra_ldflags {
-        cmd.arg(f);
-    }
-
-    cmd.arg("-o").arg(exe_path);
-
-    for o in objects {
-        cmd.arg(o);
-    }
-
-    // Group own archive + dep archives so the linker can re-scan.
-    let dep_archives: Vec<PathBuf> = plan
-        .link_deps
-        .iter()
-        .map(|dep| layout.dep_dir(dep).join(format!("lib{dep}.a")))
-        .collect();
-
-    let has_archives = own_archive.is_some() || !dep_archives.is_empty();
-    if has_archives {
-        cmd.arg("-Wl,--start-group");
-        if let Some(a) = own_archive {
-            cmd.arg(a);
-        }
-        for a in &dep_archives {
-            cmd.arg(a);
-        }
-        cmd.arg("-Wl,--end-group");
-    }
-
-    let status = cmd.stdin(Stdio::null()).status().with_context(|| {
-        format!(
-            "invoking `{}` to link `{}`",
-            plan.clang.path.display(),
-            exe_path.display()
-        )
-    })?;
-    if !status.success() {
-        bail!(
-            "clang link exited with status {status} for `{}`",
-            exe_path.display()
-        );
-    }
-    Ok(())
-}
-
-fn pick_ar() -> OsString {
-    // Prefer llvm-ar if it's on PATH. We probe by trying `--version`
-    // — cheap and avoids carrying a `which` dep.
-    let llvm_ar_ok = Command::new("llvm-ar")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if llvm_ar_ok {
-        OsString::from("llvm-ar")
-    } else {
-        OsString::from("ar")
-    }
-}
-
-fn write_compile_commands(path: &Path, entries: &[CompileEntry]) -> Result<()> {
-    // Minimal JSON serialiser tailored to compile_commands.json —
-    // avoids pulling in serde_json just to emit an array of
-    // {directory, file, arguments} objects. Escapes per RFC 8259 §7.
-    let mut out = String::from("[\n");
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push_str(",\n");
-        }
-        out.push_str("  {\n");
-        push_json_kv(&mut out, "directory", &e.directory.display().to_string());
-        out.push_str(",\n");
-        push_json_kv(&mut out, "file", &e.file.display().to_string());
-        out.push_str(",\n    \"arguments\": [");
-        for (j, a) in e.arguments.iter().enumerate() {
-            if j > 0 {
-                out.push_str(", ");
-            }
-            out.push('"');
-            out.push_str(&escape_json(a));
-            out.push('"');
-        }
-        out.push_str("]\n  }");
-    }
-    out.push_str("\n]\n");
-
-    fs::write(path, out).with_context(|| format!("writing `{}`", path.display()))?;
-    Ok(())
-}
-
-fn push_json_kv(buf: &mut String, key: &str, value: &str) {
-    buf.push_str("    \"");
-    buf.push_str(key);
-    buf.push_str("\": \"");
-    buf.push_str(&escape_json(value));
-    buf.push('"');
-}
-
-fn escape_json(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Write `target/.cust-version` containing the cust + clang
-/// version strings. Used by `cust clean` (and external tooling)
-/// to detect when the cached build was produced by a different
 /// toolchain. Idempotent — overwrites unconditionally.
 pub fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
     let contents = format!(
@@ -1677,17 +898,6 @@ fn strip_fragment_header_comment(body: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_json;
-
-    #[test]
-    fn escapes_quotes_backslashes_controls() {
-        assert_eq!(escape_json("hi"), "hi");
-        assert_eq!(escape_json("a\"b"), "a\\\"b");
-        assert_eq!(escape_json("a\\b"), "a\\\\b");
-        assert_eq!(escape_json("a\nb"), "a\\nb");
-        assert_eq!(escape_json("\u{0007}"), "\\u0007");
-    }
-
     #[test]
     fn header_guard_basic() {
         use super::header_guard;
