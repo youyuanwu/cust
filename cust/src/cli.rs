@@ -62,6 +62,15 @@ pub struct BuildArgs {
     /// member is built.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
+    /// Maximum number of parallel build jobs (v0.4.2 V42D-13 +
+    /// roadmap v0.4.3). Lowered to `cmake --build -j <N>` so
+    /// Ninja owns intra-crate and inter-crate parallelism in
+    /// one scheduler. When omitted, Ninja picks (defaults to
+    /// `nproc`). Falls back to `$CUST_JOBS` or
+    /// `$CARGO_BUILD_JOBS` (Cargo parity) when neither flag
+    /// nor env is set.
+    #[arg(short = 'j', long = "jobs")]
+    pub jobs: Option<u32>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -78,10 +87,11 @@ pub struct CheckArgs {
 
 /// Arguments for `cust run`.
 ///
-/// `cust run [-p <member>] [--release] [-- <args>...]` — builds
-/// the workspace, picks a runnable bin member (the only bin if
-/// `-p` is omitted; the named member otherwise), then spawns
-/// the resulting executable with everything after `--` as argv.
+/// `cust run [-p <member>] [--release] [-j <N>] [-- <args>...]`
+/// — builds the workspace, picks a runnable bin member (the
+/// only bin if `-p` is omitted; the named member otherwise),
+/// then spawns the resulting executable with everything after
+/// `--` as argv.
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
     /// Build (and run) with the `release` profile.
@@ -91,6 +101,9 @@ pub struct RunArgs {
     /// than one bin member exists.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
+    /// Build parallelism. See `cust build --jobs`.
+    #[arg(short = 'j', long = "jobs")]
+    pub jobs: Option<u32>,
     /// Arguments forwarded to the spawned binary. Anything after
     /// `--` lands here.
     #[arg(last = true, allow_hyphen_values = true)]
@@ -115,6 +128,9 @@ pub struct TestArgs {
     /// members named here are rejected with the V32D-11 error.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
+    /// Build parallelism. See `cust build --jobs`.
+    #[arg(short = 'j', long = "jobs")]
+    pub jobs: Option<u32>,
     /// Substring filter forwarded to the runner. Matches against
     /// the runner's `module::name` qualified name (V32D-9).
     pub filter: Option<String>,
@@ -150,6 +166,7 @@ impl Cli {
             Cmd::Build(args) => run_build(
                 profile_kind(args.release),
                 args.package.as_deref(),
+                resolve_jobs(args.jobs)?,
                 no_plugin,
             ),
             Cmd::Check(args) => run_check(
@@ -160,12 +177,14 @@ impl Cli {
             Cmd::Run(args) => run_run(
                 profile_kind(args.release),
                 args.package.as_deref(),
+                resolve_jobs(args.jobs)?,
                 &args.forwarded,
                 no_plugin,
             ),
             Cmd::Test(args) => run_test(
                 profile_kind(args.release),
                 args.package.as_deref(),
+                resolve_jobs(args.jobs)?,
                 args.filter.as_deref(),
                 &args.forwarded,
                 no_plugin,
@@ -182,6 +201,40 @@ const fn profile_kind(release: bool) -> ProfileKind {
     } else {
         ProfileKind::Dev
     }
+}
+
+/// V42D-13 / v0.4.3-roadmap `--jobs` resolution.
+///
+/// Precedence (matches Cargo's `--jobs` story):
+/// 1. Explicit `--jobs N` on the command line.
+/// 2. `$CUST_JOBS` (cust-native name).
+/// 3. `$CARGO_BUILD_JOBS` (Cargo parity — lets users keep one
+///    env var across both ecosystems).
+/// 4. Nothing — Ninja picks (`nproc`).
+///
+/// Errors on a non-positive integer or a non-numeric value in
+/// either env var so the user gets a clear diagnostic instead of
+/// silent fall-through. `--jobs 0` is rejected.
+fn resolve_jobs(cli: Option<u32>) -> Result<Option<u32>> {
+    if let Some(n) = cli {
+        if n == 0 {
+            anyhow::bail!("`--jobs 0` is not allowed (use `--jobs 1` for serial)");
+        }
+        return Ok(Some(n));
+    }
+    for env_var in ["CUST_JOBS", "CARGO_BUILD_JOBS"] {
+        if let Some(raw) = env::var_os(env_var) {
+            let s = raw.to_string_lossy();
+            let parsed: u32 = s
+                .parse()
+                .with_context(|| format!("parsing ${env_var}={s:?} as a positive integer"))?;
+            if parsed == 0 {
+                anyhow::bail!("${env_var}=0 is not allowed (use 1 for serial)");
+            }
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
 }
 
 /// Locate the workspace by walking up from cwd. Returns a fully
@@ -252,7 +305,12 @@ fn resolve_plugin(no_plugin: bool, subcommand: &str) -> Result<Option<crate::plu
     Ok(plugin)
 }
 
-fn run_build(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) -> Result<()> {
+fn run_build(
+    profile_kind: ProfileKind,
+    package: Option<&str>,
+    jobs: Option<u32>,
+    no_plugin: bool,
+) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
@@ -265,6 +323,7 @@ fn run_build(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
         syntax_only: false,
         test_build: false,
         only: package,
+        jobs,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 
@@ -298,6 +357,9 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
         syntax_only: true,
         test_build: false,
         only: package,
+        // V42D-15: `cust check` bypasses CMake entirely — the
+        // jobs field has no consumer here.
+        jobs: None,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
     for (name, _) in &outputs.per_member {
@@ -314,6 +376,7 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
 fn run_run(
     profile_kind: ProfileKind,
     package: Option<&str>,
+    jobs: Option<u32>,
     forwarded: &[String],
     no_plugin: bool,
 ) -> Result<()> {
@@ -374,6 +437,7 @@ fn run_run(
         syntax_only: false,
         test_build: false,
         only: Some(&target_name),
+        jobs,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 
@@ -446,6 +510,7 @@ fn run_run(
 fn run_test(
     profile_kind: ProfileKind,
     package: Option<&str>,
+    jobs: Option<u32>,
     filter: Option<&str>,
     forwarded: &[String],
     no_plugin: bool,
@@ -484,6 +549,7 @@ fn run_test(
         syntax_only: false,
         test_build: true,
         only: package,
+        jobs,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 

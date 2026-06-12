@@ -569,6 +569,11 @@ pub struct WorkspaceBuildOptions<'a> {
     /// `None` builds every member. Used by `cust build -p <member>`
     /// (Slice E).
     pub only: Option<&'a str>,
+    /// V42D-13 / v0.4.3 roadmap: maximum parallel build jobs.
+    /// Lowered to `cmake --build -j <N>`. `None` lets `Ninja`
+    /// pick (`nproc`). Ignored in `syntax_only` mode — the
+    /// surface pass is already cheap and bypasses `CMake`.
+    pub jobs: Option<u32>,
 }
 
 /// One member's build outputs, indexed for callers that want to
@@ -675,7 +680,7 @@ pub fn build_workspace(
         opts.plugin,
         &crate::cmake_emit::DriveOptions {
             only: opts.only,
-            jobs: None, // slice D wires -jN / CUST_JOBS
+            jobs: opts.jobs,
             test_build: false,
         },
     )
@@ -786,7 +791,7 @@ fn run_test_build_path(
         opts.plugin,
         &crate::cmake_emit::DriveOptions {
             only: opts.only,
-            jobs: None,
+            jobs: opts.jobs,
             test_build: true,
         },
     )

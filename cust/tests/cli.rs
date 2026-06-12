@@ -1097,6 +1097,53 @@ fn build_p_unknown_member_is_error() {
 }
 
 #[test]
+fn build_rejects_jobs_zero() {
+    // v0.4.2 slice D: `--jobs 0` is a usage error; `0` would lower
+    // to `cmake --build -j 0` which Ninja interprets as "no
+    // limit" via a footgun. Reject up front with a clear hint.
+    let (_tmp, dir) = stage("hello");
+    let out = cust(&dir, ["build", "-j", "0"]);
+    assert_failure_with(&out, "`--jobs 0` is not allowed");
+}
+
+#[test]
+fn build_with_jobs_succeeds() {
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    // Both forms of the flag work and produce a working artefact.
+    let (_tmp, dir) = stage("hello");
+    assert_success(&cust(&dir, ["build", "-j", "1"]));
+    assert!(dir.join("target/debug/build/hello/libhello.a").is_file());
+    assert_success(&cust(&dir, ["build", "--jobs", "2"]));
+}
+
+#[test]
+fn cust_jobs_env_var_is_consumed() {
+    // v0.4.2 slice D: `$CUST_JOBS` is the env fallback when the
+    // flag isn't passed; `$CARGO_BUILD_JOBS` is the secondary
+    // (Cargo parity). Garbage values produce a clear error.
+    let (_tmp, dir) = stage("hello");
+    let mut cmd = std::process::Command::new(CUST_BIN);
+    cmd.current_dir(&dir);
+    cmd.env("CUST_JOBS", "garbage");
+    cmd.arg("build");
+    let out = cmd.output().expect("spawn cust");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "expected failure; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("parsing $CUST_JOBS"),
+        "stderr did not mention CUST_JOBS:\n{stderr}"
+    );
+}
+
+#[test]
 fn check_p_filters_to_member_and_transitive_deps() {
     if plugin_path().is_none() {
         eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
