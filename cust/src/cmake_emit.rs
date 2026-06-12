@@ -148,22 +148,21 @@ pub struct MemberView {
     /// disk file is `<name>` either way — only the in-`CMake`
     /// target identifier differs.
     pub bin_target_name: String,
-    /// V42D-14 test executable. `Some` only when the driver is
-    /// running in test-build mode AND the member has a lib half
-    /// (V32D-11 — `cust test` only tests library crates;
-    /// lib+bin members test their library half only). The
-    /// emitter wraps each test target in `if(CUST_TEST_BUILD)`
-    /// so the workspace `CMakeLists` is identical for `cust
-    /// build` vs `cust test` (V42D-8 stamp doesn't churn when
-    /// switching modes); the driver flips behaviour by passing
-    /// `-DCUST_TEST_BUILD=ON` on the configure line for `cust
-    /// test`.
+    /// V42D-14 test executable. `Some` whenever the member has
+    /// a lib half (V32D-11 — `cust test` only tests library
+    /// crates; lib+bin members test their library half only).
+    /// The emitter marks each test target `EXCLUDE_FROM_ALL`
+    /// so `cust build` skips it; `cust test` reaches it via
+    /// `cmake --build --target <crate>__test`. Same `CMakeLists`
+    /// bytes either way — the V42D-8 stamp doesn't churn when
+    /// flipping modes, so neither does the configure step.
     pub test_target: Option<TestTargetView>,
 }
 
 /// V42D-14 per-member test executable description. Lowered to a
-/// `add_executable(<crate>__test ...)` target wrapped in
-/// `if(CUST_TEST_BUILD)`.
+/// `add_executable(<crate>__test EXCLUDE_FROM_ALL ...)` target.
+/// `EXCLUDE_FROM_ALL` keeps it out of the default `cmake --build`
+/// graph; `cust test` reaches it explicitly via `--target`.
 #[derive(Debug, Clone)]
 pub struct TestTargetView {
     /// `CMake` target name. Always `<member>__test` (V42D-14).
@@ -345,73 +344,52 @@ fn emit_executable(out: &mut String, m: &MemberView) {
 }
 
 /// V42D-14: emit one test target per member that has tests,
-/// wrapped in `if(CUST_TEST_BUILD)`. The driver passes
-/// `-DCUST_TEST_BUILD=ON` on the configure line for `cust test`
-/// so the gate flips without churning the stamp (V42D-8).
+/// marked `EXCLUDE_FROM_ALL` so `cmake --build` (the `cust
+/// build` path) skips it. `cust test` reaches the target
+/// explicitly via `cmake --build --target <crate>__test`. The
+/// target is emitted unconditionally — same `CMakeLists` bytes
+/// regardless of build vs test mode — so flipping modes doesn't
+/// churn the V42D-8 stamp and never triggers a reconfigure.
 fn emit_test_executable(out: &mut String, m: &MemberView, t: &TestTargetView) {
     out.push('\n');
     let _ = writeln!(out, "# ---- crate: {} (test) ----", m.name);
-    out.push_str("if(CUST_TEST_BUILD)\n");
-    let _ = writeln!(out, "    add_executable({}", t.target_name);
+    let _ = writeln!(out, "add_executable({} EXCLUDE_FROM_ALL", t.target_name);
     for src in &t.sources {
-        let _ = writeln!(out, "        \"{}\"", src.path.display());
+        let _ = writeln!(out, "    \"{}\"", src.path.display());
     }
-    out.push_str("    )\n");
+    out.push_str(")\n");
+    let _ = writeln!(out, "set_target_properties({} PROPERTIES", t.target_name);
     let _ = writeln!(
         out,
-        "    set_target_properties({} PROPERTIES",
-        t.target_name
-    );
-    let _ = writeln!(
-        out,
-        "        RUNTIME_OUTPUT_DIRECTORY \"{}\"",
+        "    RUNTIME_OUTPUT_DIRECTORY \"{}\"",
         t.runtime_output_dir.display(),
     );
-    let _ = writeln!(out, "        OUTPUT_NAME {}", m.name);
-    out.push_str("    )\n");
+    let _ = writeln!(out, "    OUTPUT_NAME {}", m.name);
+    out.push_str(")\n");
     // OBJECT_DEPENDS for the test target's sources (V42D-6).
     // Test TUs re-import the same fragment headers the lib TUs do.
-    for src in &t.sources {
-        if src.object_depends.is_empty() {
-            continue;
-        }
-        out.push_str("    set_source_files_properties(\n");
-        let _ = writeln!(out, "        \"{}\"", src.path.display());
-        out.push_str("        PROPERTIES OBJECT_DEPENDS\n        \"");
-        for (i, dep) in src.object_depends.iter().enumerate() {
-            if i > 0 {
-                out.push(';');
-            }
-            let _ = write!(out, "{}", dep.display());
-        }
-        out.push_str("\"\n    )\n");
-    }
+    emit_object_depends(out, &t.sources);
     if !t.include_dirs.is_empty() {
-        let _ = writeln!(
-            out,
-            "    target_include_directories({} PRIVATE",
-            t.target_name
-        );
+        let _ = writeln!(out, "target_include_directories({} PRIVATE", t.target_name);
         for dir in &t.include_dirs {
-            let _ = writeln!(out, "        \"{}\"", dir.display());
+            let _ = writeln!(out, "    \"{}\"", dir.display());
         }
-        out.push_str("    )\n");
+        out.push_str(")\n");
     }
     if !t.link_deps.is_empty() {
-        let _ = writeln!(out, "    target_link_libraries({} PRIVATE", t.target_name);
+        let _ = writeln!(out, "target_link_libraries({} PRIVATE", t.target_name);
         for dep in &t.link_deps {
-            let _ = writeln!(out, "        {dep}");
+            let _ = writeln!(out, "    {dep}");
         }
-        out.push_str("    )\n");
+        out.push_str(")\n");
     }
     if !t.compile_options.is_empty() {
-        let _ = writeln!(out, "    target_compile_options({} PRIVATE", t.target_name);
+        let _ = writeln!(out, "target_compile_options({} PRIVATE", t.target_name);
         for opt in &t.compile_options {
-            let _ = writeln!(out, "        \"{opt}\"");
+            let _ = writeln!(out, "    \"{opt}\"");
         }
-        out.push_str("    )\n");
+        out.push_str(")\n");
     }
-    out.push_str("endif()\n");
 }
 
 /// Emit `target_compile_options(<target> PRIVATE …)` with one
@@ -769,19 +747,18 @@ use crate::{
 /// time, not at emit time). This keeps the stamp stable across
 /// `-p` variations.
 ///
-/// When `test_build` is `true`, each member with a lib half also
-/// gets a populated `test_target` (V42D-14). The emitted test
-/// block is always wrapped in `if(CUST_TEST_BUILD)` so the same
-/// `CMakeLists` serves both modes — only the configure-line
-/// `-DCUST_TEST_BUILD=ON` flag flips the behaviour. We pin
-/// `test_build = true` whenever the driver knows tests will be
-/// built so the V42D-8 stamp matches the configure mode; the
-/// emitter is permissive (`false` simply omits the block).
+/// When the member has a lib half, the view always also carries
+/// a populated `test_target` (V42D-14). The emitter marks the
+/// test target `EXCLUDE_FROM_ALL` so the same `CMakeLists`
+/// serves both `cust build` and `cust test` — only the
+/// `cmake --build --target` selection on the build step
+/// differs. The V42D-8 stamp is therefore stable across mode
+/// flips, and `CMake` doesn't reconfigure when toggling between
+/// build and test in the same workspace.
 pub fn collect_view(
     ws: &Workspace,
     profile_kind: ProfileKind,
     plugin: Option<&Plugin>,
-    test_build: bool,
 ) -> Result<WorkspaceView> {
     let layout = TargetLayout::for_workspace(&ws.root, profile_kind);
     let rewrite_root = layout.profile_root.join(".rewrite");
@@ -849,9 +826,12 @@ pub fn collect_view(
         let compile_options =
             build_member_compile_options(&profile, &m.manifest, &prelude_path, plugin);
 
-        // V42D-14 test target (only when the driver is building
-        // tests AND the member has a lib half).
-        let test_target = if test_build && kind.has_lib() {
+        // V42D-14 test target (whenever the member has a lib
+        // half). Always populated so the emitted CMakeLists is
+        // identical between `cust build` and `cust test`;
+        // `EXCLUDE_FROM_ALL` on the target keeps it out of the
+        // default build graph.
+        let test_target = if kind.has_lib() {
             // Lib-half sources (same as the lib target) plus the
             // driver-generated runner TU. The runner path is the
             // contract V42D-14 pins: cmake_dir/cust_test_main_<crate>.c.
@@ -1023,7 +1003,7 @@ pub fn emit_workspace_cmakelists(
     profile_kind: ProfileKind,
     plugin: Option<&Plugin>,
 ) -> Result<WriteOutcome> {
-    let view = collect_view(ws, profile_kind, plugin, false)?;
+    let view = collect_view(ws, profile_kind, plugin)?;
     let bytes = generate(&view).into_bytes();
     let layout = TargetLayout::for_workspace(&ws.root, profile_kind);
     let cmake_dir = layout.profile_root.join("cmake");
@@ -1047,12 +1027,12 @@ pub struct DriveOptions<'a> {
     /// defaults to `nproc`). Slice D will plumb `--jobs` / env
     /// vars through here.
     pub jobs: Option<u32>,
-    /// V42D-14: when `true`, the configure step passes
-    /// `-DCUST_TEST_BUILD=ON` and the build step picks the
-    /// `<member>__test` targets instead of the lib + bin ones.
-    /// The emitted `CMakeLists` is identical either way —
-    /// `if(CUST_TEST_BUILD)` is the only gate — so flipping
-    /// modes does NOT churn the V42D-8 stamp.
+    /// V42D-14: when `true`, the build step picks the
+    /// `<member>__test` targets instead of the default lib +
+    /// bin ones (which are `EXCLUDE_FROM_ALL` for test targets).
+    /// The emitted `CMakeLists` is identical either way, so
+    /// flipping modes neither churns the V42D-8 stamp nor
+    /// triggers a `CMake` reconfigure.
     pub test_build: bool,
 }
 
@@ -1094,21 +1074,30 @@ pub fn emit_and_drive_cmake(
     let cmakelists = cmake_dir.join("CMakeLists.txt");
     let stamp = cmake_dir.join("stamp").join("cmakelists.sha256");
 
-    let view = collect_view(ws, profile_kind, plugin, opts.test_build)?;
+    let view = collect_view(ws, profile_kind, plugin)?;
     let bytes = generate(&view).into_bytes();
     let outcome = write_if_changed(&cmakelists, &bytes, &stamp, view.plugin_path.as_deref())?;
 
+    // V42D-14: ensure every member's `cust_test_main_<crate>.c`
+    // runner TU exists on disk before configure. CMake validates
+    // every `add_executable` source path at configure time even
+    // when the target is `EXCLUDE_FROM_ALL`, so a missing runner
+    // TU during `cust build` would fail configure. The build
+    // path doesn't need real runner content (the target is
+    // never built); a tiny stub is enough. `cust test` calls
+    // `build::write_test_runner_tu` to overwrite the stub with
+    // the real concatenation before reaching the build step.
+    ensure_runner_tu_stubs(&view, &cmake_dir)?;
+
     // Configure if the CMakeLists was just written OR there's no
     // existing CMake cache to reuse. Either condition forces a
-    // fresh `cmake -G Ninja` run. Test-mode toggling between
-    // `cust build` and `cust test` also forces reconfigure
-    // because `-DCUST_TEST_BUILD=ON/OFF` flips a CMake cache
-    // variable; we detect that by comparing the current cache's
-    // value against the requested one (cheap, no stamp file).
-    let mode_changed = test_mode_changed(&build_dir, opts.test_build);
-    let must_configure = outcome == WriteOutcome::Wrote
-        || !build_dir.join("CMakeCache.txt").is_file()
-        || mode_changed;
+    // fresh `cmake -G Ninja` run. Mode flips between `cust
+    // build` and `cust test` are NOT a reason to reconfigure:
+    // the same CMakeLists drives both — test targets are
+    // `EXCLUDE_FROM_ALL` and selected per-invocation via
+    // `cmake --build --target` below.
+    let must_configure =
+        outcome == WriteOutcome::Wrote || !build_dir.join("CMakeCache.txt").is_file();
     if must_configure {
         fs::create_dir_all(&build_dir)
             .with_context(|| format!("creating `{}`", build_dir.display()))?;
@@ -1125,14 +1114,6 @@ pub fn emit_and_drive_cmake(
         // CMake records it in CMakeCache.txt and uses it for
         // every subsequent `cmake --build`.
         cmd.arg(format!("-DCMAKE_C_COMPILER={}", clang.path.display()));
-        // V42D-14: surface the test gate as a CMake cache
-        // variable so `if(CUST_TEST_BUILD)` picks it up.
-        // OFF (the default) compiles only lib + bin; ON adds
-        // the per-member `<crate>__test` exe targets.
-        cmd.arg(format!(
-            "-DCUST_TEST_BUILD={}",
-            if opts.test_build { "ON" } else { "OFF" }
-        ));
         run_streaming(cmd, "cmake configure")?;
     }
 
@@ -1166,32 +1147,6 @@ pub fn emit_and_drive_cmake(
     Ok(())
 }
 
-/// True if the CMakeCache.txt at `build_dir` records a different
-/// `CUST_TEST_BUILD` value than `want`. Missing cache or unparseable
-/// line counts as "different" so a fresh tree triggers configure.
-fn test_mode_changed(build_dir: &Path, want: bool) -> bool {
-    let cache = build_dir.join("CMakeCache.txt");
-    let Ok(contents) = fs::read_to_string(&cache) else {
-        return true;
-    };
-    let want_str = if want { "ON" } else { "OFF" };
-    // Cache lines look like `CUST_TEST_BUILD:BOOL=ON` or
-    // `CUST_TEST_BUILD:UNINITIALIZED=ON`. Match the prefix and
-    // compare the value after `=`.
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("CUST_TEST_BUILD:") {
-            if let Some(eq) = rest.find('=') {
-                return rest[eq + 1..].trim() != want_str;
-            }
-        }
-    }
-    // No CUST_TEST_BUILD line in cache yet — always reconfigure
-    // when caller wants ON (so the gate flips); when caller
-    // wants OFF and the cache lacks the var, the default is OFF
-    // already, no reconfigure needed.
-    want
-}
-
 /// `CMake` target name(s) for a member, used when lowering
 /// `cust build -p <name>` to `cmake --build --target ...`.
 /// Returns `[lib]`, `[bin]`, or `[lib, bin]` for build mode;
@@ -1221,6 +1176,46 @@ fn target_names_for<'a>(
         out.push(m.bin_target_name.as_str());
     }
     out
+}
+
+/// V42D-14: ensure each member's `cust_test_main_<crate>.c`
+/// runner TU exists on disk before `CMake` configure runs.
+/// `CMake` validates every `add_executable` source path at
+/// configure time even for `EXCLUDE_FROM_ALL` targets, so a
+/// missing runner TU would fail configure during `cust build`.
+///
+/// On the test path `build::write_test_runner_tu` overwrites the
+/// stub with the real runner before reaching the build step;
+/// the stub itself is never compiled (the test target only
+/// reaches the `Ninja` graph when `cust test` selects it via
+/// `cmake --build --target <crate>__test`).
+///
+/// Idempotent + cheap: stubs are only written when the runner
+/// TU file is missing, and the stub content is small enough
+/// that any subsequent `write_if_byte_different` from the test
+/// path always replaces it.
+fn ensure_runner_tu_stubs(view: &WorkspaceView, cmake_dir: &Path) -> Result<()> {
+    const STUB: &[u8] = b"/* @generated by cust \xe2\x80\x94 build-mode stub.\n\
+ * The real runner is concatenated by `cust test`'s\n\
+ * build::write_test_runner_tu before this target is built;\n\
+ * see cust/src/test_runner.rs.\n\
+ */\n";
+    for m in &view.members {
+        let Some(t) = &m.test_target else { continue };
+        // The runner TU is the only source under `cmake_dir/`
+        // (the lib sources all live under `.rewrite/<crate>/`).
+        for src in &t.sources {
+            if src.path.starts_with(cmake_dir) && !src.path.is_file() {
+                if let Some(parent) = src.path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("creating `{}`", parent.display()))?;
+                }
+                fs::write(&src.path, STUB)
+                    .with_context(|| format!("writing runner stub `{}`", src.path.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Publish `CMake`'s `compile_commands.json` at both the canonical

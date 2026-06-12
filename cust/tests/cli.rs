@@ -421,9 +421,18 @@ fn build_multi_module_emits_one_compile_command_per_tu() {
 #[test]
 fn compile_commands_json_carries_paired_entries_for_clangd() {
     // v0.4.2: CMake-emitted compile_commands.json carries ONE
-    // entry per TU — the rewritten `.rewrite/.../src/<name>.c`
-    // file. clangd opens the user's original `src/<name>.c`
-    // and won't find a matching entry; supporting that needs a
+    // entry per TU per CMake target — the rewritten
+    // `.rewrite/.../src/<name>.c` file. Because the v0.4.2
+    // refinement makes the per-member `<crate>__test` target
+    // unconditional (EXCLUDE_FROM_ALL keeps it out of `cust
+    // build` but it still appears in compile_commands.json),
+    // each lib source shows up twice: once with the lib
+    // target's flags and once with the test target's flags
+    // (which add `-DCUST_TEST_BUILD=1`). The runner-TU stub
+    // contributes one extra entry.
+    //
+    // clangd opens the user's original `src/<name>.c` and
+    // won't find a matching entry; supporting that needs a
     // post-process step mirroring each entry with the original-
     // source path. Tracked as a v0.4.x follow-up, not a v0.4.2
     // blocker (see docs/design/v0.4.2.md V42D-12).
@@ -432,11 +441,13 @@ fn compile_commands_json_carries_paired_entries_for_clangd() {
 
     let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
     let entry_count = cc.matches("\"file\":").count();
-    // Three TUs — three CMake-emitted entries. (v0.3 had six:
-    // 3 rewritten + 3 paired-originals.)
+    // 3 lib TUs (multi_module target) + 3 lib TUs recompiled
+    // for the EXCLUDE_FROM_ALL `multi_module__test` target +
+    // 1 runner-TU stub = 7. (v0.3 had six: 3 rewritten + 3
+    // paired-originals.)
     assert_eq!(
-        entry_count, 3,
-        "expected 3 entries (one per TU); v0.4.2 dropped the clangd-paired entries:\n{cc}"
+        entry_count, 7,
+        "expected 7 entries (3 lib + 3 test-target lib + 1 runner stub); got:\n{cc}"
     );
 }
 

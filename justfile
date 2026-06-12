@@ -46,7 +46,7 @@ test-all: test test-plugin test-cwork
 # --- run / dogfood -----------------------------------------------
 
 # Build every member of the in-tree workspace.
-cwork-build: build
+build-cwork: build
     cd cwork && ../target/debug/cust build
 
 # Run the hello-cstd example.
