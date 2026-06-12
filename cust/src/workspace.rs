@@ -609,6 +609,18 @@ pub fn build_workspace(
     let layout = TargetLayout::for_workspace(&ws.root, opts.profile_kind);
     layout.ensure_dirs()?;
 
+    // v0.4.2 slice A (V42D-16 step 1): emit the workspace
+    // CMakeLists into `target/<profile>/cmake/` so the file
+    // shows up on disk and CI can inspect it. Slice A does NOT
+    // invoke `cmake` — `compile_one_module` still drives
+    // phase 2 below. Skipped in syntax-only mode (V42D-15:
+    // `cust check` bypasses CMake entirely) and in test-build
+    // mode (V42D-14's test targets land in slice C).
+    if !opts.syntax_only && !opts.test_build {
+        let _ = crate::cmake_emit::emit_workspace_cmakelists(ws, opts.profile_kind, opts.plugin)
+            .context("emitting workspace CMakeLists.txt")?;
+    }
+
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
     for name in &to_build {
         let m = ws

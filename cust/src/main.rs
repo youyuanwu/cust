@@ -10,6 +10,7 @@
 mod build;
 mod clang;
 mod cli;
+mod cmake_emit;
 mod lock;
 mod manifest;
 mod mod_scanner;

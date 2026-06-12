@@ -19,6 +19,9 @@ path = "src/main.rs"
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
+# v0.4.2 (V42D-8): configure-skip stamp hashes the generated
+# CMakeLists.txt bytes concatenated with the plugin .so bytes.
+sha2 = "0.10.9"
 toml = "1.1.2"
 
 [dev-dependencies]
