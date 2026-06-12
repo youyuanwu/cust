@@ -11,6 +11,7 @@ mod build;
 mod clang;
 mod cli;
 mod cmake_emit;
+mod diag_rewrite;
 mod lock;
 mod manifest;
 mod mod_scanner;

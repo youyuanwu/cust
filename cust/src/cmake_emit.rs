@@ -1,11 +1,11 @@
-//! `CMakeLists` emission for the v0.4.2 CMake-driven build backend
+//! `CMakeLists` emission for the v0.4.2 `CMake`-driven build backend
 //! (`docs/design/v0.4.2.md`).
 //!
 //! Slice A scope (V42D-16): this module owns three concerns and
 //! nothing else.
 //!
 //! 1. **Emitter** — pure function `generate(&WorkspaceView) ->
-//!    String`. Produces deterministic CMakeLists.txt bytes for
+//!    String`. Produces deterministic `CMakeLists`.txt bytes for
 //!    the whole workspace per V42D-13 (one file, all members) and
 //!    V42D-4 (byte-stable on no-input-change). Golden-file tested
 //!    in `cmake_emit::tests`.
@@ -56,11 +56,14 @@ pub struct WorkspaceView {
     /// per-member overrides through later.
     pub c_standard: String,
     /// Absolute path to the cust clang plugin .so, resolved by
-    /// `plugin::Plugin::discover()`. `None` is permitted in
-    /// slice A so the write-side-effect from `build_workspace`
-    /// remains a no-op when the plugin is missing (slice B will
-    /// turn this into a hard error at `build_workspace` time —
-    /// the emitter itself stays permissive).
+    /// `plugin::Plugin::discover()`. `None` is permitted so the
+    /// emitter stays usable in test environments without a real
+    /// plugin; slice B's `emit_and_drive_cmake` rejects it before
+    /// invoking `cmake`. The path itself is no longer emitted by
+    /// `generate` directly (each member bakes the plugin flag into
+    /// its own `compile_options`); the field stays on
+    /// `WorkspaceView` because it still feeds the configure-skip
+    /// stamp (V42D-8 + RQ-V42-1: plugin bytes hash into the stamp).
     pub plugin_path: Option<PathBuf>,
     /// Members in topological (build) order: dependencies before
     /// consumers. V42D-4 + same rule the existing
@@ -78,7 +81,7 @@ pub struct MemberView {
     pub name: String,
     /// What the member produces. `LibOnly` / `BinOnly` /
     /// `LibAndBin`. Mirrors `manifest::CrateKind` but stays
-    /// CrateKind-free at the emitter boundary so tests don't
+    /// `CrateKind`-free at the emitter boundary so tests don't
     /// have to construct a full `Manifest`.
     pub kind: MemberKind,
     /// Lib-half sources in topological order over `#cust use
@@ -109,6 +112,42 @@ pub struct MemberView {
     /// `target_link_libraries(<bin> PRIVATE <dep>)` per V42D-13.
     /// Empty for lib-only members.
     pub workspace_link_deps: Vec<String>,
+    /// Names of other workspace members this member's *library*
+    /// half depends on, in topological order. Lowered to
+    /// `target_link_libraries(<lib> PUBLIC <dep>)` so `CMake`'s
+    /// `--target <lib>` walker pulls each dep into the build
+    /// (`cust build -p <lib-member>` parity with Cargo). PUBLIC
+    /// also propagates the link to downstream consumers, so an
+    /// exe linking against `<lib>` transparently picks up the
+    /// dep chain. Empty for bin-only members.
+    pub lib_workspace_deps: Vec<String>,
+    /// Per-target compile options applied to every TU of the
+    /// member's library and executable targets via
+    /// `target_compile_options(<t> PRIVATE …)`. Built by the
+    /// caller from: profile cflags (opt-level, debug info,
+    /// sanitisers), `[clang] extra-cflags` from the manifest,
+    /// `-fvisibility=hidden`, `-include <prelude>`, and (when a
+    /// plugin is present) `SHELL:-fplugin=<abs>` +
+    /// `-Wno-unknown-attributes`. The emitter passes them
+    /// through verbatim — each entry becomes one literal `CMake`
+    /// list element. Wrap shell-significant entries (e.g. the
+    /// plugin `-fplugin=…` arg) in a `SHELL:` prefix at the
+    /// caller to bypass `CMake`'s de-dup / re-order pass.
+    pub compile_options: Vec<String>,
+    /// Absolute path the bin executable is placed in via
+    /// `RUNTIME_OUTPUT_DIRECTORY`. Cargo-parity layout: bins
+    /// land at `target/<profile>/<crate>/` so `cust run` finds
+    /// them at the v0.3+ location. Ignored for lib-only members.
+    pub runtime_output_dir: PathBuf,
+    /// `CMake` target name for the bin half. For pure-bin members
+    /// this equals `name`; for lib+bin it's suffixed `-bin` to
+    /// avoid the `add_executable cannot create target "<name>"
+    /// because another target with the same name already exists`
+    /// error (`CMake` target names are workspace-unique). The bin's
+    /// `OUTPUT_NAME` still emits the unsuffixed `name` so the on-
+    /// disk file is `<name>` either way — only the in-`CMake`
+    /// target identifier differs.
+    pub bin_target_name: String,
 }
 
 /// Mirror of `manifest::CrateKind`, exposed at the emitter
@@ -186,14 +225,6 @@ pub fn generate(view: &WorkspaceView) -> String {
         }
     }
 
-    // Shared compile options foreach (V42D-5). Skipped entirely
-    // when no plugin was discovered — slice A keeps the
-    // emitter permissive; slice B will reject `plugin_path =
-    // None` at `build_workspace` time.
-    if let Some(plugin) = view.plugin_path.as_deref() {
-        emit_shared_compile_options(&mut out, view, plugin);
-    }
-
     out
 }
 
@@ -214,31 +245,75 @@ fn emit_library(out: &mut String, m: &MemberView) {
     let _ = writeln!(out, "    OUTPUT_NAME {}", m.name);
     out.push_str(")\n");
     emit_object_depends(out, &m.lib_sources);
+    if !m.lib_workspace_deps.is_empty() {
+        let _ = writeln!(out, "target_link_libraries({} PUBLIC", m.name);
+        for dep in &m.lib_workspace_deps {
+            let _ = writeln!(out, "    {dep}");
+        }
+        out.push_str(")\n");
+    }
+    emit_compile_options(out, &m.name, &m.compile_options);
 }
 
 fn emit_executable(out: &mut String, m: &MemberView) {
     out.push('\n');
     let _ = writeln!(out, "# ---- crate: {} (binary) ----", m.name);
-    let _ = writeln!(out, "add_executable({}", m.name);
+    let _ = writeln!(out, "add_executable({}", m.bin_target_name);
     for src in &m.bin_sources {
         let _ = writeln!(out, "    \"{}\"", src.path.display());
     }
     out.push_str(")\n");
+    let _ = writeln!(
+        out,
+        "set_target_properties({} PROPERTIES",
+        m.bin_target_name
+    );
+    let _ = writeln!(
+        out,
+        "    RUNTIME_OUTPUT_DIRECTORY \"{}\"",
+        m.runtime_output_dir.display(),
+    );
+    let _ = writeln!(out, "    OUTPUT_NAME {}", m.name);
+    out.push_str(")\n");
     emit_object_depends(out, &m.bin_sources);
     if !m.bin_include_dirs.is_empty() {
-        let _ = writeln!(out, "target_include_directories({} PRIVATE", m.name);
+        let _ = writeln!(
+            out,
+            "target_include_directories({} PRIVATE",
+            m.bin_target_name
+        );
         for dir in &m.bin_include_dirs {
             let _ = writeln!(out, "    \"{}\"", dir.display());
         }
         out.push_str(")\n");
     }
     if !m.workspace_link_deps.is_empty() {
-        let _ = writeln!(out, "target_link_libraries({} PRIVATE", m.name);
+        let _ = writeln!(out, "target_link_libraries({} PRIVATE", m.bin_target_name);
         for dep in &m.workspace_link_deps {
             let _ = writeln!(out, "    {dep}");
         }
         out.push_str(")\n");
     }
+    emit_compile_options(out, &m.bin_target_name, &m.compile_options);
+}
+
+/// Emit `target_compile_options(<target> PRIVATE …)` with one
+/// option per line. Each option is written verbatim (`CMake` list
+/// element); the caller wraps shell-significant strings in
+/// `SHELL:` (V42D-5).
+fn emit_compile_options(out: &mut String, target: &str, opts: &[String]) {
+    if opts.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "target_compile_options({target} PRIVATE");
+    for opt in opts {
+        // Quote every option so spaces / shell metacharacters
+        // pass through cleanly. CMake unquotes them when
+        // building the argv (and SHELL: prefixes survive the
+        // unquote).
+        let _ = writeln!(out, "    \"{opt}\"");
+    }
+    out.push_str(")\n");
 }
 
 /// Emit a `set_source_files_properties(... OBJECT_DEPENDS ...)`
@@ -261,27 +336,6 @@ fn emit_object_depends(out: &mut String, sources: &[SourceFile]) {
         }
         out.push_str("\"\n)\n");
     }
-}
-
-fn emit_shared_compile_options(out: &mut String, view: &WorkspaceView, plugin: &Path) {
-    out.push('\n');
-    out.push_str("# ---- shared compile options ----\n");
-    out.push_str("# Plugin invocation — absolute path baked at emit-time (V42D-5).\n");
-    out.push_str("foreach(_t");
-    for m in &view.members {
-        if m.kind.has_lib() {
-            let _ = write!(out, " {}", m.name);
-        }
-        if m.kind.has_bin() {
-            let _ = write!(out, " {}", m.name);
-        }
-    }
-    out.push_str(")\n");
-    out.push_str("    target_compile_options(${_t} PRIVATE\n");
-    let _ = writeln!(out, "        \"SHELL:-fplugin={}\"", plugin.display());
-    out.push_str("        -Wno-unknown-attributes\n");
-    out.push_str("    )\n");
-    out.push_str("endforeach()\n");
 }
 
 // ─── Configure-skip stamp (V42D-8 + RQ-V42-1) ───────────────────
@@ -441,7 +495,7 @@ pub struct Tool {
     /// Absolute path the PATH lookup resolved to.
     pub path: PathBuf,
     /// `(major, minor, patch)`. Patch is 0 when the `--version`
-    /// output omits it (some Ninja builds report `1.11`).
+    /// output omits it (some `Ninja` builds report `1.11`).
     pub version: (u32, u32, u32),
 }
 
@@ -477,7 +531,7 @@ pub fn find_cmake() -> Result<Tool> {
 }
 
 /// Look up `ninja` on `$PATH`, run `ninja --version`, parse it.
-/// No version floor (V42D-11 — Ninja's build-format compat is
+/// No version floor (V42D-11 — `Ninja`'s build-format compat is
 /// excellent). Surfaced now (slice B will be the first caller).
 #[allow(dead_code)] // consumed by slice B
 pub fn find_ninja() -> Result<Tool> {
@@ -534,7 +588,7 @@ fn find_tool(tool: &str, install_hint: &str) -> Result<Tool> {
 
 /// Parse a `<tool> --version` first line. Looks for the first
 /// `MAJOR.MINOR[.PATCH]` sequence and returns it. `CMake`'s first
-/// line is `cmake version 3.28.1`; Ninja's is just `1.11.1`.
+/// line is `cmake version 3.28.1`; `Ninja`'s is just `1.11.1`.
 #[allow(dead_code)] // consumed by slice B via find_tool
 fn parse_version(line: &str) -> Result<(u32, u32, u32)> {
     let mut chars = line.char_indices().peekable();
@@ -574,19 +628,23 @@ fn try_triple(s: &str) -> Option<(u32, u32, u32)> {
 // ─── Workspace → WorkspaceView bridge (slice A wire-up) ─────────
 
 use crate::{
-    manifest::CrateKind, modules, plugin::Plugin, profile::ProfileKind,
-    target_layout::TargetLayout, workspace::Workspace,
+    manifest::{CrateKind, Manifest},
+    modules,
+    plugin::Plugin,
+    profile::{ProfileKind, ResolvedProfile},
+    target_layout::TargetLayout,
+    workspace::Workspace,
 };
 
 /// Walk `ws` and produce a `WorkspaceView` describing every
 /// member's lib/bin shape, sources (post-`#cust use` rewrite
-/// paths), and `OBJECT_DEPENDS` fragment edges.
+/// paths), `OBJECT_DEPENDS` fragment edges, per-target compile
+/// options, and output directories.
 ///
-/// Slice A only: this duplicates the module walk
-/// `compile_tree` does. Slice B (V42D-16) will fuse them so the
-/// driver walks once per build, not twice. The duplicate cost is
-/// tolerable today because slice A doesn't yet drive `cmake` —
-/// the walk's only consumer is the configure-skip stamp.
+/// Slice B (V42D-16) is the first real consumer: the emitter
+/// drives a `cmake -G Ninja` + `cmake --build` invocation
+/// against the result. Walk is deterministic — same inputs in,
+/// same `WorkspaceView` out, byte-stable through `generate`.
 ///
 /// The view always contains every workspace member, regardless of
 /// `cust build -p <name>` scoping (V42D-13: one `CMakeLists` for
@@ -600,6 +658,7 @@ pub fn collect_view(
 ) -> Result<WorkspaceView> {
     let layout = TargetLayout::for_workspace(&ws.root, profile_kind);
     let rewrite_root = layout.profile_root.join(".rewrite");
+    let prelude_path = layout.prelude_path();
 
     let mut members: Vec<MemberView> = Vec::with_capacity(ws.members.len());
     for m in &ws.members {
@@ -632,14 +691,32 @@ pub fn collect_view(
         // Intra-workspace link deps for the bin half (V42D-13:
         // lower to `target_link_libraries`). Workspace deps come
         // from `Member::deps`; for lib+bin we additionally link
-        // against the member's own lib half. TODO(slice B):
-        // resolve the lib+bin self-link name collision — CMake
-        // can't have two targets with the same name. Today's
-        // cwork has no lib+bin members so the issue is dormant.
+        // against the member's own lib half (which still has the
+        // unsuffixed member name as its CMake target).
         let mut workspace_link_deps = m.deps.clone();
         if kind == MemberKind::LibAndBin {
             workspace_link_deps.insert(0, m.name.clone());
         }
+
+        // CMake target name for the bin half. Suffix `-bin` only
+        // when the member is lib+bin, so the pure-bin case
+        // (cwork hello-cstd) stays simple.
+        let bin_target_name = if kind == MemberKind::LibAndBin {
+            format!("{}-bin", m.name)
+        } else {
+            m.name.clone()
+        };
+
+        // Per-target compile options. Mirror what `build::build_cflags`
+        // would produce for a non-test, non-syntax-only TU minus the
+        // trailing `-c -o <obj> <src>` (CMake supplies those).
+        let profile_override = match profile_kind {
+            ProfileKind::Dev => m.manifest.profile.dev.as_ref(),
+            ProfileKind::Release => m.manifest.profile.release.as_ref(),
+        };
+        let profile = ResolvedProfile::resolve(profile_kind, profile_override)?;
+        let compile_options =
+            build_member_compile_options(&profile, &m.manifest, &prelude_path, plugin);
 
         members.push(MemberView {
             name: m.name.clone(),
@@ -647,8 +724,16 @@ pub fn collect_view(
             lib_sources,
             bin_sources,
             archive_output_dir: layout.build_dir(&m.name),
+            runtime_output_dir: layout.profile_root.clone(),
             bin_include_dirs,
             workspace_link_deps,
+            lib_workspace_deps: if kind.has_lib() {
+                m.deps.clone()
+            } else {
+                Vec::new()
+            },
+            compile_options,
+            bin_target_name,
         });
     }
 
@@ -658,6 +743,53 @@ pub fn collect_view(
         plugin_path: plugin.map(|p| p.path.clone()),
         members,
     })
+}
+
+/// Build the per-target compile options for one member matching
+/// what the v0.4.0 driver's `build_cflags` produced (minus the
+/// trailing `-c -o <obj> <src>` that `CMake` supplies). Output is a
+/// flat list of `CMake` list elements; multi-word flags like
+/// `-include <path>` are emitted as two separate elements so
+/// `CMake`'s argv reconstruction passes them to clang verbatim.
+fn build_member_compile_options(
+    profile: &ResolvedProfile,
+    manifest: &Manifest,
+    prelude: &Path,
+    plugin: Option<&Plugin>,
+) -> Vec<String> {
+    let mut opts: Vec<String> = Vec::new();
+
+    // Profile cflags (-O…, -g…, -fsanitize=…, [profile.<kind>]
+    // extra-cflags). Same order build::build_cflags emits.
+    opts.extend(profile.cflags());
+
+    // [clang] extra-cflags.
+    opts.extend(manifest.clang.extra_cflags.iter().cloned());
+
+    // -fvisibility=hidden: same default the v0.3 prelude pinned.
+    opts.push("-fvisibility=hidden".to_string());
+
+    // -include <prelude>: two separate argv tokens (clang
+    // requires them split). CMake preserves list order; no
+    // SHELL: prefix needed because -include doesn't collide
+    // with any other flag CMake adds.
+    opts.push("-include".to_string());
+    opts.push(prelude.display().to_string());
+
+    if let Some(plugin) = plugin {
+        // Plugin loader. SHELL: prefix prevents CMake from
+        // splitting / re-ordering this around other -f flags
+        // (V42D-5). Path is absolute, resolved by
+        // plugin::discover() before collect_view ran.
+        opts.push(format!("SHELL:-fplugin={}", plugin.path.display()));
+    }
+
+    // Always suppress `-Wunknown-attributes` so cust-attribute
+    // decls don't drown the build in warnings even when the
+    // plugin is loaded (V42D-5 defensive).
+    opts.push("-Wno-unknown-attributes".to_string());
+
+    opts
 }
 
 const fn map_kind(k: &CrateKind) -> MemberKind {
@@ -710,14 +842,12 @@ fn collect_sources(
 }
 
 /// Write the workspace's `CMakeLists` into the build tree
-/// (V42D-13 path + V42D-8 configure-skip stamp). Slice A's
-/// only on-disk side effect for the CMake-driver work.
+/// (V42D-13 path + V42D-8 configure-skip stamp).
 ///
-/// `build_workspace` calls this after computing `to_build` but
-/// before running the per-member loop. The return value is
-/// discarded today (slice A's wire is fire-and-forget); slice B
-/// will branch on `WriteOutcome` to decide whether to re-run
-/// `cmake -G Ninja`.
+/// Slice A's standalone emit entry point; slice B's
+/// `emit_and_drive_cmake` is now the production caller, so this
+/// stays around mainly for tests and out-of-band tooling.
+#[allow(dead_code)] // superseded as a build-path callee by `emit_and_drive_cmake`; kept for tests
 pub fn emit_workspace_cmakelists(
     ws: &Workspace,
     profile_kind: ProfileKind,
@@ -730,6 +860,214 @@ pub fn emit_workspace_cmakelists(
     let cmakelists = cmake_dir.join("CMakeLists.txt");
     let stamp = cmake_dir.join("stamp").join("cmakelists.sha256");
     write_if_changed(&cmakelists, &bytes, &stamp, view.plugin_path.as_deref())
+}
+
+// ─── Slice B: drive cmake + ninja ───────────────────────────────
+
+/// Inputs to `emit_and_drive_cmake`. Mirror of the v0.4.2 design
+/// doc's `cust build` / `cust build -p <name>` shape.
+#[derive(Default)]
+pub struct DriveOptions<'a> {
+    /// `Some(name)` lowers to `cmake --build --target <name>`.
+    /// `None` builds every default target. Slice B accepts a
+    /// single member name; v0.4.4 multi-bin will generalise to a
+    /// `Vec<String>`.
+    pub only: Option<&'a str>,
+    /// `cmake --build -j <jobs>`. `None` lets `Ninja` pick (`Ninja`
+    /// defaults to `nproc`). Slice D will plumb `--jobs` / env
+    /// vars through here.
+    pub jobs: Option<u32>,
+}
+
+/// One-shot orchestrator for the v0.4.2 `CMake`-driven build path.
+/// Emits the workspace `CMakeLists`, optionally reconfigures, and
+/// drives `cmake --build`. Returns once `Ninja` exits.
+///
+/// Steps (per V42D-16):
+///
+/// 1. `find_cmake()` / `find_ninja()` — install hints on miss.
+/// 2. `collect_view` → `generate` → `write_if_changed`.
+/// 3. Configure: if `WriteOutcome::Wrote` *or* the build dir
+///    doesn't already contain a `CMakeCache.txt`, run
+///    `cmake -G `Ninja` -S <cmake_dir> -B <build_dir>
+///    -DCMAKE_C_COMPILER=<abs/clang>`. Otherwise skip (V42D-8:
+///    stamp matched, nothing to reconfigure).
+/// 4. Build: `cmake --build <build_dir>` (with `--target <name>`
+///    when `opts.only` is set; with `-j <jobs>` when set).
+/// 5. Publish `compile_commands.json` (V42D-12): symlink
+///    `target/<profile>/compile_commands.json` and the legacy
+///    `target/compile_commands.json` to the `CMake`-emitted
+///    `<build_dir>/compile_commands.json`.
+///
+/// Both cmake and ninja get their stdout + stderr piped through
+/// `diag_rewrite::rewrite` (V42D-18).
+pub fn emit_and_drive_cmake(
+    ws: &Workspace,
+    profile_kind: ProfileKind,
+    clang: &crate::clang::Clang,
+    plugin: Option<&Plugin>,
+    opts: &DriveOptions<'_>,
+) -> Result<()> {
+    let cmake = find_cmake()?;
+    let _ninja = find_ninja()?; // discovery + version-parse check; CMake invokes ninja itself
+
+    let layout = TargetLayout::for_workspace(&ws.root, profile_kind);
+    let cmake_dir = layout.profile_root.join("cmake");
+    let build_dir = cmake_dir.join("build");
+    let cmakelists = cmake_dir.join("CMakeLists.txt");
+    let stamp = cmake_dir.join("stamp").join("cmakelists.sha256");
+
+    let view = collect_view(ws, profile_kind, plugin)?;
+    let bytes = generate(&view).into_bytes();
+    let outcome = write_if_changed(&cmakelists, &bytes, &stamp, view.plugin_path.as_deref())?;
+
+    // Configure if the CMakeLists was just written OR there's no
+    // existing CMake cache to reuse. Either condition forces a
+    // fresh `cmake -G Ninja` run.
+    let must_configure =
+        outcome == WriteOutcome::Wrote || !build_dir.join("CMakeCache.txt").is_file();
+    if must_configure {
+        fs::create_dir_all(&build_dir)
+            .with_context(|| format!("creating `{}`", build_dir.display()))?;
+        // Wipe any stale cache so a compiler-path change (or any
+        // other -D the driver might add later) takes effect on the
+        // next project() call. Object files under CMakeFiles/ stay.
+        let _ = fs::remove_file(build_dir.join("CMakeCache.txt"));
+        let mut cmd = Command::new(&cmake.path);
+        cmd.arg("-G").arg("Ninja");
+        cmd.arg("-S").arg(&cmake_dir);
+        cmd.arg("-B").arg(&build_dir);
+        // V42D-3 / Headline outcome: cust drives clang, not the
+        // system default. Passing on the configure line means
+        // CMake records it in CMakeCache.txt and uses it for
+        // every subsequent `cmake --build`.
+        cmd.arg(format!("-DCMAKE_C_COMPILER={}", clang.path.display()));
+        run_streaming(cmd, "cmake configure")?;
+    }
+
+    // Build.
+    let mut cmd = Command::new(&cmake.path);
+    cmd.arg("--build").arg(&build_dir);
+    if let Some(target) = opts.only {
+        // For lib+bin members the bin lives at a `-bin`-suffixed
+        // CMake target name; the lib keeps the unsuffixed
+        // member name. `-p <name>` builds both halves: walk the
+        // view to find which targets the member produced.
+        for cmake_target in target_names_for(&view, target) {
+            cmd.arg("--target").arg(cmake_target);
+        }
+    }
+    if let Some(jobs) = opts.jobs {
+        cmd.arg("-j").arg(jobs.to_string());
+    }
+    run_streaming(cmd, "cmake --build")?;
+
+    publish_compile_commands(&layout, &build_dir)?;
+    Ok(())
+}
+
+/// `CMake` target name(s) for a member, used when lowering
+/// `cust build -p <name>` to `cmake --build --target ...`.
+/// Returns `[lib]`, `[bin]`, or `[lib, bin]` depending on the
+/// member's `kind`. Unknown member names produce an empty Vec
+/// (the caller fails at the workspace-membership check before
+/// reaching this).
+fn target_names_for<'a>(view: &'a WorkspaceView, member_name: &str) -> Vec<&'a str> {
+    let Some(m) = view.members.iter().find(|m| m.name == member_name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(2);
+    if m.kind.has_lib() {
+        out.push(m.name.as_str());
+    }
+    if m.kind.has_bin() {
+        out.push(m.bin_target_name.as_str());
+    }
+    out
+}
+
+/// Publish `CMake`'s `compile_commands.json` at both the canonical
+/// V42D-12 location (`target/<profile>/compile_commands.json`)
+/// and the legacy v0.1 location (`target/compile_commands.json`)
+/// via symlinks. The legacy location stays during v0.4.x because
+/// existing dev tooling and the v0.1+ test suite reach for it.
+fn publish_compile_commands(layout: &TargetLayout, build_dir: &Path) -> Result<()> {
+    let canonical = build_dir.join("compile_commands.json");
+    if !canonical.is_file() {
+        return Ok(()); // configure was skipped and an old cache lacks the export — non-fatal
+    }
+    let v42d12_path = layout.profile_root.join("compile_commands.json");
+    let legacy_path = layout.target_root.join("compile_commands.json");
+    symlink_overwrite(&canonical, &v42d12_path)?;
+    symlink_overwrite(&canonical, &legacy_path)?;
+    Ok(())
+}
+
+fn symlink_overwrite(target: &Path, link: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    if fs::symlink_metadata(link).is_ok() {
+        fs::remove_file(link).with_context(|| format!("removing stale `{}`", link.display()))?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link)
+        .with_context(|| format!("symlinking `{}` -> `{}`", link.display(), target.display()))?;
+    #[cfg(not(unix))]
+    fs::copy(target, link)
+        .map(|_| ())
+        .with_context(|| format!("copying `{}` -> `{}`", target.display(), link.display()))?;
+    Ok(())
+}
+
+// ─── Subprocess wrapper + diagnostic rewrite ────────────────────
+//
+// Inline helper per V42D-18 (the design says "promote to a shared
+// module only if a second caller appears"). Spawns `cmd` with
+// piped stdout + stderr; one reader thread per pipe pushes each
+// line through `diag_rewrite::rewrite` before printing to the
+// driver's own stdout / stderr.
+
+fn run_streaming(mut cmd: Command, ctx: &'static str) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().with_context(|| format!("spawning {ctx}"))?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let h_out = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let rewritten = crate::diag_rewrite::rewrite(&line);
+            println!("{rewritten}");
+        }
+    });
+    let h_err = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let rewritten = crate::diag_rewrite::rewrite(&line);
+            eprintln!("{rewritten}");
+        }
+    });
+
+    let status = child.wait().with_context(|| format!("waiting on {ctx}"))?;
+    // Joining the reader threads is fire-and-forget: the pipes
+    // closed when the child exited, so the threads finish on
+    // their own; we just sync before returning so the driver
+    // doesn't print its own "Finished" line before the child's
+    // last lines flush.
+    let _ = h_out.join();
+    let _ = h_err.join();
+
+    if !status.success() {
+        bail!("{ctx} failed with status {status}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

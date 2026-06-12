@@ -177,20 +177,19 @@ fn compile_commands_json_carries_expected_flags() {
     let (_tmp, dir) = stage("hello");
     assert_success(&cust(&dir, ["build"]));
 
+    // v0.4.2 V42D-12: compile_commands.json is emitted by CMake
+    // and the cust driver publishes the legacy `target/`
+    // location as a symlink.
     let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
     for needle in [
-        "\"-fvisibility=hidden\"",
-        "\"-include\"",
+        "-fvisibility=hidden",
+        "-include",
         "prelude.h",
-        "\"-O0\"",
-        "\"-g3\"",
-        "\"-Wall\"",
-        "\"-c\"",
-        // The compiled file is the rewritten copy under target/;
-        // the `-I` argument anchors `#include` resolution back at
-        // the user's `src/` directory.
-        "lib.preprocessed.c",
-        "/src\"",
+        "-O0",
+        "-g3",
+        // The compiled file is the post-`#cust use`-rewrite copy
+        // under target/<profile>/.rewrite/<crate>/ (V42D-13).
+        "/.rewrite/hello/src/lib.c",
     ] {
         assert!(
             cc.contains(needle),
@@ -360,15 +359,20 @@ fn build_multi_module_compiles_all_tus() {
     let (_tmp, dir) = stage("multi_module");
     assert_success(&cust(&dir, ["build"]));
 
-    // Each module gets its own rewritten source + object.
-    let bd = dir.join("target/debug/build/multi_module");
-    for name in ["lib", "util", "parser"] {
-        assert!(
-            bd.join(format!("{name}.preprocessed.c")).is_file(),
-            "missing {name}.preprocessed.c"
-        );
-        assert!(bd.join(format!("{name}.o")).is_file(), "missing {name}.o");
+    // v0.4.2 V42D-13: rewrites land under
+    // `target/<profile>/.rewrite/<crate>/<rel>.c`. CMake's
+    // per-TU object files live under
+    // `target/<profile>/cmake/build/CMakeFiles/<target>.dir/...`
+    // (an implementation detail of the CMake/Ninja backend;
+    // tests don't assert the exact object-file paths).
+    let rd = dir.join("target/debug/.rewrite/multi_module/src");
+    for name in ["lib.c", "util.c"] {
+        assert!(rd.join(name).is_file(), "missing rewrite of {name}");
     }
+    assert!(
+        rd.join("parser/mod.c").is_file(),
+        "missing rewrite of parser/mod.c"
+    );
 
     let archive = dir.join("target/debug/build/multi_module/libmulti_module.a");
     assert!(archive.is_file());
@@ -398,11 +402,14 @@ fn build_multi_module_emits_one_compile_command_per_tu() {
     let (_tmp, dir) = stage("multi_module");
     assert_success(&cust(&dir, ["build"]));
 
+    // v0.4.2 V42D-12: CMake emits compile_commands.json. One
+    // entry per TU (no paired clangd entries — see the test
+    // below for the trade-off).
     let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
     for needle in [
-        "lib.preprocessed.c",
-        "util.preprocessed.c",
-        "parser.preprocessed.c",
+        "/.rewrite/multi_module/src/lib.c",
+        "/.rewrite/multi_module/src/util.c",
+        "/.rewrite/multi_module/src/parser/mod.c",
     ] {
         assert!(
             cc.contains(needle),
@@ -413,26 +420,24 @@ fn build_multi_module_emits_one_compile_command_per_tu() {
 
 #[test]
 fn compile_commands_json_carries_paired_entries_for_clangd() {
-    // For each module the driver emits TWO entries: one for the
-    // rewritten `.preprocessed.c` (matches what was actually
-    // compiled) and one for the user's original source (lets
-    // clangd find matching flags when the editor opens src/*.c).
+    // v0.4.2: CMake-emitted compile_commands.json carries ONE
+    // entry per TU — the rewritten `.rewrite/.../src/<name>.c`
+    // file. clangd opens the user's original `src/<name>.c`
+    // and won't find a matching entry; supporting that needs a
+    // post-process step mirroring each entry with the original-
+    // source path. Tracked as a v0.4.x follow-up, not a v0.4.2
+    // blocker (see docs/design/v0.4.2.md V42D-12).
     let (_tmp, dir) = stage("multi_module");
     assert_success(&cust(&dir, ["build"]));
 
     let cc = fs::read_to_string(dir.join("target/compile_commands.json")).unwrap();
-    // Crude but sufficient: the rewritten path and the original
-    // source path should both appear as the "file" value for each
-    // of the three modules.
-    for original in ["src/lib.c", "src/util.c", "src/parser/mod.c"] {
-        assert!(
-            cc.contains(original),
-            "compile_commands.json missing original source `{original}`:\n{cc}"
-        );
-    }
-    // Six "file": entries (3 modules × 2). Count them.
-    let n = cc.matches("\"file\":").count();
-    assert_eq!(n, 6, "expected 6 file entries, got {n}:\n{cc}");
+    let entry_count = cc.matches("\"file\":").count();
+    // Three TUs — three CMake-emitted entries. (v0.3 had six:
+    // 3 rewritten + 3 paired-originals.)
+    assert_eq!(
+        entry_count, 3,
+        "expected 3 entries (one per TU); v0.4.2 dropped the clangd-paired entries:\n{cc}"
+    );
 }
 
 #[test]

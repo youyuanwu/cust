@@ -1,4 +1,4 @@
-//! Workspace discovery and member resolution.
+//! `Workspace` discovery and member resolution.
 //!
 //! v0.3 ([docs/design/v0.3.0.md]) adds `[workspace]` to `Cust.toml`.
 //! A workspace consists of:
@@ -43,7 +43,7 @@ use crate::{
 /// One resolved workspace member.
 #[derive(Debug)]
 pub struct Member {
-    /// Member name (from its `[package].name`).
+    /// `Member` name (from its `[package].name`).
     pub name: String,
     /// Absolute, canonicalised path to the member directory.
     pub root: PathBuf,
@@ -581,6 +581,21 @@ pub struct WorkspaceBuildOutputs {
 /// (dependencies first). After each producer build, refresh the
 /// `target/<profile>/deps/<name>` symlink so downstream consumers
 /// reach the producer's outputs at a stable path (V3D-5 option A).
+///
+/// v0.4.2 slice B (V42D-16) splits the orchestration into three
+/// modes:
+///
+/// * **`test_build`** — keeps the v0.3.2/v0.4.0 per-member loop
+///   driving `build::run` (each member builds its own test exe
+///   via the in-driver `compile_tree` + `link_executable` path).
+///   Slice C will move the test runner under `CMake`.
+/// * **`syntax_only`** (`cust check`) — V42D-15: per member,
+///   run the surface pass and concat the crate header, no
+///   codegen, no `CMake`. Implemented via `build::run_phase1`.
+/// * **build** — V42D-13: per member, run phase 1 + write the
+///   `.rewrite/` tree, then a SINGLE `cmake -G Ninja` + `cmake
+///   --build` invocation drives every member's codegen and link
+///   under one `Ninja` graph.
 pub fn build_workspace(
     ws: &Workspace,
     opts: &WorkspaceBuildOptions<'_>,
@@ -609,97 +624,166 @@ pub fn build_workspace(
     let layout = TargetLayout::for_workspace(&ws.root, opts.profile_kind);
     layout.ensure_dirs()?;
 
-    // v0.4.2 slice A (V42D-16 step 1): emit the workspace
-    // CMakeLists into `target/<profile>/cmake/` so the file
-    // shows up on disk and CI can inspect it. Slice A does NOT
-    // invoke `cmake` — `compile_one_module` still drives
-    // phase 2 below. Skipped in syntax-only mode (V42D-15:
-    // `cust check` bypasses CMake entirely) and in test-build
-    // mode (V42D-14's test targets land in slice C).
-    if !opts.syntax_only && !opts.test_build {
-        let _ = crate::cmake_emit::emit_workspace_cmakelists(ws, opts.profile_kind, opts.plugin)
-            .context("emitting workspace CMakeLists.txt")?;
+    // Test-build mode: keep the v0.4.0 per-member loop. Slice C
+    // will move this under CMake (V42D-14).
+    if opts.test_build {
+        return run_test_build_path(ws, &to_build, opts, &layout);
     }
 
+    // Check mode: V42D-15 — per-member surface pass + crate
+    // header concat, no codegen, no CMake.
+    if opts.syntax_only {
+        return run_check_path(ws, &to_build, opts, &layout);
+    }
+
+    // Build mode (V42D-16): driver runs phase 1 + writes the
+    // `.rewrite/` tree for every workspace member (the whole-
+    // workspace CMakeLists references every member's sources;
+    // CMake's configure-time existence check needs the rewrite
+    // tree complete even when `-p <name>` scopes the eventual
+    // `cmake --build` invocation). Per-member work stays cheap
+    // (idempotent reads + content-skip writes); slice D can
+    // narrow this if larger workspaces ever surface real
+    // pressure.
+    let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(ws.members.len());
+    for m in &ws.members {
+        let name = &m.name;
+        with_plan(ws, m, opts, |plan| {
+            build::run_phase1(plan).with_context(|| format!("phase 1 for member `{name}`"))?;
+            build::write_rewrite_tree(plan)
+                .with_context(|| format!("writing rewrite tree for member `{name}`"))?;
+            refresh_dep_symlink(&layout, &m.name, &m.root)
+                .with_context(|| format!("publishing dep view for `{name}`"))?;
+            // Only report `per_member` entries for the
+            // `-p`-scoped subset (matches v0.3 behaviour: cust
+            // run / cust test query specific members; siblings
+            // outside the scope shouldn't appear in `Finished`
+            // lines).
+            if to_build.iter().any(|n| n == name) {
+                per_member.push((name.clone(), build::cmake_outputs_for(plan, &layout)));
+            }
+            Ok(())
+        })?;
+    }
+
+    // Drive the CMake build for the whole workspace (V42D-13:
+    // single CMakeLists, single `cmake --build`).
+    crate::cmake_emit::emit_and_drive_cmake(
+        ws,
+        opts.profile_kind,
+        opts.clang,
+        opts.plugin,
+        &crate::cmake_emit::DriveOptions {
+            only: opts.only,
+            jobs: None, // slice D wires -jN / CUST_JOBS
+        },
+    )
+    .context("driving cmake build")?;
+
+    crate::lock::write_lock(ws).context("writing Cust.lock")?;
+    // Write the v0.1 `.cust-version` stamp so downstream tooling
+    // (and the test suite) can detect which cust + clang built
+    // the tree. Per V42D-12 this lives at `target/.cust-version`,
+    // shared with the legacy compile_commands.json symlink.
+    build::write_version_stamp(&layout.target_root.join(".cust-version"), opts.clang)
+        .context("writing .cust-version stamp")?;
+
+    Ok(WorkspaceBuildOutputs { per_member })
+}
+
+/// V42D-15: `cust check` runs phase 1 (surface pass + crate
+/// header concat) per member and stops. No codegen, no `CMake`.
+/// Cross-crate `#cust use <dep>;` resolves through the dep view
+/// symlink to the upstream member's crate header — same path
+/// the build mode produces.
+fn run_check_path(
+    ws: &Workspace,
+    to_build: &[String],
+    opts: &WorkspaceBuildOptions<'_>,
+    layout: &TargetLayout,
+) -> Result<WorkspaceBuildOutputs> {
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
-    for name in &to_build {
+    for name in to_build {
         let m = ws
             .member(name)
             .expect("build_order returned a member not in ws");
-
-        // Resolve the crate kind from the cached Member metadata.
-        // v0.3.1: a member may now be lib, bin, or lib+bin
-        // (V31D-1). Workspace::build computed this once at
-        // discovery; we just clone it here.
-        let kind = m.kind.clone();
-
-        // Materialise each member's deps as &str slices so
-        // BuildPlan can borrow them.
-        let dep_strs: Vec<&str> = m.deps.iter().map(String::as_str).collect();
-
-        // Transitive deps for the bin link step (v0.3.1). For
-        // lib-only members this is unused; we compute it
-        // unconditionally for uniformity, but it's cheap.
-        // The closure includes `m` itself; we filter it out so
-        // the linker only sees deps. `collect_transitive_deps`
-        // walks in arbitrary set order; we sort here so the
-        // link line is deterministic across runs.
-        let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        collect_transitive_deps(ws, m, &mut closure);
-        closure.remove(&m.name);
-        let link_deps_owned: Vec<String> = closure.into_iter().collect();
-        let link_deps: Vec<&str> = link_deps_owned.iter().map(String::as_str).collect();
-
-        let plan = BuildPlan {
-            manifest: &m.manifest,
-            crate_root: &m.root,
-            workspace_root: &ws.root,
-            profile_kind: opts.profile_kind,
-            clang: opts.clang,
-            plugin: opts.plugin,
-            syntax_only: opts.syntax_only,
-            deps: &dep_strs,
-            link_deps: &link_deps,
-            kind,
-            test_build: opts.test_build,
-        };
-        let outputs = build::run(&plan).with_context(|| format!("building member `{name}`"))?;
-
-        // Refresh the dep view symlink so consumers reach this
-        // member's outputs at a stable path (V3D-5 A). Runs in
-        // both build and check mode — downstream members'
-        // `#cust use <name>;` rewrites point at
-        // `target/<profile>/deps/<name>/include/<name>.h`, which
-        // resolves through this symlink. Bin-only members get a
-        // symlink too; it's harmless since (per V31D-6, enforced
-        // in Slice C) no one will resolve through it for a bin.
-        //
-        // Skipped in test-build mode (v0.3.2 V32D-4): the test
-        // pipeline doesn't populate `target/<profile>/build/<name>/`
-        // so there'd be nothing to point at. Test code that
-        // imports a sibling dep via `#cust use <dep>;` still
-        // resolves through whatever the dep's normal `cust build`
-        // last produced — if that was never run, the test
-        // compile fails with a clear missing-header error.
-        if !opts.test_build {
-            refresh_dep_symlink(&layout, &m.name, &m.root)
+        with_plan(ws, m, opts, |plan| {
+            build::run_phase1(plan).with_context(|| format!("checking member `{name}`"))?;
+            refresh_dep_symlink(layout, &m.name, &m.root)
                 .with_context(|| format!("publishing dep view for `{name}`"))?;
-        }
-
-        per_member.push((name.clone(), outputs));
+            per_member.push((
+                name.clone(),
+                BuildOutputs {
+                    objects: Vec::new(),
+                    archive: None,
+                    executable: None,
+                    test_executable: None,
+                    compile_commands: layout.target_root.join("compile_commands.json"),
+                },
+            ));
+            Ok(())
+        })?;
     }
-
-    // After all members built successfully, emit Cust.lock at the
-    // workspace root. Skipped for single-crate (non-workspace)
-    // projects — they have no edges to record — and skipped in
-    // syntax-only and test-build modes (cust check / cust test
-    // shouldn't churn the lockfile; lock changes are committed
-    // by the user via `cust build`).
-    if !opts.syntax_only && !opts.test_build {
-        crate::lock::write_lock(ws).context("writing Cust.lock")?;
-    }
-
+    // No lock write in check mode (matches v0.3.x behaviour).
     Ok(WorkspaceBuildOutputs { per_member })
+}
+
+/// v0.3.2 / v0.4.0 test-build pipeline orchestrator. Kept
+/// untouched in slice B; slice C (V42D-14) moves the per-member
+/// test build into the workspace `CMakeLists` as an
+/// `add_executable(<crate>__test ...)` target.
+fn run_test_build_path(
+    ws: &Workspace,
+    to_build: &[String],
+    opts: &WorkspaceBuildOptions<'_>,
+    _layout: &TargetLayout,
+) -> Result<WorkspaceBuildOutputs> {
+    let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
+    for name in to_build {
+        let m = ws
+            .member(name)
+            .expect("build_order returned a member not in ws");
+        with_plan(ws, m, opts, |plan| {
+            let outputs = build::run(plan).with_context(|| format!("building member `{name}`"))?;
+            per_member.push((name.clone(), outputs));
+            Ok(())
+        })?;
+    }
+    Ok(WorkspaceBuildOutputs { per_member })
+}
+
+/// Construct a per-member `BuildPlan` for the duration of `f`.
+/// Owns the dep / transitive-link Vecs locally so the plan's
+/// `&[&str]` slices stay valid; the closure shape avoids leaking
+/// the temporaries past the call site (`BuildPlan` is `&'a`-heavy
+/// and refactoring it to own its slices is a slice-C job).
+fn with_plan<R>(
+    ws: &Workspace,
+    m: &Member,
+    opts: &WorkspaceBuildOptions<'_>,
+    f: impl FnOnce(&BuildPlan<'_>) -> Result<R>,
+) -> Result<R> {
+    let dep_strs: Vec<&str> = m.deps.iter().map(String::as_str).collect();
+    let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    collect_transitive_deps(ws, m, &mut closure);
+    closure.remove(&m.name);
+    let link_deps_owned: Vec<String> = closure.into_iter().collect();
+    let link_deps: Vec<&str> = link_deps_owned.iter().map(String::as_str).collect();
+
+    let plan = BuildPlan {
+        manifest: &m.manifest,
+        crate_root: &m.root,
+        workspace_root: &ws.root,
+        profile_kind: opts.profile_kind,
+        clang: opts.clang,
+        plugin: opts.plugin,
+        syntax_only: opts.syntax_only,
+        deps: &dep_strs,
+        link_deps: &link_deps,
+        kind: m.kind.clone(),
+        test_build: opts.test_build,
+    };
+    f(&plan)
 }
 
 /// `target/<profile>/deps/<name>` → `target/<profile>/build/<name>/`.

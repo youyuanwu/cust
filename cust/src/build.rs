@@ -62,7 +62,7 @@ pub struct BuildPlan<'a> {
     pub deps: &'a [&'a str],
     /// Transitive dep names whose archives must be linked into
     /// this crate's executable (v0.3.1). For lib-only crates this
-    /// is unused. Workspace orchestrator computes this in topo
+    /// is unused. `Workspace` orchestrator computes this in topo
     /// order; for non-workspace single-crate builds it's empty.
     pub link_deps: &'a [&'a str],
     /// What this crate produces (lib / bin / lib+bin). Computed
@@ -112,6 +112,206 @@ struct CompileEntry {
     directory: PathBuf,
     file: PathBuf,
     arguments: Vec<String>,
+}
+
+// ─── v0.4.2 slice B: driver-side prebuild for the CMake path ─────
+//
+// Slice B (V42D-16) moves phase-2 codegen + link into CMake. The
+// driver still owns phase 1 (surface pass + crate header concat)
+// per V42D-2, plus the `#cust use` rewriting to disk so CMake has
+// post-rewrite sources to compile (V42D-13 layout —
+// `target/<profile>/.rewrite/<crate>/<rel>.c`). The two helpers
+// below are the entry points `workspace::build_workspace` calls
+// from the build / check paths.
+
+/// Run phase 1 for one workspace member: materialise prelude,
+/// surface-pass fixed-point over the lib half (if the plugin is
+/// loaded), concatenate the user-facing `<crate>.h`. Idempotent;
+/// safe to call before every `cmake --build` (V42D-17 — the
+/// driver owns fragment freshness).
+///
+/// Bin-half modules are NOT surface-passed because nothing reads
+/// their surface (bin has no downstream consumers). Matches the
+/// existing v0.4.0 behaviour.
+pub fn run_phase1(plan: &BuildPlan<'_>) -> Result<()> {
+    let profile_override = match plan.profile_kind {
+        ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
+        ProfileKind::Release => plan.manifest.profile.release.as_ref(),
+    };
+    let profile = ResolvedProfile::resolve(plan.profile_kind, profile_override)?;
+    let layout = TargetLayout::for_workspace(plan.workspace_root, profile.kind);
+    layout.ensure_dirs()?;
+
+    let prelude_path = layout.prelude_path();
+    materialise_prelude(&prelude_path)?;
+
+    let crate_name = plan.manifest.package_name();
+    let crate_build_dir = layout.build_dir(crate_name);
+    fs::create_dir_all(&crate_build_dir)
+        .with_context(|| format!("creating `{}`", crate_build_dir.display()))?;
+
+    if let Some(lib_src) = plan.kind.lib_source() {
+        if !lib_src.is_file() {
+            bail!(
+                "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
+                lib_src.display()
+            );
+        }
+        let lib_modules =
+            modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
+        if plan.plugin.is_some() {
+            surface_pass_fixed_point(
+                plan,
+                &profile,
+                &prelude_path,
+                &crate_build_dir,
+                &layout,
+                &lib_modules,
+            )?;
+            write_crate_header(&layout, crate_name, &lib_modules)?;
+        }
+    }
+    // No surface pass on the bin half (nothing downstream
+    // consumes bin module surfaces).
+    Ok(())
+}
+
+/// Write `#cust use`-lowered source files into
+/// `target/<profile>/.rewrite/<crate>/<rel>.c` (V42D-13 layout)
+/// for every lib + bin module. `CMake` compiles these directly;
+/// the original `src/` tree is untouched.
+///
+/// Mirrors `compile_one_module`'s rewrite logic (validation +
+/// directive substitution) but stops short of invoking clang —
+/// `CMake`/Ninja owns codegen from v0.4.2 onward (V42D-16). Slice
+/// C will fold this into a single `phase1+rewrites` walk; slice
+/// B keeps them separate so the diff is bounded.
+pub fn write_rewrite_tree(plan: &BuildPlan<'_>) -> Result<()> {
+    let layout = TargetLayout::for_workspace(plan.workspace_root, plan.profile_kind);
+    let rewrite_root = layout.profile_root.join(".rewrite");
+
+    if let Some(lib_src) = plan.kind.lib_source() {
+        let lib_modules =
+            modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
+        for m in &lib_modules {
+            write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, false)?;
+        }
+    }
+    if let Some(bin_src) = plan.kind.bin_source() {
+        let bin_modules =
+            modules::discover(plan.crate_root, bin_src).context("discovering bin module graph")?;
+        for m in &bin_modules {
+            write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_one_rewrite(
+    plan: &BuildPlan<'_>,
+    layout: &TargetLayout,
+    rewrite_root: &Path,
+    source_path: &Path,
+    m: &Module,
+    is_bin_half: bool,
+) -> Result<()> {
+    let src_text = fs::read_to_string(source_path)
+        .with_context(|| format!("reading `{}`", source_path.display()))?;
+    let scan = mod_scanner::scan(&src_text, source_path)?;
+
+    let crate_name = plan.manifest.package_name();
+    let own_lib_header = layout.crate_header_path(crate_name);
+    let rewritten = mod_scanner::rewrite_with(&src_text, source_path, &scan, |d| match &d.kind {
+        crate::mod_scanner::DirectiveKind::UseCrate { name } => {
+            let frag = layout.fragment_path(crate_name, name);
+            Some(format!("#include \"{}\"", frag.display()))
+        }
+        crate::mod_scanner::DirectiveKind::UseDep { name } => {
+            if is_bin_half && plan.kind.has_lib() && name == crate_name {
+                return Some(format!("#include \"{}\"", own_lib_header.display()));
+            }
+            let dep_header = layout
+                .dep_dir(name)
+                .join("include")
+                .join(format!("{name}.h"));
+            Some(format!("#include \"{}\"", dep_header.display()))
+        }
+        crate::mod_scanner::DirectiveKind::Mod { .. } => None,
+    });
+
+    // Validate `#cust use <name>;` resolves to a declared dep or
+    // the own-crate carve-out (bin half of lib+bin). Same shape
+    // compile_one_module enforces; same error format.
+    for d in &scan.directives {
+        if let crate::mod_scanner::DirectiveKind::UseDep { name } = &d.kind {
+            if is_bin_half && plan.kind.has_lib() && name == crate_name {
+                continue;
+            }
+            if !plan.deps.iter().any(|n| n == name) {
+                bail!(
+                    "{}:{}:{}: `#cust use {name};` refers to a crate not \
+                     listed in [dependencies]; add `{name} = {{ path = \"…\" }}`",
+                    source_path.display(),
+                    d.span.line,
+                    d.span.column
+                );
+            }
+        }
+    }
+
+    // Output path: target/<profile>/.rewrite/<crate>/<rel>.c
+    // where <rel> is the source file's path relative to the
+    // crate root, preserving `src/<...>.c` shape. Matches what
+    // `cmake_emit::collect_view` already expects.
+    let rel = m
+        .source_path
+        .strip_prefix(plan.crate_root)
+        .unwrap_or(&m.source_path);
+    let dst = rewrite_root.join(crate_name).join(rel);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    write_if_byte_different(&dst, rewritten.as_bytes())?;
+    Ok(())
+}
+
+/// Write `bytes` to `path` only if the contents differ from
+/// what's already on disk (or the file doesn't exist yet). Saves
+/// `CMake`/Ninja from spuriously rebuilding TUs whose post-rewrite
+/// bytes are unchanged across `cust build` invocations.
+fn write_if_byte_different(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Ok(existing) = fs::read(path) {
+        if existing == bytes {
+            return Ok(());
+        }
+    }
+    fs::write(path, bytes).with_context(|| format!("writing `{}`", path.display()))
+}
+
+/// Synthesize the per-member `BuildOutputs` from `layout` for
+/// the v0.4.2 `CMake`-driven path. `CMake` produces the actual
+/// artifacts at the predictable paths V42D-13 pins
+/// (`build/<crate>/lib<crate>.a` via `ARCHIVE_OUTPUT_DIRECTORY`,
+/// `<profile_root>/<crate>` via `RUNTIME_OUTPUT_DIRECTORY`); the
+/// driver doesn't track per-TU object files (`Ninja` does).
+pub fn cmake_outputs_for(plan: &BuildPlan<'_>, layout: &TargetLayout) -> BuildOutputs {
+    let crate_name = plan.manifest.package_name();
+    let archive = plan.kind.has_lib().then(|| {
+        layout
+            .build_dir(crate_name)
+            .join(format!("lib{crate_name}.a"))
+    });
+    let executable = plan
+        .kind
+        .has_bin()
+        .then(|| layout.profile_root.join(crate_name));
+    BuildOutputs {
+        objects: Vec::new(),
+        archive,
+        executable,
+        test_executable: None,
+        compile_commands: layout.target_root.join("compile_commands.json"),
+    }
 }
 
 #[allow(clippy::too_many_lines)] // staged lib+bin pipeline; splitting further hurts readability more than it helps
@@ -1287,7 +1487,11 @@ fn escape_json(s: &str) -> String {
     out
 }
 
-fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
+/// Write `target/.cust-version` containing the cust + clang
+/// version strings. Used by `cust clean` (and external tooling)
+/// to detect when the cached build was produced by a different
+/// toolchain. Idempotent — overwrites unconditionally.
+pub fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
     let contents = format!(
         "cust {}\n{}\n",
         env!("CARGO_PKG_VERSION"),
@@ -1361,7 +1565,13 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
     out.push_str("#ifdef __cplusplus\n} /* extern \"C\" */\n#endif\n\n");
     let _ = writeln!(out, "#endif /* {guard} */");
 
-    fs::write(&path, out).with_context(|| format!("writing `{}`", path.display()))?;
+    // v0.4.2: incremental hygiene. CMake/Ninja's `OBJECT_DEPENDS`
+    // edges (V42D-6) trigger TU recompiles when the depended-on
+    // file's mtime advances; rewriting `cstd.h` unconditionally
+    // would re-codegen every consumer's main.c every build even
+    // when the public surface didn't change. Compare bytes before
+    // touching.
+    write_if_byte_different(&path, out.as_bytes())?;
     Ok(())
 }
 

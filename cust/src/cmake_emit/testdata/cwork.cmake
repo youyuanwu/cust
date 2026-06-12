@@ -21,10 +21,23 @@ set_source_files_properties(
     PROPERTIES OBJECT_DEPENDS
     "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
 )
+target_compile_options(cstd PRIVATE
+    "-O0"
+    "-g3"
+    "-fvisibility=hidden"
+    "-include"
+    "/ws/target/debug/prelude.h"
+    "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
+    "-Wno-unknown-attributes"
+)
 
 # ---- crate: hello-cstd (binary) ----
 add_executable(hello-cstd
     "/ws/target/debug/.rewrite/hello-cstd/src/main.c"
+)
+set_target_properties(hello-cstd PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "/ws/target/debug"
+    OUTPUT_NAME hello-cstd
 )
 set_source_files_properties(
     "/ws/target/debug/.rewrite/hello-cstd/src/main.c"
@@ -37,12 +50,12 @@ target_include_directories(hello-cstd PRIVATE
 target_link_libraries(hello-cstd PRIVATE
     cstd
 )
-
-# ---- shared compile options ----
-# Plugin invocation — absolute path baked at emit-time (V42D-5).
-foreach(_t cstd hello-cstd)
-    target_compile_options(${_t} PRIVATE
-        "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
-        -Wno-unknown-attributes
-    )
-endforeach()
+target_compile_options(hello-cstd PRIVATE
+    "-O0"
+    "-g3"
+    "-fvisibility=hidden"
+    "-include"
+    "/ws/target/debug/prelude.h"
+    "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
+    "-Wno-unknown-attributes"
+)

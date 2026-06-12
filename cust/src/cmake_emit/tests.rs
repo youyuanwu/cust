@@ -29,6 +29,18 @@ fn cwork_view() -> WorkspaceView {
     // platform-stable.
     let cstd_archive = PathBuf::from("/ws/target/debug/build/cstd");
     let cstd_include = PathBuf::from("/ws/target/debug/build/cstd/include");
+    let profile_root = PathBuf::from("/ws/target/debug");
+    // Per-member compile options match what build_member_compile_options
+    // emits for cwork's default dev profile (no overrides).
+    let compile_options = vec![
+        "-O0".to_string(),
+        "-g3".to_string(),
+        "-fvisibility=hidden".to_string(),
+        "-include".to_string(),
+        "/ws/target/debug/prelude.h".to_string(),
+        "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so".to_string(),
+        "-Wno-unknown-attributes".to_string(),
+    ];
     WorkspaceView {
         cust_version: "0.4.2".to_string(),
         c_standard: "23".to_string(),
@@ -51,8 +63,12 @@ fn cwork_view() -> WorkspaceView {
                 ],
                 bin_sources: vec![],
                 archive_output_dir: cstd_archive,
+                runtime_output_dir: profile_root.clone(),
                 bin_include_dirs: vec![],
                 workspace_link_deps: vec![],
+                lib_workspace_deps: vec![],
+                compile_options: compile_options.clone(),
+                bin_target_name: "cstd".to_string(),
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -66,8 +82,12 @@ fn cwork_view() -> WorkspaceView {
                     ],
                 }],
                 archive_output_dir: PathBuf::from("/ws/target/debug/build/hello-cstd"),
+                runtime_output_dir: profile_root,
                 bin_include_dirs: vec![cstd_include],
                 workspace_link_deps: vec!["cstd".to_string()],
+                lib_workspace_deps: vec![],
+                compile_options,
+                bin_target_name: "hello-cstd".to_string(),
             },
         ],
     }
@@ -103,14 +123,18 @@ fn golden_cwork() {
 
 #[test]
 fn determinism_no_plugin() {
-    // No plugin → no shared-compile-options foreach. Output is
-    // still well-formed CMake (verified by the golden equivalence
-    // below — same view minus plugin should match the golden up
-    // to that block).
+    // No plugin → the `SHELL:-fplugin=…` entry drops out of
+    // each member's compile_options. Output is still well-formed.
     let mut view = cwork_view();
     view.plugin_path = None;
+    for m in &mut view.members {
+        m.compile_options.retain(|o| !o.contains("-fplugin="));
+    }
     let out = generate(&view);
-    assert!(!out.contains("foreach(_t"), "no plugin ⇒ no foreach block");
+    assert!(
+        !out.contains("-fplugin="),
+        "no plugin ⇒ no plugin flag in output"
+    );
     assert!(
         out.contains("add_library(cstd STATIC"),
         "lib target still emitted"
@@ -126,6 +150,7 @@ fn lib_and_bin_member_emits_both_targets() {
     // A single member with kind=LibAndBin produces one
     // add_library and one add_executable, and the bin links
     // against the (same-name) lib via workspace_link_deps.
+    let profile_root = PathBuf::from("/ws/target/debug");
     let view = WorkspaceView {
         cust_version: "0.4.2".to_string(),
         c_standard: "23".to_string(),
@@ -142,14 +167,22 @@ fn lib_and_bin_member_emits_both_targets() {
                 object_depends: vec![],
             }],
             archive_output_dir: PathBuf::from("/ws/target/debug/build/app"),
+            runtime_output_dir: profile_root,
             bin_include_dirs: vec![PathBuf::from("/ws/target/debug/build/app/include")],
             workspace_link_deps: vec!["app".to_string()],
+            lib_workspace_deps: vec![],
+            compile_options: vec!["-O0".to_string()],
+            bin_target_name: "app-bin".to_string(),
         }],
     };
     let out = generate(&view);
     assert!(out.contains("add_library(app STATIC"));
-    assert!(out.contains("add_executable(app"));
-    assert!(out.contains("target_link_libraries(app PRIVATE"));
+    assert!(
+        out.contains("add_executable(app-bin"),
+        "lib+bin uses -bin suffix to avoid CMake target name collision"
+    );
+    assert!(out.contains("OUTPUT_NAME app"));
+    assert!(out.contains("target_link_libraries(app-bin PRIVATE"));
 }
 
 // ─── Stamp (V42D-8 + RQ-V42-1) ──────────────────────────────────
