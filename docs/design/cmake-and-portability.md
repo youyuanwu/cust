@@ -1,6 +1,25 @@
 # CMake interop & compiler portability
 
-Status: **design sketch / brainstorm**, 2026‑06‑03
+Status: **⚠️ SUPERSEDED on the CMake-as-driver question** by
+[v0.4.2.md](v0.4.2.md) (2026‑06‑11). The "CMake is never a
+build‑time dependency of cust" rule in §1 / §2.2 / §2.3 / §5 is
+**reversed**: starting v0.4.2, cust generates a `CMakeLists.txt`
+into the build tree and shells out to CMake + Ninja as the
+codegen / link / dep‑tracking backend. See [v0.4.2.md](v0.4.2.md)
+for the reversal rationale, the headline counterarguments
+addressed (configure latency, two‑sources‑of‑truth risk,
+plugin/bitcode glue, diagnostics layering), and the new
+boundary between the Rust driver and the generated CMake.
+
+The rest of this doc — §3 (`cust export cmake` for *consumers*),
+§4 (GCC support is still a non‑goal), §5 rows 3–5, §6 open
+questions, §7 risks — stands unchanged. The export story and
+the multi‑compiler discussion were never coupled to the
+"CMake‑as‑driver: no" decision; only that one decision flipped.
+
+Original doc preserved below for the historical reasoning record.
+
+Status (original): **design sketch / brainstorm**, 2026‑06‑03
 Owner: TBD
 Companion to: [cust-design.md](cust-design.md)
 
