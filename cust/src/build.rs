@@ -91,10 +91,12 @@ pub struct BuildOutputs {
     /// `Some` when the crate has a lib component (`Lib` or
     /// `LibAndBin`); `None` for bin-only crates.
     pub archive: Option<PathBuf>,
-    /// `Some` when the crate has a bin component (`Bin` or
-    /// `LibAndBin`) and the build was not `syntax_only`; `None`
-    /// otherwise.
-    pub executable: Option<PathBuf>,
+    /// One `(bin-name, path)` per binary target the crate
+    /// produces (v0.4.4 V44D-8). Empty for lib-only crates and
+    /// for `syntax_only` builds. For a single-bin crate this has
+    /// exactly one entry. The CLI prints a `Finished` line per
+    /// entry and `cust run --bin` selects by name.
+    pub executables: Vec<(String, PathBuf)>,
     /// `Some` when `plan.test_build` was true and a test binary
     /// was produced (V32D-4 / V32D-5). The path is
     /// `target/<profile>/test/<crate>/<crate>`.
@@ -204,9 +206,13 @@ pub fn write_rewrite_tree(plan: &BuildPlan<'_>) -> Result<()> {
             write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, false)?;
         }
     }
-    if let Some(bin_src) = plan.kind.bin_source() {
-        let bin_modules =
-            modules::discover(plan.crate_root, bin_src).context("discovering bin module graph")?;
+    // v0.4.4 V44D-8: each `BinTarget` is its own root; discover +
+    // rewrite one module graph per bin (a bin may `#cust use
+    // crate::<mod>`). Two bins sharing a module rewrite it to the
+    // same path idempotently.
+    for bin in plan.kind.bins() {
+        let bin_modules = modules::discover(plan.crate_root, &bin.source)
+            .with_context(|| format!("discovering bin `{}` module graph", bin.name))?;
         for m in &bin_modules {
             write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, true)?;
         }
@@ -387,14 +393,17 @@ pub fn cmake_outputs_for(plan: &BuildPlan<'_>, layout: &TargetLayout) -> BuildOu
             .build_dir(crate_name)
             .join(format!("lib{crate_name}.a"))
     });
-    let executable = plan
+    // v0.4.4 V44D-8: one exe per bin at `target/<profile>/<name>`.
+    let executables = plan
         .kind
-        .has_bin()
-        .then(|| layout.profile_root.join(crate_name));
+        .bins()
+        .iter()
+        .map(|b| (b.name.clone(), layout.profile_root.join(&b.name)))
+        .collect();
     BuildOutputs {
         objects: Vec::new(),
         archive,
-        executable,
+        executables,
         test_executable: None,
         integration_tests: Vec::new(),
         compile_commands: layout.target_root.join("compile_commands.json"),

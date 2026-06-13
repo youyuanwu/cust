@@ -1920,3 +1920,114 @@ fn test_build_excludes_cust_test_symbols_from_normal_archive() {
         );
     }
 }
+
+// ─── v0.4.4 multi-bin (src/bin/*.c, [[bin]] arrays) ─────────────
+
+#[test]
+fn multibin_build_produces_all_executables() {
+    // V44D-1/V44D-5: `src/main.c` (package bin `multibin`) +
+    // `src/bin/extra.c` (extra bin `extra`) both build from one
+    // `cust build`, landing at target/debug/{multibin,extra}.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_bin");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+    assert!(
+        dir.join("target/debug/multibin").is_file(),
+        "missing package bin"
+    );
+    assert!(
+        dir.join("target/debug/extra").is_file(),
+        "missing extra bin"
+    );
+    // The lib half is still published as an archive.
+    assert!(dir
+        .join("target/debug/build/multibin/libmultibin.a")
+        .is_file());
+}
+
+#[test]
+fn multibin_run_without_bin_is_ambiguous() {
+    // V44D-6: a member with >1 bin and no `--bin` errors with the
+    // Cargo-shape "could not determine which binary to run".
+    let (_tmp, dir) = stage("multi_bin");
+    let out = cust(&dir, ["run"]);
+    assert_failure_with(&out, "could not determine which binary to run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Both bin names are listed, sorted.
+    assert!(
+        stderr.contains("`extra`") && stderr.contains("`multibin`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn multibin_run_bin_selects_executable() {
+    // V44D-6: `cust run --bin <name>` runs the right exe.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_bin");
+    let out = cust(&dir, ["run", "--bin", "extra"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("extra: answer = 42"), "{stdout}");
+    assert!(!stdout.contains("main: answer"), "ran wrong bin:\n{stdout}");
+}
+
+#[test]
+fn multibin_run_unknown_bin_is_error() {
+    // V44D-6: an unknown `--bin` lists the available names.
+    let (_tmp, dir) = stage("multi_bin");
+    let out = cust(&dir, ["run", "--bin", "nope"]);
+    assert_failure_with(&out, "no binary named `nope`");
+}
+
+#[test]
+fn multibin_build_bin_scopes_to_one() {
+    // V44D-7: `cust build --bin extra` builds only that target.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_bin");
+    let out = cust(&dir, ["build", "--bin", "extra"]);
+    assert_success(&out);
+    assert!(dir.join("target/debug/extra").is_file());
+    // The Finished line reports only the scoped bin.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("extra"), "{stdout}");
+    assert!(
+        !stdout.contains("-> ") || !stdout.contains("multibin\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn multibin_src_bin_subdirs_ignored() {
+    // V44D-1 no-recursion / V44D-2 deferral: a `src/bin/sub/`
+    // directory produces no bin and no error.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_bin");
+    let sub = dir.join("src/bin/sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("nested.c"),
+        "[[cust::pub]] int cust_main(void){return 0;}\n",
+    )
+    .unwrap();
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+    // No `nested` exe emitted.
+    assert!(
+        !dir.join("target/debug/nested").exists(),
+        "subdir bin leaked"
+    );
+}

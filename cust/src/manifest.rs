@@ -11,9 +11,13 @@
 //! deps only); see `validate_v0_3` below for the exact rules.
 //!
 //! v0.3.1 ([docs/design/v0.3.1.md]) adds `[[bin]]` (single-entry in
-//! v0.3.1; multi-bin via `src/bin/*.c` and `[[bin]]` arrays is
-//! v0.4+) and `Manifest::resolve_kind` for filesystem-driven crate
+//! v0.3.1) and `Manifest::resolve_kind` for filesystem-driven crate
 //! kind inference (lib / bin / lib+bin).
+//!
+//! v0.4.4 ([docs/design/v0.4.4.md]) lifts the single-entry cap:
+//! `[[bin]]` is a real multi-bin array, and `src/bin/*.c` files are
+//! auto-discovered. `resolve_kind` delegates the bin-set union to
+//! `resolve_bins` (V44D-1/V44D-3/V44D-4).
 //!
 //! See `docs/design/cust-design.md` §3 and §17 for the canonical
 //! schema and current scope.
@@ -45,9 +49,9 @@ pub struct Manifest {
     #[serde(default)]
     pub lib: Option<Lib>,
 
-    /// v0.3.1: `[[bin]]` array. Accepted as an array shape for
-    /// forward-compat with the multi-bin v0.4 schema, but
-    /// `validate` rejects `len > 1` in v0.3.1 (V31D-3).
+    /// v0.4.4: `[[bin]]` array. A multi-entry array is now
+    /// accepted (V44D-4); name/path resolution + collision checks
+    /// happen in `resolve_kind` → `resolve_bins` (filesystem-aware).
     #[serde(default)]
     pub bin: Vec<Bin>,
 
@@ -147,15 +151,25 @@ pub struct Lib {
     pub crate_type: Option<Vec<String>>,
 }
 
-/// `[[bin]]` table entry. v0.3.1 accepts a single entry only;
-/// multi-bin via `src/bin/*.c` and the multi-entry `[[bin]]`
-/// array is deferred to v0.4 (V31D-3 in v0.3.1.md).
+/// `[[bin]]` table entry. v0.4.4 ([docs/design/v0.4.4.md])
+/// relaxes the v0.3.1 single-entry cap into a real multi-bin
+/// array. Each entry carries an optional `name` (required once
+/// there are ≥2 entries; defaults to the package name for a
+/// single entry — v0.3.1 back-compat) and an optional `path`
+/// (defaults to `src/bin/<name>.c`, or `src/main.c` for the
+/// package-named entry).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bin {
-    /// Defaults to `src/main.c` when omitted.
+    /// Bin target name. v0.4.4 V44D-4: required when the manifest
+    /// has ≥2 `[[bin]]` entries; for a single entry it defaults to
+    /// the package name (exact v0.3.1 shape).
     #[serde(default)]
-    #[allow(dead_code)] // consumed by Slice B via resolve_kind
+    pub name: Option<String>,
+
+    /// Defaults to `src/bin/<name>.c` (or `src/main.c` for the
+    /// package-named entry) when omitted.
+    #[serde(default)]
     pub path: Option<PathBuf>,
 }
 
@@ -404,26 +418,11 @@ impl Manifest {
         }
 
         // [[bin]] settings only apply when the manifest is a
-        // package; v0.3.1 also caps the array at length 1
-        // (V31D-3 in v0.3.1.md).
-        if !self.bin.is_empty() {
-            if self.package.is_none() {
-                bail!(
-                    "`{}` has [[bin]] but no [package]; [[bin]] only \
-                     makes sense in a buildable crate",
-                    path.display()
-                );
-            }
-            if self.bin.len() > 1 {
-                bail!(
-                    "`{}` has {} [[bin]] entries; cust v0.3.1 supports \
-                     exactly one binary target per crate \
-                     (multi-bin via `src/bin/*.c` is v0.4+)",
-                    path.display(),
-                    self.bin.len()
-                );
-            }
-        }
+        // package. v0.4.4 (V44D-4) lifts the v0.3.1 single-entry
+        // cap; name/path resolution + collision detection move to
+        // `resolve_bins`. Schema-level checks live in
+        // `validate_bin_array`.
+        self.validate_bin_array(path)?;
 
         // Package name sanity.
         if let Some(pkg) = &self.package {
@@ -487,6 +486,35 @@ impl Manifest {
         Ok(())
     }
 
+    /// Schema-level `[[bin]]` checks (v0.4.4 V44D-4). Name/path
+    /// resolution and filesystem-dependent collision detection
+    /// live in `resolve_bins`; this only rejects shapes that are
+    /// invalid regardless of disk state.
+    fn validate_bin_array(&self, path: &Path) -> Result<()> {
+        if self.bin.is_empty() {
+            return Ok(());
+        }
+        if self.package.is_none() {
+            bail!(
+                "`{}` has [[bin]] but no [package]; [[bin]] only \
+                 makes sense in a buildable crate",
+                path.display()
+            );
+        }
+        // A multi-entry array requires an explicit `name` on every
+        // entry (only a single entry may default to the package name).
+        if self.bin.len() > 1 && self.bin.iter().any(|b| b.name.is_none()) {
+            bail!(
+                "`{}` has {} [[bin]] entries; each needs an explicit \
+                 `name` (only a single `[[bin]]` may omit it, defaulting \
+                 to the package name)",
+                path.display(),
+                self.bin.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Resolved path to the lib's root TU when this crate has
     /// a library component. Honours `[lib] path` override.
     /// Returns `crate_root.join("src/lib.c")` by default.
@@ -508,43 +536,41 @@ impl Manifest {
     }
 
     /// Resolve which artifact(s) this crate produces based on
-    /// the manifest plus the on-disk presence of `src/lib.c` and
-    /// `src/main.c`. See [docs/design/v0.3.1.md](../../../docs/design/v0.3.1.md)
-    /// V31D-1 for the full decision table.
+    /// the manifest plus the on-disk presence of `src/lib.c`,
+    /// `src/main.c`, and `src/bin/*.c`. See
+    /// [docs/design/v0.3.1.md](../../../docs/design/v0.3.1.md)
+    /// V31D-1 for the lib/bin decision table and
+    /// [docs/design/v0.4.4.md](../../../docs/design/v0.4.4.md)
+    /// V44D-1/V44D-3/V44D-4 for the multi-bin discovery rules
+    /// (delegated to `resolve_bins`).
     ///
-    /// Auto-inference rules:
+    /// Auto-inference rules (lib half):
     ///
-    /// | `src/lib.c` | `src/main.c` | `[lib]` | `[[bin]]` | Result |
-    /// |---|---|---|---|---|
-    /// | present | absent  | any | absent | lib-only |
-    /// | absent  | present | absent | absent | bin-only |
-    /// | present | present | any | absent | lib+bin |
-    /// | any | any | any | present | path determined by `[[bin]] path` |
-    /// | absent  | absent  | absent | absent | error |
+    /// | `src/lib.c` | `[lib]` | Result |
+    /// |---|---|---|
+    /// | present | absent | lib present |
+    /// | absent  | present | error (lib required, missing) |
+    /// | present | present | lib present |
+    ///
+    /// The bin half is the union of `src/main.c`, `src/bin/*.c`,
+    /// and `[[bin]]` entries (see `resolve_bins`). A crate with
+    /// neither a lib half nor any bin is an error.
     ///
     /// An explicit `[lib]` or `[[bin]]` table makes the
     /// corresponding component *required*: a missing file at the
     /// declared (or default) path is an error rather than a
     /// silent omission.
-    #[allow(dead_code)] // consumed by Slice B (build pipeline kind dispatch)
+    #[allow(dead_code)] // consumed by Slice B/C
     pub fn resolve_kind(&self, crate_root: &Path) -> Result<CrateKind> {
         let lib_default = Path::new("src/lib.c");
-        let bin_default = Path::new("src/main.c");
-
         let lib_rel = self.lib.as_ref().and_then(|l| l.path.as_deref());
-        let bin_rel = self.bin.first().and_then(|b| b.path.as_deref());
-
         let lib_path = crate_root.join(lib_rel.unwrap_or(lib_default));
-        let bin_path = crate_root.join(bin_rel.unwrap_or(bin_default));
 
         // Presence of the table itself (not just an explicit
         // `path` field) is the "user wants this component" signal
-        // — mirrors how Cargo treats an empty `[lib]` / `[[bin]]`.
+        // — mirrors how Cargo treats an empty `[lib]`.
         let lib_explicit = self.lib.is_some();
-        let bin_explicit = !self.bin.is_empty();
-
         let lib_exists = lib_path.is_file();
-        let bin_exists = bin_path.is_file();
 
         if lib_explicit && !lib_exists {
             bail!(
@@ -552,28 +578,24 @@ impl Manifest {
                 lib_path.display()
             );
         }
-        if bin_explicit && !bin_exists {
-            bail!(
-                "binary source `{}` not found (configured via `[[bin]]` in `Cust.toml`)",
-                bin_path.display()
-            );
-        }
-
         let use_lib = lib_explicit || lib_exists;
-        let use_bin = bin_explicit || bin_exists;
 
-        match (use_lib, use_bin) {
-            (true, true) => Ok(CrateKind::LibAndBin {
+        // v0.4.4 V44D-8: the bin half is now a `Vec<BinTarget>`,
+        // built from the `src/main.c` ∪ `src/bin/*.c` ∪ `[[bin]]`
+        // union with V44D-3 validity + collision checks and
+        // V44D-4 override resolution.
+        let bins = self.resolve_bins(crate_root)?;
+
+        match (use_lib, bins.is_empty()) {
+            (true, false) => Ok(CrateKind::LibAndBin {
                 lib_source: lib_path,
-                bin_source: bin_path,
+                bins,
             }),
-            (true, false) => Ok(CrateKind::Lib {
+            (true, true) => Ok(CrateKind::Lib {
                 lib_source: lib_path,
             }),
-            (false, true) => Ok(CrateKind::Bin {
-                bin_source: bin_path,
-            }),
-            (false, false) => bail!(
+            (false, false) => Ok(CrateKind::Bin { bins }),
+            (false, true) => bail!(
                 "no library or binary source found in `{}`: neither \
                  `src/lib.c` (lib) nor `src/main.c` (bin) is present \
                  — add one, or set `[lib].path` / `[[bin]].path` in \
@@ -582,23 +604,126 @@ impl Manifest {
             ),
         }
     }
+
+    /// Resolve the member's set of binary targets (v0.4.4 V44D-1 /
+    /// V44D-3 / V44D-4). The bin set is the union of:
+    ///
+    /// 1. each explicit `[[bin]]` entry,
+    /// 2. the package bin `src/main.c` (named after the package),
+    /// 3. one bin per `src/bin/<stem>.c` (top level only).
+    ///
+    /// with these rules:
+    ///
+    /// * Explicit `[[bin]]` names are required when ≥2 entries
+    ///   exist (checked in `validate`); a single entry defaults to
+    ///   the package name (v0.3.1 back-compat).
+    /// * An explicit entry with a `path` *overrides* the
+    ///   auto-discovered `src/bin/<name>.c` of the same name; with
+    ///   no `path` it *collides* (redundant declaration → error).
+    /// * `src/bin/<pkg>.c` alongside `src/main.c` is a shadow error.
+    /// * Duplicate names (two `[[bin]]` with the same `name`) error.
+    /// * Non-package bin names must match `[A-Za-z][A-Za-z0-9_-]*`.
+    ///
+    /// Returns the bins sorted by name (deterministic `CMake`
+    /// emission, V42D-4). Empty when the crate has no bin at all.
+    fn resolve_bins(&self, crate_root: &Path) -> Result<Vec<BinTarget>> {
+        use std::collections::BTreeMap;
+
+        let pkg_name = self.package.as_ref().map(|p| p.name.as_str());
+        let main_path = crate_root.join("src/main.c");
+        let main_exists = main_path.is_file();
+
+        // name -> resolved source.
+        let mut result: BTreeMap<String, PathBuf> = BTreeMap::new();
+        // names claimed by an explicit `[[bin]]` entry, and whether
+        // that entry supplied an explicit `path` (override) or not.
+        let mut claimed: BTreeMap<String, bool> = BTreeMap::new();
+
+        // Phase 1: explicit `[[bin]]` entries.
+        for entry in &self.bin {
+            let name = match &entry.name {
+                Some(n) => n.clone(),
+                None => pkg_name
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`[[bin]]` without a `name` needs a `[package]` to \
+                             default the name from"
+                        )
+                    })?
+                    .to_string(),
+            };
+            if pkg_name != Some(name.as_str()) {
+                validate_bin_name(&name)?;
+            }
+            if claimed.contains_key(&name) {
+                bail!(
+                    "package `{}` defines binary `{name}` more than once \
+                     (duplicate `[[bin]]` entries); rename one",
+                    pkg_name.unwrap_or("<unknown>")
+                );
+            }
+            let has_explicit_path = entry.path.is_some();
+            let source = match &entry.path {
+                Some(p) => crate_root.join(p),
+                None if pkg_name == Some(name.as_str()) => main_path.clone(),
+                None => crate_root.join(format!("src/bin/{name}.c")),
+            };
+            if !source.is_file() {
+                bail!(
+                    "binary source `{}` not found (configured via `[[bin]]` in `Cust.toml`)",
+                    source.display()
+                );
+            }
+            claimed.insert(name.clone(), has_explicit_path);
+            result.insert(name, source);
+        }
+
+        // Phase 2: auto package bin (`src/main.c`), unless an
+        // explicit `[[bin]]` entry already claims the package name.
+        if main_exists {
+            if let Some(pkg) = pkg_name {
+                if !claimed.contains_key(pkg) {
+                    result.insert(pkg.to_string(), main_path);
+                }
+            }
+        }
+
+        // Phase 3: auto `src/bin/*.c` (top level only, V44D-1).
+        scan_src_bin_dir(crate_root, pkg_name, main_exists, &claimed, &mut result)?;
+
+        Ok(result
+            .into_iter()
+            .map(|(name, source)| BinTarget { name, source })
+            .collect())
+    }
+}
+
+/// A single binary target: its name (used as the on-disk
+/// executable name and, for non-package bins, the
+/// `<crate>__bin__<name>` `CMake` target infix) and its root
+/// source TU. v0.4.4 V44D-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinTarget {
+    pub name: String,
+    pub source: PathBuf,
 }
 
 /// What a crate produces, after `Manifest::resolve_kind`
-/// consults the filesystem. v0.3.1's three shapes.
+/// consults the filesystem. The bin half is a `Vec<BinTarget>`
+/// (v0.4.4 V44D-8): a single-bin crate is just `bins.len() == 1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // variants constructed by Slice B onward
 pub enum CrateKind {
     /// Library only — produces `lib<name>.a` and a crate header.
     Lib { lib_source: PathBuf },
-    /// Binary only — produces an executable; no archive published
-    /// for downstream consumption.
-    Bin { bin_source: PathBuf },
-    /// Both — lib built first, bin links against it. Crate
+    /// Binary only — produces one or more executables; no archive
+    /// published for downstream consumption.
+    Bin { bins: Vec<BinTarget> },
+    /// Both — lib built first, each bin links against it. Crate
     /// header is still published by the lib half.
     LibAndBin {
         lib_source: PathBuf,
-        bin_source: PathBuf,
+        bins: Vec<BinTarget>,
     },
 }
 
@@ -626,14 +751,116 @@ impl CrateKind {
         }
     }
 
-    /// Binary source path, if any.
+    /// All binary targets (empty for `Lib`). Sorted by name
+    /// (V44D-8 — `resolve_bins` emits them sorted).
     #[allow(dead_code)] // consumed by Slice B/C
-    pub fn bin_source(&self) -> Option<&Path> {
+    pub fn bins(&self) -> &[BinTarget] {
         match self {
-            Self::Bin { bin_source } | Self::LibAndBin { bin_source, .. } => Some(bin_source),
-            Self::Lib { .. } => None,
+            Self::Bin { bins } | Self::LibAndBin { bins, .. } => bins,
+            Self::Lib { .. } => &[],
         }
     }
+
+    /// First binary source path, if any. Transitional helper for
+    /// slice-A consumers that still assume a single bin; slices
+    /// B/C migrate them to `bins()`. For a single-bin crate this
+    /// is the only bin, so behaviour is identical to v0.3.1.
+    #[allow(dead_code)] // consumed by Slice B/C
+    pub fn bin_source(&self) -> Option<&Path> {
+        self.bins().first().map(|b| b.source.as_path())
+    }
+}
+
+/// Phase 3 of `Manifest::resolve_bins`: walk `src/bin/*.c` (top
+/// level only, V44D-1) and fold each into `result`. Applies the
+/// V44D-3 shadow + name-validity checks and the V44D-4
+/// override / collision rules against the already-`claimed`
+/// explicit `[[bin]]` names (`true` = entry supplied a `path`,
+/// i.e. an override; `false` = no `path`, i.e. a redundant
+/// collision). A missing `src/bin/` dir means no auto extra bins.
+fn scan_src_bin_dir(
+    crate_root: &Path,
+    pkg_name: Option<&str>,
+    main_exists: bool,
+    claimed: &std::collections::BTreeMap<String, bool>,
+    result: &mut std::collections::BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    let bin_dir = crate_root.join("src/bin");
+    let entries = match std::fs::read_dir(&bin_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading `{}`", bin_dir.display()))
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in `{}`", bin_dir.display()))?;
+        let path = entry.path();
+        // Top level only: directories (the V44D-2
+        // `src/bin/<name>/main.c` form) and non-regular files
+        // are skipped.
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("c") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename `{}`", path.display()))?
+            .to_string();
+
+        // `src/bin/<pkg>.c` next to `src/main.c` would produce two
+        // bins both named after the package (V44D-3 shadow error).
+        if Some(stem.as_str()) == pkg_name && main_exists {
+            bail!(
+                "package `{stem}` defines binary `{stem}` more than once \
+                 (src/main.c and src/bin/{stem}.c both map to the package \
+                 name); rename src/bin/{stem}.c"
+            );
+        }
+        validate_bin_name(&stem)?;
+
+        match claimed.get(&stem) {
+            // An explicit `[[bin]]` with a `path` overrode this
+            // name → the auto file is shadowed; skip it silently.
+            Some(true) => {}
+            // A no-`path` `[[bin]]` named this bin → redundant with
+            // the auto file (V44D-4 collision).
+            Some(false) => bail!(
+                "package `{}` defines binary `{stem}` more than once \
+                 (src/bin/{stem}.c and a `[[bin]]` entry); give the \
+                 `[[bin]]` entry a `path` to override, or rename one",
+                pkg_name.unwrap_or("<unknown>")
+            ),
+            None => {
+                result.insert(stem, path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v0.4.4 V44D-3: a non-package binary name must match
+/// `[A-Za-z][A-Za-z0-9_-]*` so it's safe as a `CMake` target
+/// infix (`<crate>__bin__<name>`) and an on-disk filename.
+/// Reuses the v0.4.3 V43D-8 integration-test stem rule; stricter
+/// than `validate_package_name` (which also permits a leading
+/// digit / `_` / `-`). The package bin itself is named after the
+/// package and uses the unsuffixed target name, so it's exempt.
+fn validate_bin_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        bail!(
+            "binary name `{name}` must match [A-Za-z][A-Za-z0-9_-]* \
+             (used as the CMake target name + on-disk filename)"
+        );
+    }
+    Ok(())
 }
 
 /// Validate one `[dependencies]` entry's shape. Accepted v0.3
@@ -733,7 +960,7 @@ pub fn validate_package_name(name: &str) -> std::result::Result<(), &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_dep_spec, validate_package_name, CrateKind, Manifest};
+    use super::{validate_dep_spec, validate_package_name, BinTarget, CrateKind, Manifest};
 
     #[test]
     fn accepts_typical_names() {
@@ -1043,14 +1270,159 @@ members = ["a", "a"]
     }
 
     #[test]
-    fn multiple_bin_entries_rejected_in_v0_3_1() {
-        let manifest = format!("{PKG_TOML}[[bin]]\n[[bin]]\npath = \"src/other.c\"\n");
+    fn multiple_bin_entries_now_accepted() {
+        // v0.4.4 V44D-4: the v0.3.1 single-entry cap is lifted.
+        let manifest = format!(
+            "{PKG_TOML}[[bin]]\nname = \"a\"\npath = \"src/a.c\"\n\
+             [[bin]]\nname = \"b\"\npath = \"src/b.c\"\n"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("Cust.toml"), &manifest).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.c"), "int main(void){return 0;}\n").unwrap();
+        std::fs::write(root.join("src/b.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        let bins = kind.bins();
+        assert_eq!(bins.len(), 2, "{kind:?}");
+        // Sorted by name.
+        assert_eq!(bins[0].name, "a");
+        assert_eq!(bins[0].source, root.join("src/a.c"));
+        assert_eq!(bins[1].name, "b");
+        assert_eq!(bins[1].source, root.join("src/b.c"));
+    }
+
+    #[test]
+    fn multiple_bin_entries_without_name_rejected() {
+        // ≥2 entries each require an explicit `name` (validate()).
+        let manifest =
+            format!("{PKG_TOML}[[bin]]\npath = \"src/a.c\"\n[[bin]]\npath = \"src/b.c\"\n");
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("Cust.toml");
         std::fs::write(&path, &manifest).unwrap();
         let e = format!("{:#}", Manifest::load(&path).unwrap_err());
-        assert!(e.contains("v0.3.1"), "{e}");
-        assert!(e.contains("multi-bin") || e.contains("v0.4+"), "{e}");
+        assert!(e.contains("explicit"), "{e}");
+        assert!(e.contains("name"), "{e}");
+    }
+
+    #[test]
+    fn src_bin_files_auto_discovered() {
+        // V44D-1: one bin per `src/bin/*.c`, plus the package bin
+        // from `src/main.c`; sorted by name; subdirs ignored.
+        let (tmp, root) = stage_crate(PKG_TOML, None, Some("int main(void){return 0;}\n"));
+        let bin_dir = root.join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("bench.c"), "int main(void){return 0;}\n").unwrap();
+        std::fs::write(bin_dir.join("dump.c"), "int main(void){return 0;}\n").unwrap();
+        // Non-.c ignored; subdir ignored (V44D-1 / V44D-2).
+        std::fs::write(bin_dir.join("README.md"), "x").unwrap();
+        std::fs::create_dir_all(bin_dir.join("sub")).unwrap();
+        std::fs::write(bin_dir.join("sub/nested.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        let names: Vec<&str> = kind.bins().iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["bench", "demo", "dump"], "{kind:?}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn src_bin_without_main_is_bins_only() {
+        // No `src/main.c`: `src/bin/*.c` produce bins, no package bin.
+        let (tmp, root) = stage_crate(PKG_TOML, Some("int x;\n"), None);
+        let bin_dir = root.join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("tool.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        assert!(matches!(kind, CrateKind::LibAndBin { .. }), "{kind:?}");
+        let names: Vec<&str> = kind.bins().iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["tool"], "{kind:?}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn src_bin_shadowing_package_bin_rejected() {
+        // V44D-3: `src/bin/<pkg>.c` next to `src/main.c` collides.
+        let (tmp, root) = stage_crate(PKG_TOML, None, Some("int main(void){return 0;}\n"));
+        let bin_dir = root.join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("demo.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let e = format!("{:#}", m.resolve_kind(&root).unwrap_err());
+        assert!(e.contains("more than once"), "{e}");
+        assert!(e.contains("demo"), "{e}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn bin_name_leading_digit_rejected() {
+        // V44D-3 / V43D-8 reuse: `[A-Za-z][A-Za-z0-9_-]*`.
+        let (tmp, root) = stage_crate(PKG_TOML, Some("int x;\n"), None);
+        let bin_dir = root.join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("9bad.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let e = format!("{:#}", m.resolve_kind(&root).unwrap_err());
+        assert!(e.contains("[A-Za-z]"), "{e}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn explicit_bin_path_overrides_auto_src_bin() {
+        // V44D-4: a `[[bin]]` with a `path` overrides the
+        // auto-discovered `src/bin/<name>.c`.
+        let manifest =
+            format!("{PKG_TOML}[[bin]]\nname = \"bench\"\npath = \"src/tools/bench.c\"\n");
+        let (tmp, root) = stage_crate(&manifest, Some("int x;\n"), None);
+        let bin_dir = root.join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("bench.c"), "int main(void){return 1;}\n").unwrap();
+        std::fs::create_dir_all(root.join("src/tools")).unwrap();
+        std::fs::write(
+            root.join("src/tools/bench.c"),
+            "int main(void){return 0;}\n",
+        )
+        .unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        let bench = kind.bins().iter().find(|b| b.name == "bench").unwrap();
+        assert_eq!(bench.source, root.join("src/tools/bench.c"), "{kind:?}");
+        assert_eq!(kind.bins().len(), 1, "{kind:?}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn explicit_bin_no_path_collides_with_auto_src_bin() {
+        // V44D-4: a no-`path` `[[bin]]` redundant with an
+        // auto-discovered `src/bin/<name>.c` is a collision.
+        let manifest = format!("{PKG_TOML}[[bin]]\nname = \"bench\"\n");
+        let (tmp, root) = stage_crate(&manifest, Some("int x;\n"), None);
+        let bin_dir = root.join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("bench.c"), "int main(void){return 0;}\n").unwrap();
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let e = format!("{:#}", m.resolve_kind(&root).unwrap_err());
+        assert!(e.contains("more than once"), "{e}");
+        assert!(e.contains("bench"), "{e}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn single_bin_unchanged_shape() {
+        // v0.3.1 back-compat: bare `src/main.c` ⇒ one bin named
+        // after the package, identical to the old single-bin path.
+        let (_tmp, root) = stage_crate(PKG_TOML, None, Some("int main(void){return 0;}\n"));
+        let m = Manifest::load(&root.join("Cust.toml")).unwrap();
+        let kind = m.resolve_kind(&root).unwrap();
+        assert_eq!(
+            kind.bins(),
+            &[BinTarget {
+                name: "demo".to_string(),
+                source: root.join("src/main.c"),
+            }],
+            "{kind:?}"
+        );
     }
 
     #[test]
@@ -1092,13 +1464,16 @@ members = ["a", "a"]
 
     #[test]
     fn bin_with_unknown_subkey_rejected() {
-        // [[bin]] currently only accepts `path`; `name` is
-        // derived from the package name in v0.3.1.
-        let manifest = format!("{PKG_TOML}[[bin]]\nname = \"override\"\n");
+        // [[bin]] accepts `name` + `path` only (V44D-4); any other
+        // subkey is rejected by strict-mode deny_unknown_fields.
+        let manifest = format!("{PKG_TOML}[[bin]]\nrequired-features = [\"x\"]\n");
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("Cust.toml");
         std::fs::write(&path, &manifest).unwrap();
         let e = format!("{:#}", Manifest::load(&path).unwrap_err());
-        assert!(e.contains("unknown field") || e.contains("name"), "{e}");
+        assert!(
+            e.contains("unknown field") || e.contains("required-features"),
+            "{e}"
+        );
     }
 }

@@ -598,6 +598,11 @@ pub struct WorkspaceBuildOptions<'a> {
     /// `None` builds every member. Used by `cust build -p <member>`
     /// (Slice E).
     pub only: Option<&'a str>,
+    /// v0.4.4 V44D-7: if `Some(bin)`, scope the build to the single
+    /// binary named `bin` (its `CMake` target + transitive lib deps).
+    /// Resolved against `only`'s member. `None` builds all bins.
+    /// Ignored in `test_build` / `syntax_only` modes.
+    pub bin: Option<&'a str>,
     /// V42D-13 / v0.4.3 roadmap: maximum parallel build jobs.
     /// Lowered to `cmake --build -j <N>`. `None` lets `Ninja`
     /// pick (`nproc`). Ignored in `syntax_only` mode — the
@@ -709,6 +714,7 @@ pub fn build_workspace(
         opts.plugin,
         &crate::cmake_emit::DriveOptions {
             only: opts.only,
+            bin: opts.bin,
             jobs: opts.jobs,
             test_build: false,
         },
@@ -751,7 +757,7 @@ fn run_check_path(
                 BuildOutputs {
                     objects: Vec::new(),
                     archive: None,
-                    executable: None,
+                    executables: Vec::new(),
                     test_executable: None,
                     integration_tests: Vec::new(),
                     compile_commands: layout.target_root.join("compile_commands.json"),
@@ -826,6 +832,7 @@ fn run_test_build_path(
         opts.plugin,
         &crate::cmake_emit::DriveOptions {
             only: opts.only,
+            bin: None,
             jobs: opts.jobs,
             test_build: true,
         },

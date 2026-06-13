@@ -106,5 +106,5 @@
  * the driver. Useful for downstream `static_assert`s once we expose
  * a real version macro. */
 [[cust::pub]] u32 cstd_version(void) {
-    return (0u << 16) | (4u << 8) | 3u; /* 0.4.3 */
+    return (0u << 16) | (4u << 8) | 4u; /* 0.4.4 */
 }

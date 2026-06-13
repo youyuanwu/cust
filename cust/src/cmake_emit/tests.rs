@@ -69,14 +69,13 @@ fn cwork_view() -> WorkspaceView {
                         )],
                     },
                 ],
-                bin_sources: vec![],
+                bins: vec![],
                 archive_output_dir: cstd_archive,
                 runtime_output_dir: profile_root.clone(),
                 bin_include_dirs: vec![],
                 workspace_link_deps: vec![],
                 lib_workspace_deps: vec![],
                 compile_options: compile_options.clone(),
-                bin_target_name: "cstd".to_string(),
                 test_target: None,
                 // v0.4.3 V43D-5: two integration tests
                 // (alphabetical-by-stem, V43D-1) exercising the
@@ -134,12 +133,16 @@ fn cwork_view() -> WorkspaceView {
                 name: "hello-cstd".to_string(),
                 kind: MemberKind::BinOnly,
                 lib_sources: vec![],
-                bin_sources: vec![SourceFile {
-                    path: PathBuf::from("/ws/target/debug/.rewrite/hello-cstd/src/main.c"),
-                    object_depends: vec![
-                        PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"),
-                        PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"),
-                    ],
+                bins: vec![BinView {
+                    target_name: "hello-cstd".to_string(),
+                    output_name: "hello-cstd".to_string(),
+                    sources: vec![SourceFile {
+                        path: PathBuf::from("/ws/target/debug/.rewrite/hello-cstd/src/main.c"),
+                        object_depends: vec![
+                            PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"),
+                            PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"),
+                        ],
+                    }],
                 }],
                 archive_output_dir: PathBuf::from("/ws/target/debug/build/hello-cstd"),
                 runtime_output_dir: profile_root,
@@ -147,7 +150,6 @@ fn cwork_view() -> WorkspaceView {
                 workspace_link_deps: vec!["cstd".to_string()],
                 lib_workspace_deps: vec![],
                 compile_options,
-                bin_target_name: "hello-cstd".to_string(),
                 test_target: None,
                 integration_tests: vec![],
             },
@@ -227,9 +229,13 @@ fn lib_and_bin_member_emits_both_targets() {
                 path: PathBuf::from("/ws/target/debug/.rewrite/app/src/lib.c"),
                 object_depends: vec![],
             }],
-            bin_sources: vec![SourceFile {
-                path: PathBuf::from("/ws/target/debug/.rewrite/app/src/main.c"),
-                object_depends: vec![],
+            bins: vec![BinView {
+                target_name: "app-bin".to_string(),
+                output_name: "app".to_string(),
+                sources: vec![SourceFile {
+                    path: PathBuf::from("/ws/target/debug/.rewrite/app/src/main.c"),
+                    object_depends: vec![],
+                }],
             }],
             archive_output_dir: PathBuf::from("/ws/target/debug/build/app"),
             runtime_output_dir: profile_root,
@@ -237,7 +243,6 @@ fn lib_and_bin_member_emits_both_targets() {
             workspace_link_deps: vec!["app".to_string()],
             lib_workspace_deps: vec![],
             compile_options: vec!["-O0".to_string()],
-            bin_target_name: "app-bin".to_string(),
             test_target: None,
             integration_tests: vec![],
         }],

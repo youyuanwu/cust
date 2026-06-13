@@ -62,6 +62,10 @@ pub struct BuildArgs {
     /// member is built.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
+    /// Build only the named binary (v0.4.4 V44D-7). Without `-p`,
+    /// the bin name must be unique across the workspace.
+    #[arg(long = "bin")]
+    pub bin: Option<String>,
     /// Maximum number of parallel build jobs (v0.4.2 V42D-13 +
     /// roadmap v0.4.3). Lowered to `cmake --build -j <N>` so
     /// Ninja owns intra-crate and inter-crate parallelism in
@@ -101,6 +105,11 @@ pub struct RunArgs {
     /// than one bin member exists.
     #[arg(short = 'p', long = "package")]
     pub package: Option<String>,
+    /// Select which binary to run (v0.4.4 V44D-6). Required when
+    /// the selected member has more than one bin. Without `-p`,
+    /// the bin name must be unique across the workspace.
+    #[arg(long = "bin")]
+    pub bin: Option<String>,
     /// Build parallelism. See `cust build --jobs`.
     #[arg(short = 'j', long = "jobs")]
     pub jobs: Option<u32>,
@@ -166,6 +175,7 @@ impl Cli {
             Cmd::Build(args) => run_build(
                 profile_kind(args.release),
                 args.package.as_deref(),
+                args.bin.as_deref(),
                 resolve_jobs(args.jobs)?,
                 no_plugin,
             ),
@@ -177,6 +187,7 @@ impl Cli {
             Cmd::Run(args) => run_run(
                 profile_kind(args.release),
                 args.package.as_deref(),
+                args.bin.as_deref(),
                 resolve_jobs(args.jobs)?,
                 &args.forwarded,
                 no_plugin,
@@ -308,6 +319,7 @@ fn resolve_plugin(no_plugin: bool, subcommand: &str) -> Result<Option<crate::plu
 fn run_build(
     profile_kind: ProfileKind,
     package: Option<&str>,
+    bin: Option<&str>,
     jobs: Option<u32>,
     no_plugin: bool,
 ) -> Result<()> {
@@ -316,13 +328,22 @@ fn run_build(
     let clang = Clang::discover()?;
     let plugin = resolve_plugin(no_plugin, "build")?;
 
+    // v0.4.4 V44D-7: `--bin <name>` resolves to its owning member
+    // (scoping the build to that one bin's target).
+    let bin_owner = match bin {
+        Some(name) => Some(resolve_bin_owner(&ws, package, name)?),
+        None => None,
+    };
+    let only = package.or(bin_owner.as_deref());
+
     let opts = WorkspaceBuildOptions {
         profile_kind,
         clang: &clang,
         plugin: plugin.as_ref(),
         syntax_only: false,
         test_build: false,
-        only: package,
+        only,
+        bin,
         jobs,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
@@ -332,13 +353,19 @@ fn run_build(
     }
     for (name, out) in &outputs.per_member {
         // v0.3.1: a member may produce an archive, an executable,
-        // or both. Print whatever was produced (in produce order).
+        // or both. v0.4.4: a member may produce multiple bins.
+        // Print whatever was produced (in produce order). When
+        // `--bin` scoped the build, report only that bin.
         let label = profile_kind.manifest_name();
-        if let Some(arch) = &out.archive {
-            println!("  Finished {name} [{label}] -> {}", arch.display());
+        if bin.is_none() {
+            if let Some(arch) = &out.archive {
+                println!("  Finished {name} [{label}] -> {}", arch.display());
+            }
         }
-        if let Some(exe) = &out.executable {
-            println!("  Finished {name} [{label}] -> {}", exe.display());
+        for (bin_name, exe) in &out.executables {
+            if bin.is_none_or(|b| b == bin_name) {
+                println!("  Finished {name} [{label}] -> {}", exe.display());
+            }
         }
     }
     Ok(())
@@ -357,6 +384,7 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
         syntax_only: true,
         test_build: false,
         only: package,
+        bin: None,
         // V42D-15: `cust check` bypasses CMake entirely — the
         // jobs field has no consumer here.
         jobs: None,
@@ -368,26 +396,69 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
     Ok(())
 }
 
-/// `cust run` — build the workspace, locate the requested bin
-/// member (or the only bin member when `-p` is omitted), then
-/// spawn it with anything after `--` forwarded as argv. Exits
-/// with the subprocess's exit code so shell scripts and CI
-/// behave the same as if the user had run the binary directly.
-fn run_run(
-    profile_kind: ProfileKind,
-    package: Option<&str>,
-    jobs: Option<u32>,
-    forwarded: &[String],
-    no_plugin: bool,
-) -> Result<()> {
-    let cwd = env::current_dir().context("getting current directory")?;
-    let ws = locate(&cwd)?;
+/// Format a list of names as `` `a`, `b`, `c` `` for error
+/// messages (v0.4.4 V44D-6).
+fn quoted_list(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
-    // Pick the target bin member.
-    //
-    // * `-p <name>`: must exist and be a bin (or lib+bin).
-    // * no `-p`: workspace must contain exactly one bin member.
-    let target_name = if let Some(name) = package {
+/// v0.4.4 V44D-6/V44D-7: resolve `--bin <name>` to its owning
+/// workspace member. When `package` is `Some`, the search is
+/// scoped to that member; otherwise every member is searched and
+/// a name owned by two members is an "ambiguous across packages"
+/// error.
+fn resolve_bin_owner(
+    ws: &workspace::Workspace,
+    package: Option<&str>,
+    bin: &str,
+) -> Result<String> {
+    let owners: Vec<&str> = ws
+        .members
+        .iter()
+        .filter(|m| package.is_none_or(|p| m.name == p))
+        .filter(|m| m.kind.bins().iter().any(|b| b.name == bin))
+        .map(|m| m.name.as_str())
+        .collect();
+    match owners.as_slice() {
+        [] => {
+            let all: Vec<&str> = ws
+                .members
+                .iter()
+                .flat_map(|m| m.kind.bins())
+                .map(|b| b.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "no binary named `{bin}` in the workspace — available \
+                 binaries are {}",
+                quoted_list(&all)
+            )
+        }
+        [one] => Ok((*one).to_string()),
+        many => anyhow::bail!(
+            "binary `{bin}` is ambiguous across packages {} — pass \
+             `-p <member>` to choose one",
+            quoted_list(many)
+        ),
+    }
+}
+
+/// v0.4.4 V44D-6: resolve `cust run`'s target to `(member, bin)`.
+///
+/// Member resolution: `-p <name>` (must be a bin member);
+/// `--bin <name>` without `-p` (the unique owner); otherwise the
+/// sole bin member. Then the bin within the member: `--bin <name>`
+/// (must exist); the sole bin; otherwise the V44D-6 ambiguity
+/// error.
+fn resolve_run_target(
+    ws: &workspace::Workspace,
+    package: Option<&str>,
+    bin: Option<&str>,
+) -> Result<(String, String)> {
+    let target_member = if let Some(name) = package {
         let m = ws.member(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "unknown workspace member `{name}` — known: [{}]",
@@ -405,6 +476,8 @@ fn run_run(
             );
         }
         name.to_string()
+    } else if let Some(bin_name) = bin {
+        resolve_bin_owner(ws, None, bin_name)?
     } else {
         let bins: Vec<&str> = ws
             .members
@@ -426,8 +499,55 @@ fn run_run(
         }
     };
 
-    // Build with -p scoping so we only build the target bin and
-    // its transitive deps.
+    let member = ws
+        .member(&target_member)
+        .expect("target member resolved above");
+    let bin_names: Vec<&str> = member.kind.bins().iter().map(|b| b.name.as_str()).collect();
+    let target_bin = if let Some(name) = bin {
+        if !bin_names.contains(&name) {
+            anyhow::bail!(
+                "no binary named `{name}` in package `{target_member}` — \
+                 available binaries are {}",
+                quoted_list(&bin_names)
+            );
+        }
+        name.to_string()
+    } else {
+        match bin_names.as_slice() {
+            [only] => (*only).to_string(),
+            // `has_bin` guaranteed above, so the empty case is
+            // unreachable; the >1 case is the V44D-6 ambiguity.
+            many => anyhow::bail!(
+                "could not determine which binary to run in package \
+                 `{target_member}`: available binaries are {}. Use \
+                 `--bin <NAME>` to select one.",
+                quoted_list(many)
+            ),
+        }
+    };
+    Ok((target_member, target_bin))
+}
+
+/// `cust run` — build the workspace, locate the requested bin
+/// member (or the only bin member when `-p` is omitted), then
+/// spawn it with anything after `--` forwarded as argv. Exits
+/// with the subprocess's exit code so shell scripts and CI
+/// behave the same as if the user had run the binary directly.
+fn run_run(
+    profile_kind: ProfileKind,
+    package: Option<&str>,
+    bin: Option<&str>,
+    jobs: Option<u32>,
+    forwarded: &[String],
+    no_plugin: bool,
+) -> Result<()> {
+    let cwd = env::current_dir().context("getting current directory")?;
+    let ws = locate(&cwd)?;
+
+    // Resolve the owning member + which bin to run (V44D-6).
+    let (target_member, target_bin) = resolve_run_target(&ws, package, bin)?;
+
+    // Build scoped to the resolved bin + its transitive deps.
     let clang = Clang::discover()?;
     let plugin = resolve_plugin(no_plugin, "run")?;
     let opts = WorkspaceBuildOptions {
@@ -436,7 +556,8 @@ fn run_run(
         plugin: plugin.as_ref(),
         syntax_only: false,
         test_build: false,
-        only: Some(&target_name),
+        only: Some(&target_member),
+        bin: Some(&target_bin),
         jobs,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
@@ -449,25 +570,32 @@ fn run_run(
         if let Some(arch) = &out.archive {
             println!("  Finished {name} [{label}] -> {}", arch.display());
         }
-        if let Some(exe) = &out.executable {
-            println!("  Finished {name} [{label}] -> {}", exe.display());
+        for (bin_name, exe) in &out.executables {
+            if bin_name == &target_bin {
+                println!("  Finished {name} [{label}] -> {}", exe.display());
+            }
         }
     }
 
-    // Locate the executable for the target member. build_workspace
-    // visits members in topo order, so the target bin is the last
-    // entry whose name matches.
+    // Locate the executable for the resolved bin. build_workspace
+    // visits members in topo order, so the target member is the
+    // last entry whose name matches.
     let exe = outputs
         .per_member
         .iter()
         .rev()
-        .find_map(|(name, out)| {
-            (name == &target_name)
-                .then_some(out.executable.as_deref())
-                .flatten()
+        .find(|(name, _)| name == &target_member)
+        .and_then(|(_, out)| {
+            out.executables
+                .iter()
+                .find(|(bin_name, _)| bin_name == &target_bin)
+                .map(|(_, exe)| exe.as_path())
         })
         .ok_or_else(|| {
-            anyhow::anyhow!("internal: `{target_name}` built but produced no executable")
+            anyhow::anyhow!(
+                "internal: bin `{target_bin}` of `{target_member}` built \
+                 but produced no executable"
+            )
         })?;
 
     println!("     Running {}", exe.display());
@@ -549,6 +677,7 @@ fn run_test(
         syntax_only: false,
         test_build: true,
         only: package,
+        bin: None,
         jobs,
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;

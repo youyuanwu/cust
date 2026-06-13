@@ -71,10 +71,8 @@ pub struct WorkspaceView {
     pub members: Vec<MemberView>,
 }
 
-/// One workspace member. Slice A emits at most two `CMake` targets
-/// per member: one library + one executable. Multi-bin (v0.4.4)
-/// will extend `bin_sources` from `Vec<SourceFile>` to a list of
-/// `(target_name, sources)` tuples; not in slice A scope.
+/// One workspace member. Emits one library target (if any) plus
+/// one executable per binary target (v0.4.4 multi-bin, V44D-5).
 #[derive(Debug, Clone)]
 pub struct MemberView {
     /// `[package].name`. Used verbatim as the `CMake` target name.
@@ -88,9 +86,13 @@ pub struct MemberView {
     /// crate::<mod>` edges (= the `<crate>.h` concatenation
     /// order; V42D-4). Empty when `kind` is `BinOnly`.
     pub lib_sources: Vec<SourceFile>,
-    /// Bin-half sources in the same topological order. Empty
-    /// when `kind` is `LibOnly`.
-    pub bin_sources: Vec<SourceFile>,
+    /// Binary targets (v0.4.4 V44D-8). One `add_executable` per
+    /// entry. Each carries its own `CMake` target name, on-disk
+    /// `OUTPUT_NAME`, and source list; the include dirs / link
+    /// deps / compile options / output dir below are **shared**
+    /// across every bin of the member (V44D-11: bins share the
+    /// member's config). Empty when `kind` is `LibOnly`.
+    pub bins: Vec<BinView>,
     /// Absolute path the lib archive is placed in via
     /// `ARCHIVE_OUTPUT_DIRECTORY`. Preserves the
     /// `target/<profile>/build/<crate>/` layout from v0.3+
@@ -106,11 +108,12 @@ pub struct MemberView {
     ///
     /// Order is preserved verbatim; the caller is responsible
     /// for determinism (V42D-4: callers pass topo-ordered lists).
+    /// Shared across every bin of the member.
     pub bin_include_dirs: Vec<PathBuf>,
     /// Names of other workspace members this member's bin half
     /// links against, in topological order. Lowered to
     /// `target_link_libraries(<bin> PRIVATE <dep>)` per V42D-13.
-    /// Empty for lib-only members.
+    /// Empty for lib-only members. Shared across every bin.
     pub workspace_link_deps: Vec<String>,
     /// Names of other workspace members this member's *library*
     /// half depends on, in topological order. Lowered to
@@ -134,20 +137,12 @@ pub struct MemberView {
     /// plugin `-fplugin=…` arg) in a `SHELL:` prefix at the
     /// caller to bypass `CMake`'s de-dup / re-order pass.
     pub compile_options: Vec<String>,
-    /// Absolute path the bin executable is placed in via
+    /// Absolute path every bin executable is placed in via
     /// `RUNTIME_OUTPUT_DIRECTORY`. Cargo-parity layout: bins
-    /// land at `target/<profile>/<crate>/` so `cust run` finds
-    /// them at the v0.3+ location. Ignored for lib-only members.
+    /// land at `target/<profile>/` so `cust run` finds them at
+    /// the v0.3+ location. Shared across every bin. Ignored for
+    /// lib-only members.
     pub runtime_output_dir: PathBuf,
-    /// `CMake` target name for the bin half. For pure-bin members
-    /// this equals `name`; for lib+bin it's suffixed `-bin` to
-    /// avoid the `add_executable cannot create target "<name>"
-    /// because another target with the same name already exists`
-    /// error (`CMake` target names are workspace-unique). The bin's
-    /// `OUTPUT_NAME` still emits the unsuffixed `name` so the on-
-    /// disk file is `<name>` either way — only the in-`CMake`
-    /// target identifier differs.
-    pub bin_target_name: String,
     /// V42D-14 test executable. `Some` whenever the member has
     /// a lib half (V32D-11 — `cust test` only tests library
     /// crates; lib+bin members test their library half only).
@@ -167,6 +162,22 @@ pub struct MemberView {
     /// so they get no integration targets — mirrors
     /// `test_target` being `None` for them).
     pub integration_tests: Vec<IntegrationTestView>,
+}
+
+/// v0.4.4 V44D-5: one binary target. A member emits one
+/// `add_executable` per `BinView`.
+#[derive(Debug, Clone)]
+pub struct BinView {
+    /// `CMake` target name (workspace-unique). For the package
+    /// bin this is `<crate>` (pure-bin) or `<crate>-bin`
+    /// (lib+bin); for an extra bin it's `<crate>__bin__<name>`.
+    pub target_name: String,
+    /// On-disk executable name via `OUTPUT_NAME`. `<crate>` for
+    /// the package bin, `<name>` for an extra bin.
+    pub output_name: String,
+    /// This bin's source TUs (its own module graph), in topo
+    /// order. Compiled into this exe only.
+    pub sources: Vec<SourceFile>,
 }
 
 /// V42D-14 per-member test executable description. Lowered to a
@@ -361,45 +372,53 @@ fn emit_library(out: &mut String, m: &MemberView) {
 }
 
 fn emit_executable(out: &mut String, m: &MemberView) {
-    out.push('\n');
-    let _ = writeln!(out, "# ---- crate: {} (binary) ----", m.name);
-    let _ = writeln!(out, "add_executable({}", m.bin_target_name);
-    for src in &m.bin_sources {
-        let _ = writeln!(out, "    \"{}\"", src.path.display());
-    }
-    out.push_str(")\n");
-    let _ = writeln!(
-        out,
-        "set_target_properties({} PROPERTIES",
-        m.bin_target_name
-    );
-    let _ = writeln!(
-        out,
-        "    RUNTIME_OUTPUT_DIRECTORY \"{}\"",
-        m.runtime_output_dir.display(),
-    );
-    let _ = writeln!(out, "    OUTPUT_NAME {}", m.name);
-    out.push_str(")\n");
-    emit_object_depends(out, &m.bin_sources);
-    if !m.bin_include_dirs.is_empty() {
+    for bin in &m.bins {
+        out.push('\n');
+        // Package bin keeps the v0.3.1 `(binary)` comment (golden
+        // byte-identical); extra bins are labelled by name.
+        if bin.output_name == m.name {
+            let _ = writeln!(out, "# ---- crate: {} (binary) ----", m.name);
+        } else {
+            let _ = writeln!(
+                out,
+                "# ---- crate: {} (binary: {}) ----",
+                m.name, bin.output_name
+            );
+        }
+        let _ = writeln!(out, "add_executable({}", bin.target_name);
+        for src in &bin.sources {
+            let _ = writeln!(out, "    \"{}\"", src.path.display());
+        }
+        out.push_str(")\n");
+        let _ = writeln!(out, "set_target_properties({} PROPERTIES", bin.target_name);
         let _ = writeln!(
             out,
-            "target_include_directories({} PRIVATE",
-            m.bin_target_name
+            "    RUNTIME_OUTPUT_DIRECTORY \"{}\"",
+            m.runtime_output_dir.display(),
         );
-        for dir in &m.bin_include_dirs {
-            let _ = writeln!(out, "    \"{}\"", dir.display());
-        }
+        let _ = writeln!(out, "    OUTPUT_NAME {}", bin.output_name);
         out.push_str(")\n");
-    }
-    if !m.workspace_link_deps.is_empty() {
-        let _ = writeln!(out, "target_link_libraries({} PRIVATE", m.bin_target_name);
-        for dep in &m.workspace_link_deps {
-            let _ = writeln!(out, "    {dep}");
+        emit_object_depends(out, &bin.sources);
+        if !m.bin_include_dirs.is_empty() {
+            let _ = writeln!(
+                out,
+                "target_include_directories({} PRIVATE",
+                bin.target_name
+            );
+            for dir in &m.bin_include_dirs {
+                let _ = writeln!(out, "    \"{}\"", dir.display());
+            }
+            out.push_str(")\n");
         }
-        out.push_str(")\n");
+        if !m.workspace_link_deps.is_empty() {
+            let _ = writeln!(out, "target_link_libraries({} PRIVATE", bin.target_name);
+            for dep in &m.workspace_link_deps {
+                let _ = writeln!(out, "    {dep}");
+            }
+            out.push_str(")\n");
+        }
+        emit_compile_options(out, &bin.target_name, &m.compile_options);
     }
-    emit_compile_options(out, &m.bin_target_name, &m.compile_options);
 }
 
 /// V42D-14: emit one test target per member that has tests,
@@ -861,6 +880,40 @@ use crate::{
 /// differs. The V42D-8 stamp is therefore stable across mode
 /// flips, and `CMake` doesn't reconfigure when toggling between
 /// build and test in the same workspace.
+///
+/// v0.4.4 V44D-5/V44D-8: build one `BinView` per `BinTarget` of a
+/// member. The package bin (name == member name) keeps the v0.3.1
+/// target name (`<crate>` pure-bin / `<crate>-bin` lib+bin); extra
+/// bins get `<crate>__bin__<name>`. The on-disk `OUTPUT_NAME` is
+/// always the bin name. Each bin's sources are its own rewritten
+/// module graph.
+fn collect_bin_views(
+    m: &crate::workspace::Member,
+    kind: MemberKind,
+    rewrite_root: &Path,
+    layout: &TargetLayout,
+) -> Result<Vec<BinView>> {
+    let mut bins: Vec<BinView> = Vec::with_capacity(m.kind.bins().len());
+    for bt in m.kind.bins() {
+        let sources = collect_sources(&m.root, &bt.source, &m.name, rewrite_root, layout)?;
+        let target_name = if bt.name == m.name {
+            if kind == MemberKind::LibAndBin {
+                format!("{}-bin", m.name)
+            } else {
+                m.name.clone()
+            }
+        } else {
+            format!("{}__bin__{}", m.name, bt.name)
+        };
+        bins.push(BinView {
+            target_name,
+            output_name: bt.name.clone(),
+            sources,
+        });
+    }
+    Ok(bins)
+}
+
 pub fn collect_view(
     ws: &Workspace,
     profile_kind: ProfileKind,
@@ -881,10 +934,8 @@ pub fn collect_view(
             Some(src) => collect_sources(&m.root, src, &m.name, &rewrite_root, &layout)?,
             None => Vec::new(),
         };
-        let bin_sources = match m.kind.bin_source() {
-            Some(src) => collect_sources(&m.root, src, &m.name, &rewrite_root, &layout)?,
-            None => Vec::new(),
-        };
+        // v0.4.4 V44D-5/V44D-8: one `BinView` per `BinTarget`.
+        let bins = collect_bin_views(m, kind, &rewrite_root, &layout)?;
 
         // Bin half include dirs: for a lib+bin member, the bin
         // needs the lib's own include dir for `#include "<crate>.h"`
@@ -912,14 +963,8 @@ pub fn collect_view(
             workspace_link_deps.insert(0, m.name.clone());
         }
 
-        // CMake target name for the bin half. Suffix `-bin` only
-        // when the member is lib+bin, so the pure-bin case
-        // (cwork hello-cstd) stays simple.
-        let bin_target_name = if kind == MemberKind::LibAndBin {
-            format!("{}-bin", m.name)
-        } else {
-            m.name.clone()
-        };
+        // CMake target names for the bins are computed above in the
+        // `BinView` loop (V44D-5).
 
         // Per-target compile options. Mirror what `build::build_cflags`
         // would produce for a non-test, non-syntax-only TU minus the
@@ -988,7 +1033,7 @@ pub fn collect_view(
             name: m.name.clone(),
             kind,
             lib_sources,
-            bin_sources,
+            bins,
             archive_output_dir: layout.build_dir(&m.name),
             runtime_output_dir: layout.profile_root.clone(),
             bin_include_dirs,
@@ -999,7 +1044,6 @@ pub fn collect_view(
                 Vec::new()
             },
             compile_options,
-            bin_target_name,
             test_target,
             integration_tests,
         });
@@ -1196,9 +1240,14 @@ pub fn emit_workspace_cmakelists(
 pub struct DriveOptions<'a> {
     /// `Some(name)` lowers to `cmake --build --target <name>`.
     /// `None` builds every default target. Slice B accepts a
-    /// single member name; v0.4.4 multi-bin will generalise to a
-    /// `Vec<String>`.
+    /// single member name; v0.4.4 multi-bin scopes further via
+    /// `bin`.
     pub only: Option<&'a str>,
+    /// v0.4.4 V44D-7: `Some(bin)` scopes the build to the single
+    /// binary named `bin` within `only`'s member — lowered to
+    /// `cmake --build --target <that-bin's-target>`. `None` builds
+    /// all of the member's (or workspace's) default targets.
+    pub bin: Option<&'a str>,
     /// `cmake --build -j <jobs>`. `None` lets `Ninja` pick (`Ninja`
     /// defaults to `nproc`). Slice D will plumb `--jobs` / env
     /// vars through here.
@@ -1296,7 +1345,15 @@ pub fn emit_and_drive_cmake(
     // Build.
     let mut cmd = Command::new(&cmake.path);
     cmd.arg("--build").arg(&build_dir);
-    if let Some(target) = opts.only {
+    if let Some(bin_name) = opts.bin {
+        // v0.4.4 V44D-7: `--bin <name>` scopes to the single bin's
+        // CMake target (CMake pulls its transitive lib deps).
+        // `opts.only` (if set) restricts the search to one member;
+        // the CLI has already validated existence + uniqueness.
+        let target = bin_target_name_for(&view, opts.only, bin_name)
+            .ok_or_else(|| anyhow::anyhow!("internal: no CMake target for bin `{bin_name}`"))?;
+        cmd.arg("--target").arg(target);
+    } else if let Some(target) = opts.only {
         // For lib+bin members the bin lives at a `-bin`-suffixed
         // CMake target name; the lib keeps the unsuffixed
         // member name. `-p <name>` builds both halves — or, in
@@ -1327,6 +1384,25 @@ pub fn emit_and_drive_cmake(
     Ok(())
 }
 
+/// v0.4.4 V44D-7: resolve `--bin <name>` to its `CMake` target
+/// name. Searches `member`'s bins (or every member when `member`
+/// is `None`) for the `BinView` whose `output_name` matches
+/// `bin_name`, returning the first match's `target_name`. The CLI
+/// validates existence + cross-member uniqueness before the build,
+/// so a single match is expected here.
+fn bin_target_name_for<'a>(
+    view: &'a WorkspaceView,
+    member: Option<&str>,
+    bin_name: &str,
+) -> Option<&'a str> {
+    view.members
+        .iter()
+        .filter(|m| member.is_none_or(|name| m.name == name))
+        .flat_map(|m| &m.bins)
+        .find(|b| b.output_name == bin_name)
+        .map(|b| b.target_name.as_str())
+}
+
 /// `CMake` target name(s) for a member, used when lowering
 /// `cust build -p <name>` to `cmake --build --target ...`.
 /// Returns `[lib]`, `[bin]`, or `[lib, bin]` for build mode;
@@ -1350,13 +1426,12 @@ fn target_names_for<'a>(
         out.extend(m.integration_tests.iter().map(|it| it.target_name.as_str()));
         return out;
     }
-    let mut out = Vec::with_capacity(2);
+    let mut out = Vec::with_capacity(1 + m.bins.len());
     if m.kind.has_lib() {
         out.push(m.name.as_str());
     }
-    if m.kind.has_bin() {
-        out.push(m.bin_target_name.as_str());
-    }
+    // v0.4.4 V44D-5: every bin of the member.
+    out.extend(m.bins.iter().map(|b| b.target_name.as_str()));
     out
 }
 

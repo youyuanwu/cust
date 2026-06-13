@@ -1282,7 +1282,7 @@ Roadmap bullets here are deliberately short:
 * **v0.3.1 — binary crates & `cust run`.** ✅ **shipped.**
   Small single-purpose milestone slotted between v0.3 and v0.4.
   `[[bin]]` table (single entry; multi-bin via `src/bin/*.c`
-  deferred to v0.4) plus auto-inference: `src/main.c` →
+  shipped later in v0.4.4) plus auto-inference: `src/main.c` →
   bin-only, `src/lib.c` + `src/main.c` → lib+bin (Cargo shape).
   Bin output at `target/<profile>/<crate>` (Cargo parity).
   `cust run [-p <member>] [--release] [-- <argv>…]` builds the
@@ -1406,6 +1406,18 @@ Roadmap bullets here are deliberately short:
     pulled forward from v0.4.5. See [v0.4.3.md](v0.4.3.md).
   - **v0.4.4** — multi-bin per crate (`src/bin/*.c`,
     `[[bin]]` arrays — V31D-3 deferral from v0.3.1).
+    ✅ **shipped.** Auto-discovers one bin per `src/bin/<name>.c`
+    (top level, V44D-1) alongside the package bin `src/main.c`,
+    and lifts `[[bin]]` to a real multi-entry array (V44D-4).
+    `cust run --bin <name>` / `cust build --bin <name>` select
+    one bin (V44D-6/7); ambiguous `cust run` without `--bin`
+    errors Cargo-style. `CrateKind` carries a `Vec<BinTarget>`
+    (V44D-8); `Cust.lock` unchanged (V44D-12). Deferred:
+    `src/bin/<name>/main.c` subdirs (V44D-2), per-bin
+    deps/config (V44D-11), strict `cust check` over bins (V44D-9
+    — `cust check` is a tolerant lib-surface pass, same finding
+    as V43D-13), `default-run` / `required-features` /
+    bin-internal tests (RQ-V44-1/2/3). See [v0.4.4.md](v0.4.4.md).
   - **v0.4.5** — `cust test` follow-ups:
     `[[cust::test(inline)]]`,
     `should_panic`, per-test timeout, `--nocapture` /
