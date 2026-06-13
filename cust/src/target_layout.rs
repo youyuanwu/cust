@@ -26,6 +26,19 @@ use anyhow::{Context, Result};
 
 use crate::profile::ProfileKind;
 
+/// Which kind of test a discovery sidecar belongs to. Selects the
+/// `target/<profile>/.test-discovery/<crate>/…` path scheme
+/// (V43D-6): unit sidecars are keyed by module qualified name,
+/// integration sidecars by file stem under a `tests/` subdir.
+#[derive(Debug, Clone, Copy)]
+pub enum TestOrigin<'a> {
+    /// Unit test in `src/**.c`, keyed by module qualified name.
+    Unit { qualified_name: &'a str },
+    /// Integration test in `tests/<stem>.c`, keyed by file stem.
+    #[allow(dead_code)] // constructed by Slice C (integration runner-TU sidecar plumbing)
+    Integration { stem: &'a str },
+}
+
 pub struct TargetLayout {
     pub target_root: PathBuf,
     pub profile_root: PathBuf,
@@ -73,11 +86,47 @@ impl TargetLayout {
         self.profile_root.join(".test-discovery").join(crate_name)
     }
 
-    /// V0.4.0 RQ-V40-2: per-module test-discovery sidecar path.
-    /// `target/<profile>/.test-discovery/<crate>/<qname>.cust.tests`.
-    pub fn test_sidecar_path(&self, crate_name: &str, qualified_name: &str) -> PathBuf {
-        self.test_discovery_dir(crate_name)
-            .join(format!("{qualified_name}.cust.tests"))
+    /// Per-test-TU test-discovery sidecar path, keyed by origin
+    /// (V0.4.0 RQ-V40-2 for unit modules; v0.4.3 V43D-6 for
+    /// integration tests).
+    ///
+    /// * `TestOrigin::Unit` →
+    ///   `target/<profile>/.test-discovery/<crate>/<qname>.cust.tests`.
+    /// * `TestOrigin::Integration` →
+    ///   `target/<profile>/.test-discovery/<crate>/tests/<stem>.cust.tests`
+    ///   (V43D-6 nests integration sidecars under a `tests/`
+    ///   subdir so a `tests/<stem>.c` stem can never collide
+    ///   with a unit module's qualified name).
+    pub fn test_sidecar_path(&self, crate_name: &str, origin: TestOrigin<'_>) -> PathBuf {
+        let dir = self.test_discovery_dir(crate_name);
+        match origin {
+            TestOrigin::Unit { qualified_name } => dir.join(format!("{qualified_name}.cust.tests")),
+            TestOrigin::Integration { stem } => {
+                dir.join("tests").join(format!("{stem}.cust.tests"))
+            }
+        }
+    }
+
+    /// v0.4.3 V43D-5/V43D-11: per-stem build + run directory for
+    /// one integration test exe —
+    /// `target/<profile>/test/<crate>/<stem>/`. The exe lands
+    /// inside this directory (so the directory doubles as the
+    /// exe's cwd, V43D-11), mirroring the unit-test invariant
+    /// "cwd = the directory containing the exe" (V32D-4).
+    pub fn integration_test_build_dir(&self, member_name: &str, stem: &str) -> PathBuf {
+        self.test_build_dir(member_name).join(stem)
+    }
+
+    /// v0.4.3 V43D-5: integration test executable path —
+    /// `target/<profile>/test/<crate>/<stem>/<stem>`. The nested
+    /// `<stem>/` directory is what lets the exe file and the
+    /// per-stem cwd directory coexist (a flat
+    /// `test/<crate>/<stem>` would have to be both a file and a
+    /// directory).
+    #[allow(dead_code)] // surfaced by Slice B (add_executable OUTPUT path) / Slice C (spawn)
+    pub fn integration_test_executable_path(&self, member_name: &str, stem: &str) -> PathBuf {
+        self.integration_test_build_dir(member_name, stem)
+            .join(stem)
     }
 
     /// Per-member crate header

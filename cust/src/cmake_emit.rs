@@ -157,6 +157,16 @@ pub struct MemberView {
     /// bytes either way — the V42D-8 stamp doesn't churn when
     /// flipping modes, so neither does the configure step.
     pub test_target: Option<TestTargetView>,
+    /// v0.4.3 V43D-5: integration-test executables discovered
+    /// under `<crate>/tests/*.c` (one per file, sorted by stem).
+    /// Each is lowered to an
+    /// `add_executable(<crate>__itest__<stem> EXCLUDE_FROM_ALL
+    /// ...)` target. Empty for members without a `tests/` dir or
+    /// without a lib half (V43D-3: integration tests link the
+    /// CUT's library archive; bin-only members have no archive,
+    /// so they get no integration targets — mirrors
+    /// `test_target` being `None` for them).
+    pub integration_tests: Vec<IntegrationTestView>,
 }
 
 /// V42D-14 per-member test executable description. Lowered to a
@@ -190,6 +200,52 @@ pub struct TestTargetView {
     /// `target/<profile>/test/<crate>/` so the existing test
     /// runner code (and integration test fixtures) find the
     /// binary at the v0.3.2 location.
+    pub runtime_output_dir: PathBuf,
+}
+
+/// v0.4.3 V43D-5: one integration-test executable
+/// (`tests/<stem>.c`). Lowered to
+/// `add_executable(<crate>__itest__<stem> EXCLUDE_FROM_ALL ...)`.
+///
+/// Structurally distinct from `TestTargetView`: the unit-test
+/// target **recompiles** the CUT's lib sources into the exe,
+/// whereas an integration exe compiles only the rewritten
+/// `tests/<stem>.c` + its runner TU and **links against**
+/// `lib<crate>.a` (V43D-3 — public-surface-only linkage, same
+/// shape as a downstream consumer).
+#[derive(Debug, Clone)]
+pub struct IntegrationTestView {
+    /// `CMake` target name. Always `<crate>__itest__<stem>`
+    /// (V43D-5). The `__itest__` infix disambiguates from the
+    /// unit-test target (`<crate>__test`).
+    pub target_name: String,
+    /// On-disk executable name (`OUTPUT_NAME`). Always the bare
+    /// `<stem>` (no infix) so the binary lands at
+    /// `test/<crate>/<stem>/<stem>` (V43D-5).
+    pub output_name: String,
+    /// Sources: the rewritten `tests/<stem>.c` plus the
+    /// driver-generated runner TU
+    /// (`cust_itest_main_<crate>__<stem>.c`). The CUT's lib
+    /// sources are NOT here — they arrive via the
+    /// `lib<crate>.a` link (V43D-3).
+    pub sources: Vec<SourceFile>,
+    /// Include dirs the test + runner TUs need — the CUT's own
+    /// `build/<crate>/include/` so they can `#include
+    /// "<crate>.h"` (V43D-3).
+    pub include_dirs: Vec<PathBuf>,
+    /// Link deps: the CUT's own lib target (`<crate>`), which
+    /// pulls in `lib<crate>.a` plus its transitive PUBLIC dep
+    /// chain (V43D-3). Lowered to `target_link_libraries(<exe>
+    /// PRIVATE <crate>)`.
+    pub link_deps: Vec<String>,
+    /// Per-target compile options. Same shape as
+    /// `TestTargetView::compile_options` (profile cflags +
+    /// plugin invocation + `-DCUST_TEST_BUILD=1`).
+    pub compile_options: Vec<String>,
+    /// Absolute path the exe lands in via
+    /// `RUNTIME_OUTPUT_DIRECTORY`:
+    /// `target/<profile>/test/<crate>/<stem>/` (V43D-5/V43D-11
+    /// — the per-stem dir doubles as the exe's cwd).
     pub runtime_output_dir: PathBuf,
 }
 
@@ -268,6 +324,9 @@ pub fn generate(view: &WorkspaceView) -> String {
         }
         if let Some(t) = &m.test_target {
             emit_test_executable(&mut out, m, t);
+        }
+        for it in &m.integration_tests {
+            emit_integration_test_executable(&mut out, m, it);
         }
     }
 
@@ -392,10 +451,57 @@ fn emit_test_executable(out: &mut String, m: &MemberView, t: &TestTargetView) {
     }
 }
 
-/// Emit `target_compile_options(<target> PRIVATE …)` with one
-/// option per line. Each option is written verbatim (`CMake` list
-/// element); the caller wraps shell-significant strings in
-/// `SHELL:` (V42D-5).
+/// v0.4.3 V43D-5: emit one integration-test target
+/// (`tests/<stem>.c`), marked `EXCLUDE_FROM_ALL` so `cust build`
+/// skips it (matches the unit-test target's slice-F shape). `cust
+/// test` reaches it via `cmake --build --target
+/// <crate>__itest__<stem>`. Unlike `emit_test_executable`, this
+/// links against the CUT's `lib<crate>.a` (V43D-3) rather than
+/// recompiling the lib sources into the exe.
+fn emit_integration_test_executable(out: &mut String, m: &MemberView, t: &IntegrationTestView) {
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# ---- crate: {} (integration test: {}) ----",
+        m.name, t.output_name
+    );
+    let _ = writeln!(out, "add_executable({} EXCLUDE_FROM_ALL", t.target_name);
+    for src in &t.sources {
+        let _ = writeln!(out, "    \"{}\"", src.path.display());
+    }
+    out.push_str(")\n");
+    let _ = writeln!(out, "set_target_properties({} PROPERTIES", t.target_name);
+    let _ = writeln!(
+        out,
+        "    RUNTIME_OUTPUT_DIRECTORY \"{}\"",
+        t.runtime_output_dir.display(),
+    );
+    let _ = writeln!(out, "    OUTPUT_NAME {}", t.output_name);
+    out.push_str(")\n");
+    emit_object_depends(out, &t.sources);
+    if !t.include_dirs.is_empty() {
+        let _ = writeln!(out, "target_include_directories({} PRIVATE", t.target_name);
+        for dir in &t.include_dirs {
+            let _ = writeln!(out, "    \"{}\"", dir.display());
+        }
+        out.push_str(")\n");
+    }
+    if !t.link_deps.is_empty() {
+        let _ = writeln!(out, "target_link_libraries({} PRIVATE", t.target_name);
+        for dep in &t.link_deps {
+            let _ = writeln!(out, "    {dep}");
+        }
+        out.push_str(")\n");
+    }
+    if !t.compile_options.is_empty() {
+        let _ = writeln!(out, "target_compile_options({} PRIVATE", t.target_name);
+        for opt in &t.compile_options {
+            let _ = writeln!(out, "    \"{opt}\"");
+        }
+        out.push_str(")\n");
+    }
+}
+
 fn emit_compile_options(out: &mut String, target: &str, opts: &[String]) {
     if opts.is_empty() {
         return;
@@ -728,7 +834,7 @@ use crate::{
     plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
     target_layout::TargetLayout,
-    workspace::Workspace,
+    workspace::{Member, Workspace},
 };
 
 /// Walk `ws` and produce a `WorkspaceView` describing every
@@ -867,6 +973,17 @@ pub fn collect_view(
             None
         };
 
+        // v0.4.3 V43D-5: one integration-test target per
+        // `tests/<stem>.c`. Only members with a lib half get
+        // them (V43D-3: integration tests link `lib<crate>.a`);
+        // bin-only members' `integration_tests` are dropped here
+        // the same way `test_target` is `None` for them.
+        let integration_tests = if kind.has_lib() {
+            collect_integration_test_views(m, &compile_options, &rewrite_root, &cmake_dir, &layout)
+        } else {
+            Vec::new()
+        };
+
         members.push(MemberView {
             name: m.name.clone(),
             kind,
@@ -884,6 +1001,7 @@ pub fn collect_view(
             compile_options,
             bin_target_name,
             test_target,
+            integration_tests,
         });
     }
 
@@ -893,6 +1011,64 @@ pub fn collect_view(
         plugin_path: plugin.map(|p| p.path.clone()),
         members,
     })
+}
+
+/// v0.4.3 V43D-5: build the `IntegrationTestView`s for one
+/// lib-bearing workspace member. One view per `tests/<stem>.c`,
+/// in the member's already-sorted-by-stem order (V43D-1).
+///
+/// Each view's sources are the rewritten `tests/<stem>.c` (under
+/// `.rewrite/<crate>/tests/`) plus the runner TU
+/// (`cmake_dir/cust_itest_main_<crate>__<stem>.c`); the CUT's lib
+/// sources are NOT recompiled (V43D-3 — they arrive via the
+/// `lib<crate>.a` link). `compile_options` are the member's plus
+/// `-DCUST_TEST_BUILD=1`.
+fn collect_integration_test_views(
+    m: &Member,
+    compile_options: &[String],
+    rewrite_root: &Path,
+    cmake_dir: &Path,
+    layout: &TargetLayout,
+) -> Vec<IntegrationTestView> {
+    let include_dir = layout
+        .crate_header_path(&m.name)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut itest_opts = compile_options.to_vec();
+    itest_opts.push("-DCUST_TEST_BUILD=1".to_string());
+    m.integration_tests
+        .iter()
+        .map(|it| {
+            // Rewritten test source mirrors the lib sources'
+            // `.rewrite/<crate>/<rel>` scheme; <rel> is
+            // `tests/<stem>.c`.
+            let rel = it.source.strip_prefix(&m.root).unwrap_or(&it.source);
+            let rewritten = rewrite_root.join(&m.name).join(rel);
+            let runner_tu = cmake_dir.join(format!("cust_itest_main_{}__{}.c", m.name, it.stem));
+            IntegrationTestView {
+                target_name: format!("{}__itest__{}", m.name, it.stem),
+                output_name: it.stem.clone(),
+                sources: vec![
+                    SourceFile {
+                        path: rewritten,
+                        object_depends: Vec::new(),
+                    },
+                    SourceFile {
+                        path: runner_tu,
+                        object_depends: Vec::new(),
+                    },
+                ],
+                include_dirs: vec![include_dir.clone()],
+                // Link the CUT's own lib target; PUBLIC
+                // propagation pulls in its transitive workspace
+                // dep chain (V43D-3).
+                link_deps: vec![m.name.clone()],
+                compile_options: itest_opts.clone(),
+                runtime_output_dir: layout.integration_test_build_dir(&m.name, &it.stem),
+            }
+        })
+        .collect()
 }
 
 /// Build the per-target compile options for one member matching
@@ -1136,6 +1312,10 @@ pub fn emit_and_drive_cmake(
             if let Some(t) = &m.test_target {
                 cmd.arg("--target").arg(&t.target_name);
             }
+            // v0.4.3 V43D-5: also build each integration-test exe.
+            for it in &m.integration_tests {
+                cmd.arg("--target").arg(&it.target_name);
+            }
         }
     }
     if let Some(jobs) = opts.jobs {
@@ -1162,11 +1342,13 @@ fn target_names_for<'a>(
         return Vec::new();
     };
     if test_mode {
-        return m
-            .test_target
-            .as_ref()
-            .map(|t| vec![t.target_name.as_str()])
-            .unwrap_or_default();
+        let mut out = Vec::new();
+        if let Some(t) = &m.test_target {
+            out.push(t.target_name.as_str());
+        }
+        // v0.4.3 V43D-5: include the member's integration exes.
+        out.extend(m.integration_tests.iter().map(|it| it.target_name.as_str()));
+        return out;
     }
     let mut out = Vec::with_capacity(2);
     if m.kind.has_lib() {
@@ -1212,6 +1394,25 @@ fn ensure_runner_tu_stubs(view: &WorkspaceView, cmake_dir: &Path) -> Result<()> 
                 }
                 fs::write(&src.path, STUB)
                     .with_context(|| format!("writing runner stub `{}`", src.path.display()))?;
+            }
+        }
+    }
+    // v0.4.3 V43D-5: same treatment for each integration-test
+    // exe's runner TU (`cust_itest_main_<crate>__<stem>.c`,
+    // under `cmake_dir/`). The rewritten `tests/<stem>.c` source
+    // lives under `.rewrite/<crate>/tests/` and is materialised
+    // by the test path (Slice C), not stubbed here.
+    for m in &view.members {
+        for it in &m.integration_tests {
+            for src in &it.sources {
+                if src.path.starts_with(cmake_dir) && !src.path.is_file() {
+                    if let Some(parent) = src.path.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("creating `{}`", parent.display()))?;
+                    }
+                    fs::write(&src.path, STUB)
+                        .with_context(|| format!("writing runner stub `{}`", src.path.display()))?;
+                }
             }
         }
     }

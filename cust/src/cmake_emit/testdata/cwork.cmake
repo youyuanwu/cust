@@ -31,6 +31,58 @@ target_compile_options(cstd PRIVATE
     "-Wno-unknown-attributes"
 )
 
+# ---- crate: cstd (integration test: alloc_pressure) ----
+add_executable(cstd__itest__alloc_pressure EXCLUDE_FROM_ALL
+    "/ws/target/debug/.rewrite/cstd/tests/alloc_pressure.c"
+    "/ws/target/debug/cmake/cust_itest_main_cstd__alloc_pressure.c"
+)
+set_target_properties(cstd__itest__alloc_pressure PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "/ws/target/debug/test/cstd/alloc_pressure"
+    OUTPUT_NAME alloc_pressure
+)
+target_include_directories(cstd__itest__alloc_pressure PRIVATE
+    "/ws/target/debug/build/cstd/include"
+)
+target_link_libraries(cstd__itest__alloc_pressure PRIVATE
+    cstd
+)
+target_compile_options(cstd__itest__alloc_pressure PRIVATE
+    "-O0"
+    "-g3"
+    "-fvisibility=hidden"
+    "-include"
+    "/ws/target/debug/prelude.h"
+    "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
+    "-Wno-unknown-attributes"
+    "-DCUST_TEST_BUILD=1"
+)
+
+# ---- crate: cstd (integration test: basic) ----
+add_executable(cstd__itest__basic EXCLUDE_FROM_ALL
+    "/ws/target/debug/.rewrite/cstd/tests/basic.c"
+    "/ws/target/debug/cmake/cust_itest_main_cstd__basic.c"
+)
+set_target_properties(cstd__itest__basic PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "/ws/target/debug/test/cstd/basic"
+    OUTPUT_NAME basic
+)
+target_include_directories(cstd__itest__basic PRIVATE
+    "/ws/target/debug/build/cstd/include"
+)
+target_link_libraries(cstd__itest__basic PRIVATE
+    cstd
+)
+target_compile_options(cstd__itest__basic PRIVATE
+    "-O0"
+    "-g3"
+    "-fvisibility=hidden"
+    "-include"
+    "/ws/target/debug/prelude.h"
+    "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
+    "-Wno-unknown-attributes"
+    "-DCUST_TEST_BUILD=1"
+)
+
 # ---- crate: hello-cstd (binary) ----
 add_executable(hello-cstd
     "/ws/target/debug/.rewrite/hello-cstd/src/main.c"

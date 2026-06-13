@@ -31,7 +31,7 @@ use crate::{
     modules::{self, Module},
     plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
-    target_layout::TargetLayout,
+    target_layout::{TargetLayout, TestOrigin},
     test_discovery::{self, TestEntry},
     test_runner,
 };
@@ -71,6 +71,13 @@ pub struct BuildPlan<'a> {
     /// in this mode (the non-test `cust build` owns those).
     /// Ignored when `syntax_only` is true.
     pub test_build: bool,
+    /// v0.4.3 V43D-5: integration tests discovered under
+    /// `<crate>/tests/*.c` (one per file). Used in test-build
+    /// mode to rewrite + surface-pass + generate a runner TU per
+    /// file; also rewritten in build mode so the `CMakeLists`
+    /// `add_executable` source paths exist at configure time.
+    /// Empty for members without a `tests/` dir.
+    pub integration_tests: &'a [crate::workspace::IntegrationTest],
 }
 
 /// Outputs `cust build` writes. `objects` and `compile_commands`
@@ -92,8 +99,26 @@ pub struct BuildOutputs {
     /// was produced (V32D-4 / V32D-5). The path is
     /// `target/<profile>/test/<crate>/<crate>`.
     pub test_executable: Option<PathBuf>,
+    /// v0.4.3 V43D-5: integration-test executables produced in
+    /// test-build mode, one per `tests/<stem>.c`. Empty in build
+    /// / check mode and for members without a `tests/` dir.
+    pub integration_tests: Vec<IntegrationTestOutput>,
     #[allow(dead_code)]
     pub compile_commands: PathBuf,
+}
+
+/// v0.4.3 V43D-5: one built integration-test executable, ready
+/// for `cust test` to spawn (V43D-10/V43D-11).
+#[derive(Debug)]
+pub struct IntegrationTestOutput {
+    /// File stem (`tests/<stem>.c` → `<stem>`).
+    pub stem: String,
+    /// Crate-relative source label for the run banner
+    /// (`tests/<stem>.c`).
+    pub source_label: String,
+    /// Absolute path to the built exe
+    /// (`target/<profile>/test/<crate>/<stem>/<stem>`).
+    pub exe: PathBuf,
 }
 
 // ─── v0.4.2 slice B: driver-side prebuild for the CMake path ─────
@@ -186,6 +211,85 @@ pub fn write_rewrite_tree(plan: &BuildPlan<'_>) -> Result<()> {
             write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, true)?;
         }
     }
+    // v0.4.3 V43D-5: rewrite each integration test source into
+    // `.rewrite/<crate>/tests/<stem>.c` so the `CMakeLists`
+    // `add_executable(<crate>__itest__<stem> ...)` source path
+    // exists at configure time (both build and test mode). Only
+    // lib members get integration targets (V43D-3); skip the
+    // rewrites for bin-only members to match `collect_view`.
+    if plan.kind.has_lib() {
+        for it in plan.integration_tests {
+            write_integration_rewrite(plan, &layout, &rewrite_root, it)?;
+        }
+    }
+    Ok(())
+}
+
+/// v0.4.3 V43D-3/V43D-5: rewrite one `tests/<stem>.c` integration
+/// source into `.rewrite/<crate>/tests/<stem>.c`. Lowers
+/// `#cust use <crate>;` (the CUT itself) to an `#include` of the
+/// published `<crate>.h` — the same own-crate carve-out the bin
+/// half of a lib+bin crate uses — and `#cust use <dep>;` to the
+/// dep's published header. `#cust use crate::<mod>;` is **not**
+/// supported (V43D-3: integration tests see the public surface
+/// only, not crate-private modules) and lowers to nothing, so a
+/// crate-private reference fails to compile with a clear missing-
+/// declaration error.
+fn write_integration_rewrite(
+    plan: &BuildPlan<'_>,
+    layout: &TargetLayout,
+    rewrite_root: &Path,
+    it: &crate::workspace::IntegrationTest,
+) -> Result<()> {
+    let crate_name = plan.manifest.package_name();
+    let own_header = layout.crate_header_path(crate_name);
+    let src_text = fs::read_to_string(&it.source)
+        .with_context(|| format!("reading `{}`", it.source.display()))?;
+    let scan = mod_scanner::scan(&src_text, &it.source)?;
+
+    let rewritten = mod_scanner::rewrite_with(&src_text, &it.source, &scan, |d| match &d.kind {
+        crate::mod_scanner::DirectiveKind::UseDep { name } => {
+            if name == crate_name {
+                Some(format!("#include \"{}\"", own_header.display()))
+            } else {
+                let dep_header = layout
+                    .dep_dir(name)
+                    .join("include")
+                    .join(format!("{name}.h"));
+                Some(format!("#include \"{}\"", dep_header.display()))
+            }
+        }
+        // V43D-3: no crate-private module / fragment access from
+        // integration tests; blank `#cust use crate::<mod>;`.
+        crate::mod_scanner::DirectiveKind::UseCrate { .. }
+        | crate::mod_scanner::DirectiveKind::Mod { .. } => None,
+    });
+
+    // Validate `#cust use <dep>;` resolves to the CUT itself or a
+    // declared dep — same shape `write_one_rewrite` enforces.
+    for d in &scan.directives {
+        if let crate::mod_scanner::DirectiveKind::UseDep { name } = &d.kind {
+            if name == crate_name || plan.deps.iter().any(|n| n == name) {
+                continue;
+            }
+            bail!(
+                "{}:{}:{}: `#cust use {name};` refers to a crate that is \
+                 neither `{crate_name}` nor a declared dependency",
+                it.source.display(),
+                d.span.line,
+                d.span.column
+            );
+        }
+    }
+
+    let dst = rewrite_root
+        .join(crate_name)
+        .join("tests")
+        .join(format!("{}.c", it.stem));
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    write_if_byte_different(&dst, rewritten.as_bytes())?;
     Ok(())
 }
 
@@ -292,6 +396,7 @@ pub fn cmake_outputs_for(plan: &BuildPlan<'_>, layout: &TargetLayout) -> BuildOu
         archive,
         executable,
         test_executable: None,
+        integration_tests: Vec::new(),
         compile_commands: layout.target_root.join("compile_commands.json"),
     }
 }
@@ -325,7 +430,12 @@ pub fn write_test_runner_tu(plan: &BuildPlan<'_>) -> Result<Option<PathBuf>> {
     // module — bug, hard error.
     let mut tests: Vec<TestEntry> = Vec::new();
     for m in &lib_modules {
-        let sidecar_path = layout.test_sidecar_path(crate_name, &m.qualified_name);
+        let sidecar_path = layout.test_sidecar_path(
+            crate_name,
+            TestOrigin::Unit {
+                qualified_name: &m.qualified_name,
+            },
+        );
         let contents = fs::read_to_string(&sidecar_path).with_context(|| {
             format!(
                 "reading test-discovery sidecar `{}`",
@@ -346,6 +456,136 @@ pub fn write_test_runner_tu(plan: &BuildPlan<'_>) -> Result<Option<PathBuf>> {
     write_if_byte_different(&runner_path, runner_src.as_bytes())?;
 
     Ok(Some(layout.test_executable_path(crate_name)))
+}
+
+/// v0.4.3 V43D-4/V43D-5: for each integration test under
+/// `<crate>/tests/`, surface-pass the already-rewritten
+/// `.rewrite/<crate>/tests/<stem>.c` to emit its test-discovery
+/// sidecar, then render + write the per-exe runner TU at
+/// `cmake/cust_itest_main_<crate>__<stem>.c`. Returns one
+/// `IntegrationTestOutput` per file with the exe path `cust test`
+/// will spawn.
+///
+/// Test-build only (the caller gates on `plan.test_build`). No-op
+/// for non-lib members (V43D-3) or members without a `tests/`
+/// dir. Assumes `run_phase1` already wrote `<crate>.h` and
+/// `write_rewrite_tree` already produced the rewritten sources.
+pub fn write_integration_runner_tus(plan: &BuildPlan<'_>) -> Result<Vec<IntegrationTestOutput>> {
+    if !plan.kind.has_lib() || plan.integration_tests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let profile_override = match plan.profile_kind {
+        ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
+        ProfileKind::Release => plan.manifest.profile.release.as_ref(),
+    };
+    let profile = ResolvedProfile::resolve(plan.profile_kind, profile_override)?;
+    let layout = TargetLayout::for_workspace(plan.workspace_root, plan.profile_kind);
+    let prelude_path = layout.prelude_path();
+    let crate_name = plan.manifest.package_name();
+    let rewrite_root = layout.profile_root.join(".rewrite");
+    let cmake_dir = layout.profile_root.join("cmake");
+    fs::create_dir_all(&cmake_dir)
+        .with_context(|| format!("creating `{}`", cmake_dir.display()))?;
+
+    let mut out = Vec::with_capacity(plan.integration_tests.len());
+    for it in plan.integration_tests {
+        let rewritten = rewrite_root
+            .join(crate_name)
+            .join("tests")
+            .join(format!("{}.c", it.stem));
+
+        // Surface-pass the rewritten test TU to emit its sidecar.
+        // Plugin-only (no plugin ⇒ no [[cust::test]] discovery);
+        // the runner just renders zero tests in that case.
+        let sidecar_path =
+            layout.test_sidecar_path(crate_name, TestOrigin::Integration { stem: &it.stem });
+        if plan.plugin.is_some() {
+            if let Some(parent) = sidecar_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating `{}`", parent.display()))?;
+            }
+            surface_pass_integration(plan, &profile, &prelude_path, &rewritten, &sidecar_path)?;
+        }
+
+        // Read the sidecar (empty when no plugin / zero tests).
+        let tests: Vec<TestEntry> = match fs::read_to_string(&sidecar_path) {
+            Ok(contents) => test_discovery::parse(&contents, &sidecar_path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(anyhow::Error::new(e)).with_context(|| {
+                    format!("reading integration sidecar `{}`", sidecar_path.display())
+                })
+            }
+        };
+
+        let runner_path = cmake_dir.join(format!("cust_itest_main_{crate_name}__{}.c", it.stem));
+        let runner_src = test_runner::render_main_c(&tests);
+        write_if_byte_different(&runner_path, runner_src.as_bytes())?;
+
+        out.push(IntegrationTestOutput {
+            stem: it.stem.clone(),
+            source_label: format!("tests/{}.c", it.stem),
+            exe: layout.integration_test_executable_path(crate_name, &it.stem),
+        });
+    }
+    Ok(out)
+}
+
+/// Surface-compile one rewritten integration test TU with
+/// `-fsyntax-only` + the plugin so the per-file test-discovery
+/// sidecar gets written. Unlike the lib surface pass this emits
+/// no fragment header (integration tests don't publish surface)
+/// and needs no fixed-point loop (a single file, no intra-crate
+/// fragment dependencies). The plugin `module` arg is `lib` so
+/// the runner renders bare test names (qname drops the root
+/// `lib` module, matching unit tests at crate root).
+fn surface_pass_integration(
+    plan: &BuildPlan<'_>,
+    profile: &ResolvedProfile,
+    prelude: &Path,
+    rewritten: &Path,
+    sidecar_path: &Path,
+) -> Result<()> {
+    let dummy_obj = rewritten.with_extension("surface.o");
+    let mut cflags = build_cflags(
+        plan,
+        profile,
+        prelude,
+        rewritten,
+        &dummy_obj,
+        &[],
+        PluginOutputs {
+            fragment: None,
+            test_sidecar: Some(sidecar_path),
+            module: Some("lib"),
+        },
+    );
+    // Strip trailing `-c -o <obj> <src>` (4 args), replace with
+    // `-fsyntax-only -Wno-error ... <src>` — same demotions the
+    // lib surface pass uses so an unresolved decl doesn't stop
+    // the plugin from emitting the sidecar.
+    let new_len = cflags.len().saturating_sub(4);
+    cflags.truncate(new_len);
+    cflags.push("-fsyntax-only".to_string());
+    cflags.push("-Wno-error".to_string());
+    cflags.push("-Wno-implicit-function-declaration".to_string());
+    cflags.push(rewritten.display().to_string());
+
+    let _ = plan
+        .clang
+        .command()
+        .args(&cflags)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| {
+            format!(
+                "invoking `{}` for integration surface pass on `{}`",
+                plan.clang.path.display(),
+                rewritten.display()
+            )
+        })?;
+    Ok(())
 }
 
 /// Surface-extraction pass: compile every module with
@@ -442,7 +682,12 @@ fn surface_pass(
         // reads these in `run_test_build` to populate
         // __cust_tests[].
         let sidecar_path = if plan.test_build {
-            let p = layout.test_sidecar_path(crate_name, &m.qualified_name);
+            let p = layout.test_sidecar_path(
+                crate_name,
+                TestOrigin::Unit {
+                    qualified_name: &m.qualified_name,
+                },
+            );
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating `{}`", parent.display()))?;

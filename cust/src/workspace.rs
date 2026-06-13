@@ -64,6 +64,31 @@ pub struct Member {
     /// declaration order. Resolved by `Workspace::resolve_edges`
     /// (V3D-4: every dep path must point at a sibling member).
     pub deps: Vec<String>,
+    /// v0.4.3 V43D-1: integration tests discovered under
+    /// `<root>/tests/*.c` (top level only, no recursion), sorted
+    /// by stem for deterministic run order. Empty when the member
+    /// has no `tests/` dir or it contains no top-level `.c` files.
+    /// Populated even for bin-only members at discovery time;
+    /// V32D-11 scoping (only lib members get tested) is applied
+    /// later by the `CMake`/runner layer (Slice B/C).
+    #[allow(dead_code)] // read by Slice B (per-file add_executable emission)
+    pub integration_tests: Vec<IntegrationTest>,
+}
+
+/// v0.4.3 V43D-1: one integration-test source file under a
+/// member's `tests/` directory. One file ⇒ one `CMake` exe target
+/// (Slice B) ⇒ one fork-per-test runner (Slice C).
+#[derive(Debug, Clone)]
+pub struct IntegrationTest {
+    /// File stem (basename minus the `.c` extension). Validated
+    /// against `[A-Za-z][A-Za-z0-9_-]*` (V43D-8) at discovery
+    /// time; used verbatim as the `CMake` target infix
+    /// (`<crate>__itest__<stem>`), the on-disk exe name, and the
+    /// per-stem cwd directory (V43D-5/V43D-11).
+    pub stem: String,
+    /// Absolute path to the `tests/<stem>.c` source file.
+    #[allow(dead_code)] // read by Slice B (add_executable source path)
+    pub source: PathBuf,
 }
 
 /// A resolved workspace.
@@ -162,6 +187,7 @@ impl Workspace {
                 kind,
                 is_implicit_root: true,
                 deps: Vec::new(),
+                integration_tests: discover_integration_tests(&root, &pkg.name)?,
             };
             seen_names.insert(m.name.clone(), m.root.clone());
             seen_dirs.insert(m.root.clone(), m.name.clone());
@@ -214,6 +240,7 @@ impl Workspace {
             let kind = member_manifest
                 .resolve_kind(&canon)
                 .with_context(|| format!("member `{}`", pkg.name))?;
+            let integration_tests = discover_integration_tests(&canon, &pkg.name)?;
             members.push(Member {
                 name: pkg.name.clone(),
                 root: canon,
@@ -221,6 +248,7 @@ impl Workspace {
                 kind,
                 is_implicit_root: false,
                 deps: Vec::new(),
+                integration_tests,
             });
         }
 
@@ -281,6 +309,7 @@ impl Workspace {
             kind,
             is_implicit_root: true,
             deps: Vec::new(),
+            integration_tests: discover_integration_tests(&root, &pkg.name)?,
         };
         Ok(Self {
             root,
@@ -724,6 +753,7 @@ fn run_check_path(
                     archive: None,
                     executable: None,
                     test_executable: None,
+                    integration_tests: Vec::new(),
                     compile_commands: layout.target_root.join("compile_commands.json"),
                 },
             ));
@@ -769,6 +799,10 @@ fn run_test_build_path(
             // anything for them (V32D-12).
             let test_exe = build::write_test_runner_tu(plan)
                 .with_context(|| format!("writing test runner TU for member `{name}`"))?;
+            // v0.4.3 V43D-5: integration runner TUs (surface
+            // pass each `tests/<stem>.c`, render its runner).
+            let itests = build::write_integration_runner_tus(plan)
+                .with_context(|| format!("writing integration runner TUs for `{name}`"))?;
             // Only report `per_member` for members the caller
             // asked about — siblings outside `-p` scope are
             // built but stay silent (matches `cust build`
@@ -776,6 +810,7 @@ fn run_test_build_path(
             if to_build.iter().any(|n| n == name) {
                 let mut outputs = build::cmake_outputs_for(plan, layout);
                 outputs.test_executable = test_exe;
+                outputs.integration_tests = itests;
                 per_member.push((name.clone(), outputs));
             }
             Ok(())
@@ -823,6 +858,7 @@ fn with_plan<R>(
         deps: &dep_strs,
         kind: m.kind.clone(),
         test_build: opts.test_build,
+        integration_tests: &m.integration_tests,
     };
     f(&plan)
 }
@@ -938,6 +974,91 @@ fn find_cycle(members: &[Member], start: usize) -> Vec<String> {
 /// borrowed elsewhere (the parser does no I/O of its own).
 fn clone_manifest(path: &Path) -> Result<Manifest> {
     Manifest::load(path)
+}
+
+/// v0.4.3 V43D-1 + V43D-8: discover integration tests under
+/// `<member_root>/tests/`.
+///
+/// Returns the top-level `*.c` files only — subdirectories
+/// (including any future `tests/common/`) are silently ignored
+/// (V43D-1 no-recursion + V43D-2 helper-sharing deferred), and
+/// non-`.c` files are skipped. The result is sorted by stem so
+/// the `Running tests/<file>.c` banner order is deterministic
+/// regardless of filesystem readdir order.
+///
+/// A missing `tests/` directory (or an empty one) yields an empty
+/// vec — same as no `tests/` at all (V43D-12).
+///
+/// Config-time errors (V43D-8):
+///
+/// * a stem that doesn't match `[A-Za-z][A-Za-z0-9_-]*`;
+/// * a stem equal to `crate_name` (would collide with the
+///   unit-test exe at `test/<crate>/<crate>`, V43D-5).
+fn discover_integration_tests(
+    member_root: &Path,
+    crate_name: &str,
+) -> Result<Vec<IntegrationTest>> {
+    let tests_dir = member_root.join("tests");
+    let entries = match fs::read_dir(&tests_dir) {
+        Ok(rd) => rd,
+        // No tests/ dir at all ⇒ no integration tests (V43D-12).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading `{}`", tests_dir.display()))
+        }
+    };
+
+    let mut tests: Vec<IntegrationTest> = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in `{}`", tests_dir.display()))?;
+        let path = entry.path();
+        // Top level only: `is_file()` follows symlinks but returns
+        // false for directories, so subdirectories (V43D-1
+        // no-recursion) and anything non-regular are skipped.
+        if !path.is_file() {
+            continue;
+        }
+        // V43D-1: only `.c` files; non-`.c` files are ignored.
+        if path.extension().and_then(|e| e.to_str()) != Some("c") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename `{}`", path.display()))?
+            .to_string();
+
+        validate_integration_stem(&stem)?;
+        if stem == crate_name {
+            bail!(
+                "tests/{stem}.c: integration-test stem '{stem}' collides with \
+                 the unit-test executable; rename the file"
+            );
+        }
+        tests.push(IntegrationTest { stem, source: path });
+    }
+    // V43D-1: deterministic alphabetical-by-stem run order.
+    tests.sort_by(|a, b| a.stem.cmp(&b.stem));
+    Ok(tests)
+}
+
+/// v0.4.3 V43D-8: an integration-test file stem must match
+/// `[A-Za-z][A-Za-z0-9_-]*` so it's safe as a `CMake` target infix
+/// (`<crate>__itest__<stem>`) and an on-disk filename. Stricter
+/// than `manifest::validate_package_name`, which also permits a
+/// leading digit / `_` / `-`.
+fn validate_integration_stem(stem: &str) -> Result<()> {
+    let mut chars = stem.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        bail!(
+            "tests/{stem}.c: stem '{stem}' must match [A-Za-z][A-Za-z0-9_-]* \
+             (used as the CMake target name + on-disk filename)"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1259,5 +1380,164 @@ mod tests {
         let e = format!("{:#}", Workspace::discover(root).unwrap_err());
         assert!(e.contains("does not exist"), "{e}");
         assert!(e.contains("util"), "{e}");
+    }
+
+    // ---- v0.4.3 integration-test discovery (V43D-1, V43D-8) ----
+
+    /// Helper: build a single-crate workspace named `crate_name`
+    /// with the given `tests/` files written, then return the
+    /// discovered member's `integration_tests`.
+    fn discover_itests(crate_name: &str, files: &[(&str, &str)]) -> Vec<IntegrationTest> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            &format!("[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\n"),
+        );
+        write(root, "src/lib.c", "int x = 1;\n");
+        for (rel, body) in files {
+            write(root, rel, body);
+        }
+        let ws = Workspace::discover(root).unwrap();
+        ws.members.into_iter().next().unwrap().integration_tests
+    }
+
+    #[test]
+    fn no_tests_dir_yields_no_integration_tests() {
+        let itests = discover_itests("solo", &[]);
+        assert!(itests.is_empty());
+    }
+
+    #[test]
+    fn empty_tests_dir_yields_no_integration_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "src/lib.c", "int x = 1;\n");
+        // Create an empty tests/ directory (no .c files).
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+
+        let ws = Workspace::discover(root).unwrap();
+        assert!(ws.members[0].integration_tests.is_empty());
+    }
+
+    #[test]
+    fn top_level_c_files_are_discovered_sorted_by_stem() {
+        let itests = discover_itests(
+            "solo",
+            &[
+                ("tests/zeta.c", "int z;\n"),
+                ("tests/alpha.c", "int a;\n"),
+                ("tests/middle.c", "int m;\n"),
+            ],
+        );
+        let stems: Vec<&str> = itests.iter().map(|t| t.stem.as_str()).collect();
+        assert_eq!(stems, vec!["alpha", "middle", "zeta"]);
+        // Sources are absolute and point at the right files.
+        assert!(itests[0].source.ends_with("tests/alpha.c"));
+        assert!(itests[0].source.is_absolute());
+    }
+
+    #[test]
+    fn non_c_files_are_ignored() {
+        let itests = discover_itests(
+            "solo",
+            &[
+                ("tests/basic.c", "int b;\n"),
+                ("tests/README.md", "notes\n"),
+                ("tests/data.txt", "x\n"),
+                ("tests/header.h", "int h;\n"),
+            ],
+        );
+        let stems: Vec<&str> = itests.iter().map(|t| t.stem.as_str()).collect();
+        assert_eq!(stems, vec!["basic"]);
+    }
+
+    #[test]
+    fn subdirectories_under_tests_are_ignored() {
+        // V43D-1 no-recursion + V43D-2 helper-sharing deferred:
+        // a tests/common/mod.c (and any other subdir .c) is
+        // silently skipped, not discovered as an exe.
+        let itests = discover_itests(
+            "solo",
+            &[
+                ("tests/basic.c", "int b;\n"),
+                ("tests/common/mod.c", "int helper;\n"),
+                ("tests/sub/deep.c", "int d;\n"),
+            ],
+        );
+        let stems: Vec<&str> = itests.iter().map(|t| t.stem.as_str()).collect();
+        assert_eq!(stems, vec!["basic"]);
+    }
+
+    #[test]
+    fn invalid_stem_leading_digit_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "src/lib.c", "int x = 1;\n");
+        write(root, "tests/1bad.c", "int b;\n");
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("tests/1bad.c"), "{e}");
+        assert!(e.contains("[A-Za-z][A-Za-z0-9_-]*"), "{e}");
+    }
+
+    #[test]
+    fn invalid_stem_bad_char_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "src/lib.c", "int x = 1;\n");
+        write(root, "tests/has.dot.c", "int b;\n");
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("tests/has.dot.c"), "{e}");
+        assert!(e.contains("must match"), "{e}");
+    }
+
+    #[test]
+    fn stem_colliding_with_crate_name_is_error() {
+        // V43D-8: tests/<crate>.c would collide with the
+        // unit-test exe path test/<crate>/<crate>.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cust.toml",
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "src/lib.c", "int x = 1;\n");
+        write(root, "tests/solo.c", "int b;\n");
+
+        let e = format!("{:#}", Workspace::discover(root).unwrap_err());
+        assert!(e.contains("collides with"), "{e}");
+        assert!(e.contains("unit-test executable"), "{e}");
+    }
+
+    #[test]
+    fn valid_stems_with_hyphen_and_underscore_are_accepted() {
+        let itests = discover_itests(
+            "solo",
+            &[
+                ("tests/alloc_pressure.c", "int a;\n"),
+                ("tests/round-trip.c", "int r;\n"),
+            ],
+        );
+        let stems: Vec<&str> = itests.iter().map(|t| t.stem.as_str()).collect();
+        assert_eq!(stems, vec!["alloc_pressure", "round-trip"]);
     }
 }

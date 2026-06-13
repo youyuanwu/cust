@@ -597,6 +597,30 @@ fn run_test(
             // `cargo test --workspace` behaviour).
             eprintln!("error: test binary for `{name}` failed");
         }
+
+        // v0.4.3 V43D-5/V43D-10/V43D-11: run the member's
+        // integration-test exes after its unit tests. Each runs
+        // with cwd = its own per-stem dir (the directory
+        // containing the exe) so output files don't collide.
+        for it in &out.integration_tests {
+            println!("     Running {} ({})", it.source_label, it.exe.display());
+            let mut child = std::process::Command::new(&it.exe);
+            if let Some(f) = filter {
+                child.arg(f);
+            }
+            child.args(forwarded);
+            if let Some(cwd) = it.exe.parent() {
+                child.current_dir(cwd);
+            }
+            let status = child
+                .stdin(std::process::Stdio::null())
+                .status()
+                .with_context(|| format!("spawning `{}`", it.exe.display()))?;
+            if !status.success() {
+                overall_failed = true;
+                eprintln!("error: integration test `{}` of `{name}` failed", it.stem);
+            }
+        }
     }
 
     if overall_failed {

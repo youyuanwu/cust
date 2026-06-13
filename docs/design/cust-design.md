@@ -929,9 +929,10 @@ What ships today (v0.4.0, completed in slice F):
   `cust test`; V40D-10 rejects `cust test --no-plugin`.
 * No `[profile.test]`, no per‑test timeout, no
   `--nocapture`, no `--exact`, no multi‑filter, no
-  parallel test execution, no integration tests under
-  `tests/`, no `[[cust::test(inline)]]` — all deferred to
-  later v0.4.x milestones (see v0.4.0.md deferrals table).
+    parallel test execution, no `[[cust::test(inline)]]` —
+    all deferred to later v0.4.x milestones (see v0.4.0.md
+    deferrals table). Integration tests under `tests/`
+    shipped in v0.4.3 (below).
 
 The runner template lives in
 `cust/src/test_runner_template.c` (included into the
@@ -944,7 +945,31 @@ Full locked V40D‑N decisions, sentinel-marker mechanics,
 sidecar format, fixed-point loop semantics, and the
 verification target live in [v0.4.0.md](v0.4.0.md).
 
-### v0.3.2 implementation — driver pre‑pass discovery (historical)
+### v0.4.3 implementation — `tests/` integration tests
+
+What ships in v0.4.3 (V43D-1 through V43D-13):
+
+* One `.c` file at the top level of `<crate>/tests/` =
+  one integration-test executable (V43D-1; subdirectories
+  and non-`.c` files ignored, stems sorted for
+  deterministic run order). Each links against the CUT's
+  **public** surface only — `lib<crate>.a` + the published
+  `<crate>.h` (V43D-3) — making the test a real downstream
+  consumer; crate-private (`[[cust::pub_crate]]`,
+  unannotated `static`) decls are unreachable.
+* Test fns use the same `[[cust::test]]` mechanism, plugin
+  sidecar discovery, and fork-per-test runner as unit tests
+  (V43D-4) — zero plugin or `test_runner_template.c`
+  changes. One CMake `add_executable(<crate>__itest__<stem>
+  EXCLUDE_FROM_ALL ...)` per file (V43D-5), reached by
+  `cust test` via `--target`.
+* `cust test` runs unit tests then integration tests per
+  member, with the `Running tests/<file>.c (<exe>)` banner,
+  per-stem cwd (V43D-11), and exit 1 if any fails (V43D-10).
+* Deferred to v0.4.5: `tests/common/` shared helpers
+  (V43D-2), `--test <stem>` filter (V43D-9), the Cargo
+  `tests/<name>/main.c` multi-file form. See
+  [v0.4.3.md](v0.4.3.md) for the full V43D‑N record.
 
 v0.3.2 shipped the unit-test subset of §11 using a
 **driver pre‑pass** scanner instead of the plugin (V32D-2),
@@ -1369,21 +1394,26 @@ Roadmap bullets here are deliberately short:
     check` bypasses CMake entirely (V42D-15). See
     [v0.4.2.md](v0.4.2.md). The original v0.4.2 scope
     (build scripts) is reslotted to v0.4.8+.
-  - **v0.4.3** — `--jobs` / `-jN` polish. The originally-
-    planned "write a parallel scheduler" milestone
-    collapsed to a tiny tuning slice once v0.4.2 V42D-13
-    let Ninja own intra-crate and inter-crate parallelism
-    in one graph; `cust build -jN` already lowers to
-    `cmake --build -j N` (shipped in v0.4.2 slice D as a
-    pull-forward). v0.4.3 itself becomes "polish + any
-    Ninja-side knob worth surfacing."
+  - **v0.4.3** — `tests/` integration tests (V43D-1 through
+    V43D-13). One `.c` file under `<crate>/tests/` = one
+    executable linked against the crate's public surface
+    only (Cargo's model), reusing the v0.3.2 fork harness +
+    v0.4.0 plugin discovery + v0.4.2 CMake backend wholesale.
+    The originally-planned "`--jobs` / `-jN` polish" scope
+    collapsed into v0.4.2 slice D (V42D-13 let Ninja own all
+    parallelism; `cust build -jN` lowers to `cmake --build
+    -j N`), freeing the v0.4.3 slot — integration tests were
+    pulled forward from v0.4.5. See [v0.4.3.md](v0.4.3.md).
   - **v0.4.4** — multi-bin per crate (`src/bin/*.c`,
     `[[bin]]` arrays — V31D-3 deferral from v0.3.1).
-  - **v0.4.5** — `cust test` follow-ups: `tests/`
-    integration tests, `[[cust::test(inline)]]`,
+  - **v0.4.5** — `cust test` follow-ups:
+    `[[cust::test(inline)]]`,
     `should_panic`, per-test timeout, `--nocapture` /
     `--exact` / multi-filter / `--test-threads N`,
-    `[profile.test]` plumbing.
+    `[profile.test]` plumbing, `tests/common/` shared
+    helpers + the Cargo `tests/<name>/main.c` multi-file
+    form (`tests/` integration tests themselves shipped in
+    v0.4.3).
   - **v0.4.6** — dependency resolver + registry. Initial
     registry wire protocol (`Index` trait, `file://` first
     per V3D-1's deferral), `cust add`, semver version

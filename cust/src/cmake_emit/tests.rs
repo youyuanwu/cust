@@ -21,6 +21,7 @@ use super::*;
 
 // ─── Golden file (V42D-4) ───────────────────────────────────────
 
+#[allow(clippy::too_many_lines)] // mirror-of-design fixture; splitting hurts readability
 fn cwork_view() -> WorkspaceView {
     // Mirror of the design doc's example workspace
     // (docs/design/v0.4.2.md "Headline outcome"): `cstd`
@@ -41,6 +42,13 @@ fn cwork_view() -> WorkspaceView {
         "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so".to_string(),
         "-Wno-unknown-attributes".to_string(),
     ];
+    // Integration-test compile options append the test-build
+    // define (V43D + V42D-14 parity).
+    let itest_options = {
+        let mut o = compile_options.clone();
+        o.push("-DCUST_TEST_BUILD=1".to_string());
+        o
+    };
     WorkspaceView {
         cust_version: "0.4.2".to_string(),
         c_standard: "23".to_string(),
@@ -70,6 +78,57 @@ fn cwork_view() -> WorkspaceView {
                 compile_options: compile_options.clone(),
                 bin_target_name: "cstd".to_string(),
                 test_target: None,
+                // v0.4.3 V43D-5: two integration tests
+                // (alphabetical-by-stem, V43D-1) exercising the
+                // `add_executable(<crate>__itest__<stem>
+                // EXCLUDE_FROM_ALL ...)` shape from the design's
+                // §4 example.
+                integration_tests: vec![
+                    IntegrationTestView {
+                        target_name: "cstd__itest__alloc_pressure".to_string(),
+                        output_name: "alloc_pressure".to_string(),
+                        sources: vec![
+                            SourceFile {
+                                path: PathBuf::from(
+                                    "/ws/target/debug/.rewrite/cstd/tests/alloc_pressure.c",
+                                ),
+                                object_depends: vec![],
+                            },
+                            SourceFile {
+                                path: PathBuf::from(
+                                    "/ws/target/debug/cmake/cust_itest_main_cstd__alloc_pressure.c",
+                                ),
+                                object_depends: vec![],
+                            },
+                        ],
+                        include_dirs: vec![PathBuf::from("/ws/target/debug/build/cstd/include")],
+                        link_deps: vec!["cstd".to_string()],
+                        compile_options: itest_options.clone(),
+                        runtime_output_dir: PathBuf::from(
+                            "/ws/target/debug/test/cstd/alloc_pressure",
+                        ),
+                    },
+                    IntegrationTestView {
+                        target_name: "cstd__itest__basic".to_string(),
+                        output_name: "basic".to_string(),
+                        sources: vec![
+                            SourceFile {
+                                path: PathBuf::from("/ws/target/debug/.rewrite/cstd/tests/basic.c"),
+                                object_depends: vec![],
+                            },
+                            SourceFile {
+                                path: PathBuf::from(
+                                    "/ws/target/debug/cmake/cust_itest_main_cstd__basic.c",
+                                ),
+                                object_depends: vec![],
+                            },
+                        ],
+                        include_dirs: vec![PathBuf::from("/ws/target/debug/build/cstd/include")],
+                        link_deps: vec!["cstd".to_string()],
+                        compile_options: itest_options,
+                        runtime_output_dir: PathBuf::from("/ws/target/debug/test/cstd/basic"),
+                    },
+                ],
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -90,6 +149,7 @@ fn cwork_view() -> WorkspaceView {
                 compile_options,
                 bin_target_name: "hello-cstd".to_string(),
                 test_target: None,
+                integration_tests: vec![],
             },
         ],
     }
@@ -131,6 +191,9 @@ fn determinism_no_plugin() {
     view.plugin_path = None;
     for m in &mut view.members {
         m.compile_options.retain(|o| !o.contains("-fplugin="));
+        for it in &mut m.integration_tests {
+            it.compile_options.retain(|o| !o.contains("-fplugin="));
+        }
     }
     let out = generate(&view);
     assert!(
@@ -176,6 +239,7 @@ fn lib_and_bin_member_emits_both_targets() {
             compile_options: vec!["-O0".to_string()],
             bin_target_name: "app-bin".to_string(),
             test_target: None,
+            integration_tests: vec![],
         }],
     };
     let out = generate(&view);
@@ -186,6 +250,42 @@ fn lib_and_bin_member_emits_both_targets() {
     );
     assert!(out.contains("OUTPUT_NAME app"));
     assert!(out.contains("target_link_libraries(app-bin PRIVATE"));
+}
+
+#[test]
+fn integration_test_target_emits_exclude_from_all_exe() {
+    // V43D-5: one `add_executable(<crate>__itest__<stem>
+    // EXCLUDE_FROM_ALL ...)` per integration file, linking the
+    // CUT's lib archive (not recompiling lib sources).
+    let out = generate(&cwork_view());
+    // Both integration targets present, alphabetical by stem.
+    assert!(
+        out.contains("add_executable(cstd__itest__alloc_pressure EXCLUDE_FROM_ALL"),
+        "alloc_pressure itest target emitted"
+    );
+    assert!(
+        out.contains("add_executable(cstd__itest__basic EXCLUDE_FROM_ALL"),
+        "basic itest target emitted"
+    );
+    // alloc_pressure precedes basic (stem sort order, V43D-1).
+    let alloc_at = out.find("cstd__itest__alloc_pressure").unwrap();
+    let basic_at = out.find("cstd__itest__basic").unwrap();
+    assert!(alloc_at < basic_at, "integration targets sorted by stem");
+    // OUTPUT_NAME is the bare stem; exe lands under the per-stem
+    // dir (V43D-5/V43D-11).
+    assert!(out.contains("OUTPUT_NAME basic"));
+    assert!(out.contains("RUNTIME_OUTPUT_DIRECTORY \"/ws/target/debug/test/cstd/basic\""));
+    // V43D-3: links the CUT lib, not recompiling its sources.
+    assert!(out.contains("target_link_libraries(cstd__itest__basic PRIVATE"));
+    assert!(
+        !out.contains("\"/ws/target/debug/.rewrite/cstd/src/lib.c\"\n)\nset_target_properties(cstd__itest__basic"),
+        "integration exe must not recompile lib sources"
+    );
+    // Sources: rewritten test + runner TU.
+    assert!(out.contains("/ws/target/debug/.rewrite/cstd/tests/basic.c"));
+    assert!(out.contains("/ws/target/debug/cmake/cust_itest_main_cstd__basic.c"));
+    // Test-build define present.
+    assert!(out.contains("-DCUST_TEST_BUILD=1"));
 }
 
 // ─── Stamp (V42D-8 + RQ-V42-1) ──────────────────────────────────

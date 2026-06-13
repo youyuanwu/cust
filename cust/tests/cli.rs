@@ -1700,6 +1700,189 @@ fn test_subcommand_zero_tests_succeeds() {
     );
 }
 
+// ─── v0.4.3 integration tests (tests/ directory) ────────────────
+
+#[test]
+fn itest_runs_unit_and_integration_with_banners() {
+    // V43D-1/V43D-4/V43D-5: `cust test` runs the unit test in
+    // src/ plus the two integration exes under tests/, in
+    // stem-sorted order (basic before extra), each with its own
+    // Cargo-shape banner.
+    let (_tmp, dir) = stage("with_itests");
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Unit test banner + the src/ test.
+    assert!(
+        stdout.contains("Running unittests") || stdout.contains("test/with_itests/with_itests"),
+        "missing unit-test run banner:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("test test_secret_is_seven ... ok"),
+        "{stdout}"
+    );
+
+    // Integration banners use the `tests/<file>.c (<exe>)` shape
+    // (V43D-1), and exes land under the per-stem dir (V43D-5).
+    assert!(
+        stdout.contains("Running tests/basic.c"),
+        "missing basic.c banner:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Running tests/extra.c"),
+        "missing extra.c banner:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("test/with_itests/basic/basic"),
+        "basic exe not at per-stem path:\n{stdout}"
+    );
+
+    // Integration test fns ran (bare names, root module dropped).
+    assert!(
+        stdout.contains("test test_add_via_public ... ok"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("test test_mul_via_public ... ok"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("test test_add_again ... ok"), "{stdout}");
+
+    // Stem-sort order: basic.c banner precedes extra.c banner
+    // (V43D-1 deterministic run order).
+    let basic_at = stdout.find("Running tests/basic.c").unwrap();
+    let extra_at = stdout.find("Running tests/extra.c").unwrap();
+    assert!(
+        basic_at < extra_at,
+        "integration exes not stem-sorted:\n{stdout}"
+    );
+}
+
+#[test]
+fn itest_exes_land_at_per_stem_paths() {
+    // V43D-5/V43D-11: one exe per file at
+    // target/debug/test/<crate>/<stem>/<stem>, so the exe file
+    // and its per-stem cwd directory coexist.
+    let (_tmp, dir) = stage("with_itests");
+    assert_success(&cust(&dir, ["test"]));
+
+    for stem in ["basic", "extra"] {
+        let exe = dir.join(format!("target/debug/test/with_itests/{stem}/{stem}"));
+        assert!(
+            exe.is_file(),
+            "integration exe missing at {}",
+            exe.display()
+        );
+    }
+}
+
+#[test]
+fn itest_failure_sets_exit_one() {
+    // V43D-10: a failing integration test makes `cust test`
+    // exit 1, even when unit tests pass.
+    let (_tmp, dir) = stage("with_itests");
+    fs::write(
+        dir.join("tests/failing.c"),
+        "#cust use with_itests;\n\
+         [[cust::test]] int test_fails(void) { cust_assert_eq(add(1, 1), 99); return 0; }\n",
+    )
+    .unwrap();
+
+    let out = cust(&dir, ["test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("test test_fails ... FAILED"), "{stdout}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "wanted exit 1\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn itest_cannot_reach_crate_private_symbol() {
+    // V43D-3: integration tests link the public surface only.
+    // Referencing a crate-private `static` helper (not in
+    // <crate>.h) fails to compile.
+    let (_tmp, dir) = stage("with_itests");
+    fs::write(
+        dir.join("tests/reach.c"),
+        "#cust use with_itests;\n\
+         [[cust::test]] int test_reach(void) { return secret(); }\n",
+    )
+    .unwrap();
+
+    let out = cust(&dir, ["test"]);
+    assert!(
+        !out.status.success(),
+        "expected compile failure reaching a crate-private symbol"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("secret"),
+        "expected an error mentioning `secret`:\n{combined}"
+    );
+}
+
+#[test]
+fn itest_incremental_rebuild_isolated_per_file() {
+    // V43D verification #3: editing one integration file and
+    // re-running rebuilds only that exe; the sibling's exe is
+    // untouched (Ninja incremental). We assert correctness here
+    // (both still pass after editing basic.c); fine-grained
+    // mtime checks are covered by the Ninja graph itself.
+    let (_tmp, dir) = stage("with_itests");
+    assert_success(&cust(&dir, ["test"]));
+
+    // Add a third test fn to basic.c and re-run.
+    fs::write(
+        dir.join("tests/basic.c"),
+        "#cust use with_itests;\n\
+         [[cust::test]] int test_add_via_public(void) { cust_assert_eq(add(2, 3), 5); return 0; }\n\
+         [[cust::test]] void test_mul_via_public(void) { cust_assert(mul(3, 4) == 12); }\n\
+         [[cust::test]] int test_added_later(void) { cust_assert_eq(add(0, 0), 0); return 0; }\n",
+    )
+    .unwrap();
+
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("test test_added_later ... ok"), "{stdout}");
+    assert!(stdout.contains("test test_add_again ... ok"), "{stdout}");
+}
+
+#[test]
+fn itest_subdirectories_are_ignored() {
+    // V43D-1 no-recursion + V43D-2 deferral: a tests/sub/ dir is
+    // silently ignored — no error, no extra exe.
+    let (_tmp, dir) = stage("with_itests");
+    fs::create_dir_all(dir.join("tests/sub")).unwrap();
+    fs::write(
+        dir.join("tests/sub/nested.c"),
+        "#cust use with_itests;\n\
+         [[cust::test]] int test_nested(void) { return 0; }\n",
+    )
+    .unwrap();
+
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The nested file is NOT run as its own exe.
+    assert!(
+        !stdout.contains("tests/sub/nested.c"),
+        "subdirectory file should be ignored:\n{stdout}"
+    );
+    assert!(
+        !dir.join("target/debug/test/with_itests/nested").exists(),
+        "no exe should be emitted for a subdirectory test file"
+    );
+}
+
 #[test]
 fn test_build_excludes_cust_test_symbols_from_normal_archive() {
     // Build the with_tests fixture in NORMAL (non-test) mode and

@@ -6,12 +6,12 @@ lock_format_version = 1
 
 [[member]]
 name = "cstd"
-version = "0.4.2"
+version = "0.4.3"
 path = "ccrates/cstd"
 dependencies = []
 
 [[member]]
 name = "hello-cstd"
-version = "0.4.2"
+version = "0.4.3"
 path = "examples/hello-cstd"
 dependencies = ["cstd"]
