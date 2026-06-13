@@ -2031,3 +2031,209 @@ fn multibin_src_bin_subdirs_ignored() {
         "subdir bin leaked"
     );
 }
+
+// ─── v0.4.5: hidden `cust internal` leaf generators (slice A) ──────
+
+/// Build the staged `cross_module_typedef` fixture and return the
+/// canonicalised crate dir (so generated paths match the driver's
+/// canonicalised layout). Skips by returning `None` when the
+/// plugin isn't built.
+fn build_cmt_fixture() -> Option<(TempDir, PathBuf)> {
+    plugin_path()?;
+    let (tmp, dir) = stage("cross_module_typedef");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+    let canon = dir.canonicalize().expect("canonicalise crate dir");
+    Some((tmp, canon))
+}
+
+#[test]
+fn internal_rewrite_file_matches_build_output() {
+    // V45D-2/V45D-3: the hidden `rewrite-file` leaf produces a
+    // rewrite byte-identical to the driver's in-process
+    // `write_rewrite_tree`, because both call `generate::rewrite_one`.
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    let in_process = dir.join("target/debug/.rewrite/cross_module_typedef/src/mem.c");
+    let expected = fs::read(&in_process).expect("in-process rewrite of mem.c");
+
+    let frags_dir = dir.join("target/debug/.h-fragments/cross_module_typedef");
+    let deps_root = dir.join("target/debug/deps");
+    let own_lib_header =
+        dir.join("target/debug/build/cross_module_typedef/include/cross_module_typedef.h");
+    let leaf_out = dir.join("target/debug/leaf-mem.c");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "rewrite-file",
+            "--crate-name",
+            "cross_module_typedef",
+            "--in",
+            dir.join("src/mem.c").to_str().unwrap(),
+            "--out",
+            leaf_out.to_str().unwrap(),
+            "--frags-dir",
+            frags_dir.to_str().unwrap(),
+            "--deps-root",
+            deps_root.to_str().unwrap(),
+            "--own-lib-header",
+            own_lib_header.to_str().unwrap(),
+            "--has-lib",
+        ],
+    );
+    assert_success(&out);
+    let got = fs::read(&leaf_out).expect("leaf rewrite output");
+    assert_eq!(
+        got, expected,
+        "rewrite-file leaf output differs from in-process rewrite"
+    );
+}
+
+#[test]
+fn internal_crate_header_matches_build_output() {
+    // V45D-2/V45D-5: the `crate-header` leaf concatenates the same
+    // bytes as the in-process `write_crate_header`.
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    let in_process =
+        dir.join("target/debug/build/cross_module_typedef/include/cross_module_typedef.h");
+    let expected = fs::read(&in_process).expect("in-process crate header");
+
+    // Fragments in topological order: types (imported by mem) must
+    // precede mem; lib is the root. The driver's topo order for
+    // this crate is [lib, types, mem] (discovery order with the
+    // types→mem edge already satisfied).
+    let frags_dir = dir.join("target/debug/.h-fragments/cross_module_typedef");
+    let leaf_out = dir.join("target/debug/leaf-header.h");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "crate-header",
+            "--crate-name",
+            "cross_module_typedef",
+            "--out",
+            leaf_out.to_str().unwrap(),
+            "--frag",
+            frags_dir.join("lib.cust.h").to_str().unwrap(),
+            "--frag",
+            frags_dir.join("types.cust.h").to_str().unwrap(),
+            "--frag",
+            frags_dir.join("mem.cust.h").to_str().unwrap(),
+        ],
+    );
+    assert_success(&out);
+    let got = fs::read(&leaf_out).expect("leaf header output");
+    assert_eq!(
+        got, expected,
+        "crate-header leaf output differs from in-process header"
+    );
+}
+
+#[test]
+fn internal_surface_module_matches_build_output() {
+    // V45D-2/V45D-4: the `surface-module` leaf reproduces the
+    // driver's fragment for a module byte-for-byte (same
+    // `generate::surface_one_module` + `build_cflags_raw`).
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    let plugin = plugin_path().unwrap();
+    let in_process = dir.join("target/debug/.h-fragments/cross_module_typedef/types.cust.h");
+    let expected = fs::read(&in_process).expect("in-process types fragment");
+
+    let frags_dir = dir.join("target/debug/.h-fragments/cross_module_typedef");
+    let deps_root = dir.join("target/debug/deps");
+    let prelude = dir.join("target/debug/prelude.h");
+    let leaf_frag = dir.join("target/debug/leaf-types.cust.h");
+    let surface_out = dir.join("target/debug/leaf-types.surface.c");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "surface-module",
+            "--source",
+            dir.join("src/types.c").to_str().unwrap(),
+            "--surface-out",
+            surface_out.to_str().unwrap(),
+            "--fragment-out",
+            leaf_frag.to_str().unwrap(),
+            "--frags-dir",
+            frags_dir.to_str().unwrap(),
+            "--deps-root",
+            deps_root.to_str().unwrap(),
+            "--std",
+            "c23",
+            "--cflag",
+            "-O0",
+            "--cflag",
+            "-g3",
+            "--cflag",
+            "-gdwarf-5",
+            "--include",
+            dir.join("src").to_str().unwrap(),
+            "--prelude",
+            prelude.to_str().unwrap(),
+            "--plugin",
+            plugin.to_str().unwrap(),
+        ],
+    );
+    assert_success(&out);
+    let got = fs::read(&leaf_frag).expect("leaf fragment output");
+    assert_eq!(
+        got, expected,
+        "surface-module leaf fragment differs from in-process fragment"
+    );
+}
+
+#[test]
+fn internal_surface_module_requires_upstream_fragment() {
+    // V45D-4 (verification item 12): the one-shot leaf hard-errors
+    // when an imported fragment is absent (a missing DEPENDS edge),
+    // rather than silently blanking the include.
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    let plugin = plugin_path().unwrap();
+    // Point `--frags-dir` at an empty dir so `types.cust.h` (which
+    // `mem` imports) is absent.
+    let empty_frags = dir.join("target/debug/empty-frags");
+    fs::create_dir_all(&empty_frags).unwrap();
+    let deps_root = dir.join("target/debug/deps");
+    let prelude = dir.join("target/debug/prelude.h");
+    let leaf_frag = dir.join("target/debug/leaf-mem.cust.h");
+    let surface_out = dir.join("target/debug/leaf-mem.surface.c");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "surface-module",
+            "--source",
+            dir.join("src/mem.c").to_str().unwrap(),
+            "--surface-out",
+            surface_out.to_str().unwrap(),
+            "--fragment-out",
+            leaf_frag.to_str().unwrap(),
+            "--frags-dir",
+            empty_frags.to_str().unwrap(),
+            "--deps-root",
+            deps_root.to_str().unwrap(),
+            "--std",
+            "c23",
+            "--cflag",
+            "-O0",
+            "--prelude",
+            prelude.to_str().unwrap(),
+            "--plugin",
+            plugin.to_str().unwrap(),
+        ],
+    );
+    assert_failure_with(&out, "does not exist on disk");
+}

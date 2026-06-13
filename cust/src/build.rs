@@ -307,50 +307,7 @@ fn write_one_rewrite(
     m: &Module,
     is_bin_half: bool,
 ) -> Result<()> {
-    let src_text = fs::read_to_string(source_path)
-        .with_context(|| format!("reading `{}`", source_path.display()))?;
-    let scan = mod_scanner::scan(&src_text, source_path)?;
-
     let crate_name = plan.manifest.package_name();
-    let own_lib_header = layout.crate_header_path(crate_name);
-    let rewritten = mod_scanner::rewrite_with(&src_text, source_path, &scan, |d| match &d.kind {
-        crate::mod_scanner::DirectiveKind::UseCrate { name } => {
-            let frag = layout.fragment_path(crate_name, name);
-            Some(format!("#include \"{}\"", frag.display()))
-        }
-        crate::mod_scanner::DirectiveKind::UseDep { name } => {
-            if is_bin_half && plan.kind.has_lib() && name == crate_name {
-                return Some(format!("#include \"{}\"", own_lib_header.display()));
-            }
-            let dep_header = layout
-                .dep_dir(name)
-                .join("include")
-                .join(format!("{name}.h"));
-            Some(format!("#include \"{}\"", dep_header.display()))
-        }
-        crate::mod_scanner::DirectiveKind::Mod { .. } => None,
-    });
-
-    // Validate `#cust use <name>;` resolves to a declared dep or
-    // the own-crate carve-out (bin half of lib+bin). Same shape
-    // compile_one_module enforces; same error format.
-    for d in &scan.directives {
-        if let crate::mod_scanner::DirectiveKind::UseDep { name } = &d.kind {
-            if is_bin_half && plan.kind.has_lib() && name == crate_name {
-                continue;
-            }
-            if !plan.deps.iter().any(|n| n == name) {
-                bail!(
-                    "{}:{}:{}: `#cust use {name};` refers to a crate not \
-                     listed in [dependencies]; add `{name} = {{ path = \"…\" }}`",
-                    source_path.display(),
-                    d.span.line,
-                    d.span.column
-                );
-            }
-        }
-    }
-
     // Output path: target/<profile>/.rewrite/<crate>/<rel>.c
     // where <rel> is the source file's path relative to the
     // crate root, preserving `src/<...>.c` shape. Matches what
@@ -360,18 +317,28 @@ fn write_one_rewrite(
         .strip_prefix(plan.crate_root)
         .unwrap_or(&m.source_path);
     let dst = rewrite_root.join(crate_name).join(rel);
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
-    }
-    write_if_byte_different(&dst, rewritten.as_bytes())?;
-    Ok(())
+    let frags_dir = layout.fragments_dir(crate_name);
+    let deps_root = layout.profile_root.join("deps");
+    let own_lib_header = layout.crate_header_path(crate_name);
+    let ctx = crate::generate::RewriteCtx {
+        crate_name,
+        source_path,
+        out_path: &dst,
+        frags_dir: &frags_dir,
+        deps_root: &deps_root,
+        own_lib_header: &own_lib_header,
+        deps: plan.deps,
+        is_bin_half,
+        has_lib: plan.kind.has_lib(),
+    };
+    crate::generate::rewrite_one(&ctx)
 }
 
 /// Write `bytes` to `path` only if the contents differ from
 /// what's already on disk (or the file doesn't exist yet). Saves
 /// `CMake`/Ninja from spuriously rebuilding TUs whose post-rewrite
 /// bytes are unchanged across `cust build` invocations.
-fn write_if_byte_different(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_if_byte_different(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Ok(existing) = fs::read(path) {
         if existing == bytes {
             return Ok(());
@@ -623,66 +590,11 @@ fn surface_pass(
     modules: &[Module],
 ) -> Result<()> {
     let crate_name = plan.manifest.package_name();
+    let frags_dir = layout.fragments_dir(crate_name);
+    let deps_root = layout.profile_root.join("deps");
     for m in modules {
-        let src_text = fs::read_to_string(&m.source_path)
-            .with_context(|| format!("reading `{}`", m.source_path.display()))?;
-        let scan = mod_scanner::scan(&src_text, &m.source_path)?;
-        // Lower `#cust use` directives to `#include`s of the
-        // matching fragment / dep header **when the target file
-        // already exists on disk**. On iteration 1 of the fixed-
-        // point loop, sibling fragments don't exist yet and the
-        // directive is blanked (clang sees undeclared identifiers,
-        // recovers, and the plugin emits a best-effort fragment).
-        // Subsequent iterations pick up the now-written fragments
-        // and re-resolve typedef/struct names properly. Without
-        // this lowering the fixed-point loop is structurally
-        // inert — surface_pass would never see imported types,
-        // so a `[[cust::pub]] usize foo(void)` in module M would
-        // be exported as `int foo(void)` (clang's implicit-int
-        // recovery for undeclared identifiers in declarator
-        // position), silently corrupting the published ABI.
-        //
-        // Cross-crate `#cust use <dep>;` is always included
-        // because workspace topo-sort guarantees deps are built
-        // (and therefore their headers exist) before this pass
-        // runs. Unknown deps are not validated here — codegen
-        // does that with a proper line:column diagnostic — and
-        // are blanked so a missing path doesn't produce an
-        // include-resolution error during the tolerant surface
-        // compile.
-        let rewritten =
-            mod_scanner::rewrite_with(&src_text, &m.source_path, &scan, |d| match &d.kind {
-                crate::mod_scanner::DirectiveKind::UseCrate { name } => {
-                    let frag = layout.fragment_path(crate_name, name);
-                    if frag.is_file() {
-                        Some(format!("#include \"{}\"", frag.display()))
-                    } else {
-                        None
-                    }
-                }
-                crate::mod_scanner::DirectiveKind::UseDep { name } => {
-                    if plan.deps.iter().any(|n| n == name) {
-                        let dep_header = layout
-                            .dep_dir(name)
-                            .join("include")
-                            .join(format!("{name}.h"));
-                        Some(format!("#include \"{}\"", dep_header.display()))
-                    } else {
-                        None
-                    }
-                }
-                crate::mod_scanner::DirectiveKind::Mod { .. } => None,
-            });
-
         let surface_path = crate_build_dir.join(format!("{}.surface.c", m.qualified_name));
-        fs::write(&surface_path, &rewritten)
-            .with_context(|| format!("writing `{}`", surface_path.display()))?;
-
         let fragment_path = layout.fragment_path(crate_name, &m.qualified_name);
-        if let Some(parent) = fragment_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating `{}`", parent.display()))?;
-        }
 
         // V40D-6 + RQ-V40-2: in test-build mode, also request
         // the per-module test-discovery sidecar. Always emit
@@ -707,13 +619,9 @@ fn surface_pass(
         };
 
         let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
-        // Build flags but adjust: -fsyntax-only instead of `-c -o`.
-        // Demote a couple of errors to warnings so unresolved
-        // cross-module references in this pass don't stop the
-        // plugin from running.
         let dummy_obj = crate_build_dir.join(format!("{}.surface.o", m.qualified_name));
         let includes: [&Path; 1] = [original_dir];
-        let mut cflags = build_cflags(
+        let base_cflags = build_cflags(
             plan,
             profile,
             prelude,
@@ -726,38 +634,20 @@ fn surface_pass(
                 module: sidecar_path.as_ref().map(|_| m.qualified_name.as_str()),
             },
         );
-        // Strip trailing `-c -o <obj> <src>` (4 args), replace
-        // with `-fsyntax-only -Wno-error -Wno-implicit-function-declaration <src>`.
-        let new_len = cflags.len().saturating_sub(4);
-        cflags.truncate(new_len);
-        cflags.push("-fsyntax-only".to_string());
-        cflags.push("-Wno-error".to_string());
-        cflags.push("-Wno-implicit-function-declaration".to_string());
-        cflags.push(surface_path.display().to_string());
 
-        // Run clang. We intentionally DO NOT check the exit
-        // status: a non-zero exit here is the expected case for
-        // any module that imports from a sibling whose fragment
-        // doesn't exist yet. The plugin's HandleTranslationUnit
-        // runs regardless of recoverable parse errors, so the
-        // fragment gets written either way. We send stderr to
-        // /dev/null to avoid drowning the user in expected
-        // diagnostics; real errors will resurface in the codegen
-        // pass against the same source.
-        let _ = plan
-            .clang
-            .command()
-            .args(&cflags)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .with_context(|| {
-                format!(
-                    "invoking `{}` for surface pass on module `{}`",
-                    plan.clang.path.display(),
-                    m.qualified_name
-                )
-            })?;
+        // V40D-11 fixed-point caller: blank a missing imported
+        // fragment (the loop is the recovery mechanism), so
+        // `require_upstream` is `false`.
+        let ctx = crate::generate::SurfaceCtx {
+            source_path: &m.source_path,
+            surface_out: &surface_path,
+            fragment_out: &fragment_path,
+            frags_dir: &frags_dir,
+            deps_root: &deps_root,
+            deps: plan.deps,
+            require_upstream: false,
+        };
+        crate::generate::surface_one_module(&ctx, plan.clang, &base_cflags)?;
     }
     Ok(())
 }
@@ -885,22 +775,57 @@ pub fn build_cflags(
     extra_includes: &[&Path],
     plugin_out: PluginOutputs<'_>,
 ) -> Vec<String> {
-    let mut flags: Vec<String> = Vec::new();
-
-    // -std=
     let std_flag = plan
         .manifest
         .clang
         .std
         .as_deref()
         .unwrap_or_else(|| plan.clang.default_std());
+    // `mid_cflags` = profile cflags followed by manifest
+    // `[clang] extra-cflags`, in that order (V45D-15: the
+    // `surface-module` CLI leaf serialises the same list so its
+    // clang invocation is byte-identical).
+    let mut mid_cflags = profile.cflags();
+    mid_cflags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
+    build_cflags_raw(
+        std_flag,
+        &mid_cflags,
+        plan.test_build,
+        plan.plugin,
+        prelude,
+        source,
+        object,
+        extra_includes,
+        plugin_out,
+    )
+}
+
+/// Primitive form of [`build_cflags`] taking only explicit values
+/// (no `BuildPlan` / `ResolvedProfile`) so the hidden
+/// `cust internal surface-module` leaf (V45D-2) can reproduce the
+/// exact same clang argv from its command-line arguments. `mid_cflags`
+/// is the profile cflags followed by `[clang] extra-cflags`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_cflags_raw(
+    std_flag: &str,
+    mid_cflags: &[String],
+    test_build: bool,
+    plugin: Option<&Plugin>,
+    prelude: &Path,
+    source: &Path,
+    object: &Path,
+    extra_includes: &[&Path],
+    plugin_out: PluginOutputs<'_>,
+) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+
+    // -std=
     flags.push(format!("-std={std_flag}"));
 
-    flags.extend(profile.cflags());
-    flags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
+    flags.extend(mid_cflags.iter().cloned());
 
     flags.push("-fvisibility=hidden".to_string());
-    if plan.test_build {
+    if test_build {
         // v0.3.2 V32D-3 / v0.4.0 V40D-14: -DCUST_TEST_BUILD=1
         // tells the plugin to attach normal external linkage to
         // `[[cust::test]]` decls (so the runner TU can extern
@@ -911,7 +836,7 @@ pub fn build_cflags(
         // defined in the generated runner TU).
         flags.push("-DCUST_TEST_BUILD=1".to_string());
     }
-    if let Some(plugin) = plan.plugin {
+    if let Some(plugin) = plugin {
         flags.push(plugin.fplugin_flag());
         if let Some(path) = plugin_out.fragment {
             flags.push(format!("-fplugin-arg-cust-fragment-out={}", path.display()));
@@ -1002,52 +927,18 @@ pub fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
 /// and intra-crate fragment includes are forward-decl-only so
 /// they can't reintroduce one.
 fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module]) -> Result<()> {
-    use std::fmt::Write as _;
-
-    let path = layout.crate_header_path(crate_name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
-    }
-
     let ordered = topo_order_modules(modules);
-
-    let guard = header_guard(crate_name);
-    let mut out = String::new();
-    out.push_str("/* @generated by cust — DO NOT EDIT */\n");
-    let _ = writeln!(out, "/* Public surface of crate `{crate_name}`. */\n");
-    let _ = writeln!(out, "#ifndef {guard}\n#define {guard}\n");
-    // No `#include` injection: the generated header is pure
-    // declarations. Crates whose public surface mentions
-    // fixed-width / size / bool types must export their own
-    // `[[cust::pub]] typedef`s (mirrors Rust's `pub use` story —
-    // every type a consumer reaches for must be reachable via
-    // the producer's surface). See cust-design.md §5.
-    out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
-
-    for m in &ordered {
-        let frag = layout.fragment_path(crate_name, &m.qualified_name);
-        let Ok(body) = fs::read_to_string(frag) else {
-            continue; // module had no [[cust::pub]] decls; plugin emitted nothing
-        };
-        let _ = writeln!(out, "/* --- module `{}` --- */", m.qualified_name);
-        out.push_str(strip_fragment_header_comment(&body));
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-
-    out.push_str("#ifdef __cplusplus\n} /* extern \"C\" */\n#endif\n\n");
-    let _ = writeln!(out, "#endif /* {guard} */");
-
-    // v0.4.2: incremental hygiene. CMake/Ninja's `OBJECT_DEPENDS`
-    // edges (V42D-6) trigger TU recompiles when the depended-on
-    // file's mtime advances; rewriting `cstd.h` unconditionally
-    // would re-codegen every consumer's main.c every build even
-    // when the public surface didn't change. Compare bytes before
-    // touching.
-    write_if_byte_different(&path, out.as_bytes())?;
-    Ok(())
+    let frags: Vec<(String, PathBuf)> = ordered
+        .iter()
+        .map(|m| {
+            (
+                m.qualified_name.clone(),
+                layout.fragment_path(crate_name, &m.qualified_name),
+            )
+        })
+        .collect();
+    let out_path = layout.crate_header_path(crate_name);
+    crate::generate::write_crate_header_concat(crate_name, &out_path, &frags)
 }
 
 /// Order `modules` so any module appears after every module it
@@ -1126,7 +1017,7 @@ fn topo_order_modules(modules: &[Module]) -> Vec<&Module> {
 /// cargo's `name = "my-crate"` → C-identifier sanitisation: `-`
 /// and any other non-alphanumeric becomes `_`, upper-case the
 /// whole thing, and suffix `_H`.
-fn header_guard(crate_name: &str) -> String {
+pub fn header_guard(crate_name: &str) -> String {
     let mut s = String::with_capacity(crate_name.len() + 2);
     for c in crate_name.chars() {
         if c.is_ascii_alphanumeric() {
@@ -1144,7 +1035,7 @@ fn header_guard(crate_name: &str) -> String {
 /// The fragment plugin's banner is exactly two lines starting
 /// with `/* @generated` and `/* Forward declarations of`, plus a
 /// blank — see `plugin/src/plugin.cc::buildFragmentContents`.
-fn strip_fragment_header_comment(body: &str) -> &str {
+pub fn strip_fragment_header_comment(body: &str) -> &str {
     body.strip_prefix("/* @generated by cust plugin — DO NOT EDIT */\n")
         .and_then(|s| s.strip_prefix("/* Forward declarations of [[cust::pub]] items. */\n"))
         .map_or(body, |s| s.trim_start_matches('\n'))

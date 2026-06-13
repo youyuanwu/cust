@@ -50,6 +50,115 @@ pub enum Cmd {
     Clean,
     /// Scaffold a new cust crate at `<path>`.
     New(NewArgs),
+    /// v0.4.5 V45D-2: hidden leaf generators invoked by the
+    /// generated `CMakeLists` (NOT a public contract). Each
+    /// produces one artifact (a `#cust use` rewrite, one module's
+    /// surface fragment, or the concatenated crate header) so
+    /// Ninja can own generation incrementality.
+    #[command(hide = true, subcommand)]
+    Internal(InternalCmd),
+}
+
+/// v0.4.5 V45D-2: the three `cust internal …` leaf generators.
+/// All hidden; the emitter bakes the exact argv into the
+/// `add_custom_command` lines.
+#[derive(Debug, Subcommand)]
+pub enum InternalCmd {
+    /// Lower one source file's `#cust use` directives to an
+    /// `#include`-only rewrite (V45D-3).
+    #[command(hide = true)]
+    RewriteFile(RewriteFileArgs),
+    /// Surface-compile one module to produce its fragment header
+    /// (V45D-4). One-shot — imported fragments must already exist.
+    #[command(hide = true)]
+    SurfaceModule(SurfaceModuleArgs),
+    /// Concatenate per-module fragments into the published crate
+    /// header (V45D-5).
+    #[command(hide = true)]
+    CrateHeader(CrateHeaderArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RewriteFileArgs {
+    /// The crate the source belongs to (own-lib carve-out).
+    #[arg(long)]
+    pub crate_name: String,
+    /// Source `.c` to lower.
+    #[arg(long = "in")]
+    pub input: PathBuf,
+    /// Rewritten output path.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// `target/<profile>/.h-fragments/<crate>/`.
+    #[arg(long)]
+    pub frags_dir: PathBuf,
+    /// `target/<profile>/deps/`.
+    #[arg(long)]
+    pub deps_root: PathBuf,
+    /// The member's own published header (bin-half carve-out).
+    #[arg(long)]
+    pub own_lib_header: PathBuf,
+    /// Dep crate names this source may `#cust use <dep>;`.
+    #[arg(long = "dep")]
+    pub deps: Vec<String>,
+    /// Lowering the bin half of a lib+bin crate.
+    #[arg(long)]
+    pub bin_half: bool,
+    /// Whether the member has a lib half (gates the carve-out).
+    #[arg(long)]
+    pub has_lib: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SurfaceModuleArgs {
+    /// Module source `.c`.
+    #[arg(long)]
+    pub source: PathBuf,
+    /// Where to write the lowered surface TU.
+    #[arg(long)]
+    pub surface_out: PathBuf,
+    /// Where the plugin writes this module's fragment header.
+    #[arg(long)]
+    pub fragment_out: PathBuf,
+    /// `target/<profile>/.h-fragments/<crate>/`.
+    #[arg(long)]
+    pub frags_dir: PathBuf,
+    /// `target/<profile>/deps/`.
+    #[arg(long)]
+    pub deps_root: PathBuf,
+    /// Dep crate names this module may `#cust use <dep>;`.
+    #[arg(long = "dep")]
+    pub deps: Vec<String>,
+    /// `-std=<value>` for the surface compile.
+    #[arg(long)]
+    pub std: String,
+    /// Mid cflags (profile cflags + `[clang] extra-cflags`), in
+    /// order. Repeated.
+    #[arg(long = "cflag", allow_hyphen_values = true)]
+    pub cflags: Vec<String>,
+    /// Extra `-I<dir>` include dirs. Repeated.
+    #[arg(long = "include")]
+    pub includes: Vec<PathBuf>,
+    /// The materialised prelude header (`-include`d).
+    #[arg(long)]
+    pub prelude: PathBuf,
+    /// The cust clang plugin `.so`. Omitted ⇒ no plugin (no
+    /// fragment emitted — only meaningful for `--no-plugin`).
+    #[arg(long)]
+    pub plugin: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CrateHeaderArgs {
+    /// The crate whose surface is being published.
+    #[arg(long)]
+    pub crate_name: String,
+    /// Output path for the concatenated `<crate>.h`.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Fragment header paths in topological order. Repeated.
+    #[arg(long = "frag")]
+    pub frags: Vec<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -202,6 +311,7 @@ impl Cli {
             ),
             Cmd::Clean => run_clean(),
             Cmd::New(args) => run_new(&args),
+            Cmd::Internal(cmd) => run_internal(cmd),
         }
     }
 }
@@ -394,6 +504,87 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
         println!("  Checked {name}");
     }
     Ok(())
+}
+
+/// v0.4.5 V45D-2: dispatch the hidden `cust internal …` leaf
+/// generators. Each re-resolves only what its arguments name (no
+/// workspace discovery, no `Cust.lock`), produces one artifact,
+/// and exits. Invoked solely by the generated `CMakeLists`.
+fn run_internal(cmd: InternalCmd) -> Result<()> {
+    match cmd {
+        InternalCmd::RewriteFile(a) => {
+            let deps: Vec<&str> = a.deps.iter().map(String::as_str).collect();
+            let ctx = crate::generate::RewriteCtx {
+                crate_name: &a.crate_name,
+                source_path: &a.input,
+                out_path: &a.out,
+                frags_dir: &a.frags_dir,
+                deps_root: &a.deps_root,
+                own_lib_header: &a.own_lib_header,
+                deps: &deps,
+                is_bin_half: a.bin_half,
+                has_lib: a.has_lib,
+            };
+            crate::generate::rewrite_one(&ctx)
+        }
+        InternalCmd::SurfaceModule(a) => {
+            let clang = Clang::discover()?;
+            let plugin = a.plugin.map(|path| crate::plugin::Plugin { path });
+            let includes: Vec<&Path> = a.includes.iter().map(PathBuf::as_path).collect();
+            // V45D-15: rebuild the exact `build_cflags` argv from
+            // the serialised pieces. Object path is irrelevant —
+            // `surface_one_module` truncates the trailing
+            // `-c -o <obj> <src>`.
+            let dummy_obj = a.surface_out.with_extension("surface.o");
+            let base_cflags = crate::build::build_cflags_raw(
+                &a.std,
+                &a.cflags,
+                false,
+                plugin.as_ref(),
+                &a.prelude,
+                &a.surface_out,
+                &dummy_obj,
+                &includes,
+                crate::build::PluginOutputs {
+                    fragment: Some(&a.fragment_out),
+                    test_sidecar: None,
+                    module: None,
+                },
+            );
+            let deps: Vec<&str> = a.deps.iter().map(String::as_str).collect();
+            let ctx = crate::generate::SurfaceCtx {
+                source_path: &a.source,
+                surface_out: &a.surface_out,
+                fragment_out: &a.fragment_out,
+                frags_dir: &a.frags_dir,
+                deps_root: &a.deps_root,
+                deps: &deps,
+                // V45D-4: one-shot leaf — a missing imported
+                // fragment is a graph bug, not a recoverable blank.
+                require_upstream: true,
+            };
+            crate::generate::surface_one_module(&ctx, &clang, &base_cflags)
+        }
+        InternalCmd::CrateHeader(a) => {
+            // Derive each fragment's qualified name from its file
+            // stem (`<qname>.cust.h`), preserving the emitter's
+            // topological `--frag` order.
+            let frags: Vec<(String, PathBuf)> = a
+                .frags
+                .iter()
+                .map(|p| {
+                    let qname = p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.strip_suffix(".cust.h"))
+                        .unwrap_or_default()
+                        .to_string();
+                    (qname, p.clone())
+                })
+                .collect();
+            crate::generate::write_crate_header_concat(&a.crate_name, &a.out, &frags)
+        }
+    }
 }
 
 /// Format a list of names as `` `a`, `b`, `c` `` for error

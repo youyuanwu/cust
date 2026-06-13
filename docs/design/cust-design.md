@@ -966,7 +966,7 @@ What ships in v0.4.3 (V43D-1 through V43D-13):
 * `cust test` runs unit tests then integration tests per
   member, with the `Running tests/<file>.c (<exe>)` banner,
   per-stem cwd (V43D-11), and exit 1 if any fails (V43D-10).
-* Deferred to v0.4.5: `tests/common/` shared helpers
+* Deferred to v0.4.6: `tests/common/` shared helpers
   (V43D-2), `--test <stem>` filter (V43D-9), the Cargo
   `tests/<name>/main.c` multi-file form. See
   [v0.4.3.md](v0.4.3.md) for the full V43D‑N record.
@@ -1418,15 +1418,33 @@ Roadmap bullets here are deliberately short:
     — `cust check` is a tolerant lib-surface pass, same finding
     as V43D-13), `default-run` / `required-features` /
     bin-internal tests (RQ-V44-1/2/3). See [v0.4.4.md](v0.4.4.md).
-  - **v0.4.5** — `cust test` follow-ups:
+  - **v0.4.5** — CMake-owned generation
+    (`add_custom_command` codegen graph — V45D-1 through
+    V45D-13). Moves fragment-header + `#cust use` rewrite
+    generation out of the driver's unconditional pre-pass
+    and into CMake custom commands with declared
+    `OUTPUT`/`DEPENDS` edges, so Ninja owns generation
+    incrementality. Reverses v0.4.2's V42D-17 (driver-owned)
+    for the build/run path: the per-module surface pass
+    becomes a topological DAG (V45D-4), so a no-op `cust
+    build` spawns zero codegen processes (V45D-12). A new
+    hidden `cust internal {rewrite-file,surface-module,
+    crate-header}` group (V45D-2) is the callback CMake
+    invokes. Cyclic `[[cust::pub_repr]]` SCCs fall back to
+    one coarse command (V45D-6). `cust check` (V45D-8) and
+    `cust test` (V45D-11) generation stay driver-side this
+    milestone. See [v0.4.5.md](v0.4.5.md).
+  - **v0.4.6** — `cust test` follow-ups:
     `[[cust::test(inline)]]`,
     `should_panic`, per-test timeout, `--nocapture` /
     `--exact` / multi-filter / `--test-threads N`,
     `[profile.test]` plumbing, `tests/common/` shared
     helpers + the Cargo `tests/<name>/main.c` multi-file
     form (`tests/` integration tests themselves shipped in
-    v0.4.3).
-  - **v0.4.6** — dependency resolver + registry. Initial
+    v0.4.3). Also picks up the v0.4.5 deferred test-path
+    generation migration (RQ-V45-3: `internal test-sidecar`
+    + `internal test-runner` custom commands).
+  - **v0.4.7** — dependency resolver + registry. Initial
     registry wire protocol (`Index` trait, `file://` first
     per V3D-1's deferral), `cust add`, semver version
     resolution, `Cust.lock` source hashes,
@@ -1434,10 +1452,10 @@ Roadmap bullets here are deliberately short:
     work was twice displaced from the v0.4.1 slot (first by
     FFI, then by the FFI deferral); it's now slotted after
     the rest of the v0.4.x line.
-  - **v0.4.7+** — when v0.4.1's FFI design resumes, it
+  - **v0.4.8+** — when v0.4.1's FFI design resumes, it
     picks up here (or sooner if a resumption criterion
     fires earlier — see [v0.4.1.md](v0.4.1.md)).
-  - **v0.4.8+** — build scripts (`build.cust.c`) with the
+  - **v0.4.9+** — build scripts (`build.cust.c`) with the
     §12 hang-protection timeout. Pushed back from the
     original v0.4.2 slot when v0.4.2 was repurposed for
     the CMake backend; §12 design intact, only the
