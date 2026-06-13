@@ -53,6 +53,7 @@ fn cwork_view() -> WorkspaceView {
         cust_version: "0.4.2".to_string(),
         c_standard: "23".to_string(),
         plugin_path: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+        cust_exe: PathBuf::from("/ws/bin/cust"),
         members: vec![
             MemberView {
                 name: "cstd".to_string(),
@@ -128,6 +129,30 @@ fn cwork_view() -> WorkspaceView {
                         runtime_output_dir: PathBuf::from("/ws/target/debug/test/cstd/basic"),
                     },
                 ],
+                rewrites: vec![
+                    RewriteCommand {
+                        out: PathBuf::from("/ws/target/debug/.rewrite/cstd/src/types.c"),
+                        origin: PathBuf::from("/ws/cstd/src/types.c"),
+                        crate_name: "cstd".to_string(),
+                        frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/cstd"),
+                        deps_root: PathBuf::from("/ws/target/debug/deps"),
+                        own_lib_header: PathBuf::from("/ws/target/debug/build/cstd/include/cstd.h"),
+                        deps: vec![],
+                        is_bin_half: false,
+                        has_lib: true,
+                    },
+                    RewriteCommand {
+                        out: PathBuf::from("/ws/target/debug/.rewrite/cstd/src/lib.c"),
+                        origin: PathBuf::from("/ws/cstd/src/lib.c"),
+                        crate_name: "cstd".to_string(),
+                        frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/cstd"),
+                        deps_root: PathBuf::from("/ws/target/debug/deps"),
+                        own_lib_header: PathBuf::from("/ws/target/debug/build/cstd/include/cstd.h"),
+                        deps: vec![],
+                        is_bin_half: false,
+                        has_lib: true,
+                    },
+                ],
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -152,6 +177,19 @@ fn cwork_view() -> WorkspaceView {
                 compile_options,
                 test_target: None,
                 integration_tests: vec![],
+                rewrites: vec![RewriteCommand {
+                    out: PathBuf::from("/ws/target/debug/.rewrite/hello-cstd/src/main.c"),
+                    origin: PathBuf::from("/ws/hello-cstd/src/main.c"),
+                    crate_name: "hello-cstd".to_string(),
+                    frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/hello-cstd"),
+                    deps_root: PathBuf::from("/ws/target/debug/deps"),
+                    own_lib_header: PathBuf::from(
+                        "/ws/target/debug/build/hello-cstd/include/hello-cstd.h",
+                    ),
+                    deps: vec!["cstd".to_string()],
+                    is_bin_half: false,
+                    has_lib: false,
+                }],
             },
         ],
     }
@@ -222,6 +260,7 @@ fn lib_and_bin_member_emits_both_targets() {
         cust_version: "0.4.2".to_string(),
         c_standard: "23".to_string(),
         plugin_path: None,
+        cust_exe: PathBuf::from("/ws/bin/cust"),
         members: vec![MemberView {
             name: "app".to_string(),
             kind: MemberKind::LibAndBin,
@@ -245,6 +284,30 @@ fn lib_and_bin_member_emits_both_targets() {
             compile_options: vec!["-O0".to_string()],
             test_target: None,
             integration_tests: vec![],
+            rewrites: vec![
+                RewriteCommand {
+                    out: PathBuf::from("/ws/target/debug/.rewrite/app/src/lib.c"),
+                    origin: PathBuf::from("/ws/app/src/lib.c"),
+                    crate_name: "app".to_string(),
+                    frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/app"),
+                    deps_root: PathBuf::from("/ws/target/debug/deps"),
+                    own_lib_header: PathBuf::from("/ws/target/debug/build/app/include/app.h"),
+                    deps: vec![],
+                    is_bin_half: false,
+                    has_lib: true,
+                },
+                RewriteCommand {
+                    out: PathBuf::from("/ws/target/debug/.rewrite/app/src/main.c"),
+                    origin: PathBuf::from("/ws/app/src/main.c"),
+                    crate_name: "app".to_string(),
+                    frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/app"),
+                    deps_root: PathBuf::from("/ws/target/debug/deps"),
+                    own_lib_header: PathBuf::from("/ws/target/debug/build/app/include/app.h"),
+                    deps: vec![],
+                    is_bin_half: true,
+                    has_lib: true,
+                },
+            ],
         }],
     };
     let out = generate(&view);
@@ -255,6 +318,12 @@ fn lib_and_bin_member_emits_both_targets() {
     );
     assert!(out.contains("OUTPUT_NAME app"));
     assert!(out.contains("target_link_libraries(app-bin PRIVATE"));
+    // V45D-3: bin-half rewrite carries `--bin-half`; lib does not.
+    assert!(
+        out.contains("internal rewrite-file"),
+        "rewrite custom commands emitted"
+    );
+    assert!(out.contains("--bin-half"), "bin-half flag present");
 }
 
 #[test]

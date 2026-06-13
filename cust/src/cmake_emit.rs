@@ -65,6 +65,12 @@ pub struct WorkspaceView {
     /// `WorkspaceView` because it still feeds the configure-skip
     /// stamp (V42D-8 + RQ-V42-1: plugin bytes hash into the stamp).
     pub plugin_path: Option<PathBuf>,
+    /// v0.4.5 V45D-7: absolute path to the cust binary, baked into
+    /// every `cust internal …` custom-command line (captured via
+    /// `std::env::current_exe()` at `collect_view` time). Part of
+    /// the emitted bytes, so a cust relocation churns the V42D-8
+    /// stamp and forces a reconfigure.
+    pub cust_exe: PathBuf,
     /// Members in topological (build) order: dependencies before
     /// consumers. V42D-4 + same rule the existing
     /// `Workspace::build_order` applies.
@@ -162,6 +168,42 @@ pub struct MemberView {
     /// so they get no integration targets — mirrors
     /// `test_target` being `None` for them).
     pub integration_tests: Vec<IntegrationTestView>,
+    /// v0.4.5 V45D-3: one `cust internal rewrite-file` custom
+    /// command per lib + bin source. The command produces this
+    /// member's `.rewrite/<crate>/<rel>.c` files (which are the
+    /// SOURCEs of the library / executable targets above, so they
+    /// anchor themselves into the build — V45D-14). Empty in unit
+    /// tests that fabricate a view without exercising the rewrite
+    /// path. Integration-test rewrites are NOT here (V45D-11 keeps
+    /// them driver-side this milestone).
+    pub rewrites: Vec<RewriteCommand>,
+}
+
+/// v0.4.5 V45D-3: one `cust internal rewrite-file` invocation,
+/// fully resolved at `collect_view` time. The emitter lowers it
+/// to an `add_custom_command(OUTPUT <out> … DEPENDS <origin>)`.
+#[derive(Debug, Clone)]
+pub struct RewriteCommand {
+    /// `--out`: the `.rewrite/<crate>/<rel>.c` produced. Matches a
+    /// SOURCE of the consuming lib/bin target (the anchor).
+    pub out: PathBuf,
+    /// `--in` and the sole `DEPENDS`: the original `src/<…>.c`.
+    pub origin: PathBuf,
+    /// `--crate-name`.
+    pub crate_name: String,
+    /// `--frags-dir`: `target/<profile>/.h-fragments/<crate>/`.
+    pub frags_dir: PathBuf,
+    /// `--deps-root`: `target/<profile>/deps/`.
+    pub deps_root: PathBuf,
+    /// `--own-lib-header`: the member's published `<crate>.h`
+    /// (bin-half carve-out target).
+    pub own_lib_header: PathBuf,
+    /// `--dep <d>` for each declared dependency (sorted, V45D-15).
+    pub deps: Vec<String>,
+    /// `--bin-half`: lowering the bin half of a lib+bin crate.
+    pub is_bin_half: bool,
+    /// `--has-lib`: the member has a library half.
+    pub has_lib: bool,
 }
 
 /// v0.4.4 V44D-5: one binary target. A member emits one
@@ -327,6 +369,7 @@ pub fn generate(view: &WorkspaceView) -> String {
 
     // Per-member blocks.
     for m in &view.members {
+        emit_rewrite_commands(&mut out, &view.cust_exe, m);
         if m.kind.has_lib() {
             emit_library(&mut out, m);
         }
@@ -342,6 +385,59 @@ pub fn generate(view: &WorkspaceView) -> String {
     }
 
     out
+}
+
+/// v0.4.5 V45D-3: emit one `add_custom_command` per lib + bin
+/// source so Ninja produces the `.rewrite/<crate>/<rel>.c` files
+/// lazily (only when their `src/<…>.c` input changed) instead of
+/// the driver rewriting every source eagerly on every build. The
+/// outputs are SOURCEs of the consuming lib/exe targets, so they
+/// anchor themselves into the graph (V45D-14). One `internal
+/// rewrite-file` callback per command.
+fn emit_rewrite_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    if m.rewrites.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(out, "# ---- crate: {} (generated rewrites) ----", m.name);
+    for rw in &m.rewrites {
+        out.push_str("add_custom_command(\n");
+        let _ = writeln!(out, "    OUTPUT \"{}\"", rw.out.display());
+        let _ = writeln!(
+            out,
+            "    COMMAND \"{}\" internal rewrite-file",
+            cust_exe.display()
+        );
+        let _ = writeln!(out, "            --crate-name {}", rw.crate_name);
+        let _ = writeln!(out, "            --in \"{}\"", rw.origin.display());
+        let _ = writeln!(out, "            --out \"{}\"", rw.out.display());
+        let _ = writeln!(
+            out,
+            "            --frags-dir \"{}\"",
+            rw.frags_dir.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --deps-root \"{}\"",
+            rw.deps_root.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --own-lib-header \"{}\"",
+            rw.own_lib_header.display()
+        );
+        for dep in &rw.deps {
+            let _ = writeln!(out, "            --dep {dep}");
+        }
+        if rw.is_bin_half {
+            out.push_str("            --bin-half\n");
+        }
+        if rw.has_lib {
+            out.push_str("            --has-lib\n");
+        }
+        let _ = writeln!(out, "    DEPENDS \"{}\"", rw.origin.display());
+        out.push_str("    VERBATIM)\n");
+    }
 }
 
 fn emit_library(out: &mut String, m: &MemberView) {
@@ -892,10 +988,24 @@ fn collect_bin_views(
     kind: MemberKind,
     rewrite_root: &Path,
     layout: &TargetLayout,
-) -> Result<Vec<BinView>> {
+    rw_ctx: &MemberRewriteCtx,
+) -> Result<(Vec<BinView>, Vec<RewriteCommand>)> {
     let mut bins: Vec<BinView> = Vec::with_capacity(m.kind.bins().len());
+    let mut rewrites: Vec<RewriteCommand> = Vec::new();
+    // V45D-3: a bin source of a lib+bin crate is the "bin half"
+    // (enables the `#cust use <crate>;` own-lib carve-out).
+    let is_bin_half = kind == MemberKind::LibAndBin;
     for bt in m.kind.bins() {
-        let sources = collect_sources(&m.root, &bt.source, &m.name, rewrite_root, layout)?;
+        let (sources, bin_rewrites) = collect_sources(
+            &m.root,
+            &bt.source,
+            &m.name,
+            rewrite_root,
+            layout,
+            rw_ctx,
+            is_bin_half,
+        )?;
+        rewrites.extend(bin_rewrites);
         let target_name = if bt.name == m.name {
             if kind == MemberKind::LibAndBin {
                 format!("{}-bin", m.name)
@@ -911,7 +1021,7 @@ fn collect_bin_views(
             sources,
         });
     }
-    Ok(bins)
+    Ok((bins, rewrites))
 }
 
 pub fn collect_view(
@@ -930,12 +1040,24 @@ pub fn collect_view(
     let mut members: Vec<MemberView> = Vec::with_capacity(ws.members.len());
     for m in &ws.members {
         let kind = map_kind(&m.kind);
-        let lib_sources = match m.kind.lib_source() {
-            Some(src) => collect_sources(&m.root, src, &m.name, &rewrite_root, &layout)?,
-            None => Vec::new(),
+        // V45D-3: per-member rewrite-command context (shared by
+        // the lib + every bin source).
+        let rw_ctx = member_rewrite_ctx(m, kind, &layout);
+        let (lib_sources, mut rewrites) = match m.kind.lib_source() {
+            Some(src) => collect_sources(
+                &m.root,
+                src,
+                &m.name,
+                &rewrite_root,
+                &layout,
+                &rw_ctx,
+                false,
+            )?,
+            None => (Vec::new(), Vec::new()),
         };
         // v0.4.4 V44D-5/V44D-8: one `BinView` per `BinTarget`.
-        let bins = collect_bin_views(m, kind, &rewrite_root, &layout)?;
+        let (bins, bin_rewrites) = collect_bin_views(m, kind, &rewrite_root, &layout, &rw_ctx)?;
+        rewrites.extend(bin_rewrites);
 
         // Bin half include dirs: for a lib+bin member, the bin
         // needs the lib's own include dir for `#include "<crate>.h"`
@@ -1046,6 +1168,7 @@ pub fn collect_view(
             compile_options,
             test_target,
             integration_tests,
+            rewrites,
         });
     }
 
@@ -1053,6 +1176,7 @@ pub fn collect_view(
         cust_version: env!("CARGO_PKG_VERSION").to_string(),
         c_standard: "23".to_string(),
         plugin_path: plugin.map(|p| p.path.clone()),
+        cust_exe: std::env::current_exe().context("resolving cust binary path")?,
         members,
     })
 }
@@ -1170,16 +1294,49 @@ const fn map_kind(k: &CrateKind) -> MemberKind {
     }
 }
 
+/// v0.4.5 V45D-3: per-member context for building `RewriteCommand`s
+/// alongside the `SourceFile` list. Shared by the lib + every bin
+/// of a member; the only per-source difference is `is_bin_half`,
+/// passed separately.
+struct MemberRewriteCtx {
+    /// `target/<profile>/.h-fragments/<crate>/`.
+    frags_dir: PathBuf,
+    /// `target/<profile>/deps/`.
+    deps_root: PathBuf,
+    /// The member's published `<crate>.h`.
+    own_lib_header: PathBuf,
+    /// Declared dependency names, sorted (V45D-15 determinism).
+    deps: Vec<String>,
+    /// Whether the member has a library half (carve-out gate).
+    has_lib: bool,
+}
+
+/// Build the shared rewrite context for one member (V45D-3).
+fn member_rewrite_ctx(m: &Member, kind: MemberKind, layout: &TargetLayout) -> MemberRewriteCtx {
+    let mut sorted_deps = m.deps.clone();
+    sorted_deps.sort();
+    MemberRewriteCtx {
+        frags_dir: layout.fragments_dir(&m.name),
+        deps_root: layout.profile_root.join("deps"),
+        own_lib_header: layout.crate_header_path(&m.name),
+        deps: sorted_deps,
+        has_lib: kind.has_lib(),
+    }
+}
+
 fn collect_sources(
     crate_root: &Path,
     entry_source: &Path,
     crate_name: &str,
     rewrite_root: &Path,
     layout: &TargetLayout,
-) -> Result<Vec<SourceFile>> {
+    rw_ctx: &MemberRewriteCtx,
+    is_bin_half: bool,
+) -> Result<(Vec<SourceFile>, Vec<RewriteCommand>)> {
     let modules = modules::discover(crate_root, entry_source)
         .with_context(|| format!("discovering module graph for `{crate_name}`"))?;
     let mut out: Vec<SourceFile> = Vec::with_capacity(modules.len());
+    let mut rewrites: Vec<RewriteCommand> = Vec::with_capacity(modules.len());
     for m in &modules {
         // Post-rewrite path: target/<profile>/.rewrite/<crate>/<rel>.
         // <rel> is the source's path relative to the crate root,
@@ -1203,12 +1360,25 @@ fn collect_sources(
             .map(|importee| layout.fragment_path(crate_name, importee))
             .collect();
 
+        // V45D-3: one rewrite custom command per source.
+        rewrites.push(RewriteCommand {
+            out: rewrite_path.clone(),
+            origin: m.source_path.clone(),
+            crate_name: crate_name.to_string(),
+            frags_dir: rw_ctx.frags_dir.clone(),
+            deps_root: rw_ctx.deps_root.clone(),
+            own_lib_header: rw_ctx.own_lib_header.clone(),
+            deps: rw_ctx.deps.clone(),
+            is_bin_half,
+            has_lib: rw_ctx.has_lib,
+        });
+
         out.push(SourceFile {
             path: rewrite_path,
             object_depends,
         });
     }
-    Ok(out)
+    Ok((out, rewrites))
 }
 
 /// Write the workspace's `CMakeLists` into the build tree

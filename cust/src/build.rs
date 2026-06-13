@@ -185,38 +185,23 @@ pub fn run_phase1(plan: &BuildPlan<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Write `#cust use`-lowered source files into
-/// `target/<profile>/.rewrite/<crate>/<rel>.c` (V42D-13 layout)
-/// for every lib + bin module. `CMake` compiles these directly;
-/// the original `src/` tree is untouched.
+/// Write `#cust use`-lowered **integration-test** sources into
+/// `target/<profile>/.rewrite/<crate>/tests/<stem>.c` (V42D-13
+/// layout). `CMake` compiles these directly; the original `tests/`
+/// tree is untouched.
 ///
-/// Mirrors `compile_one_module`'s rewrite logic (validation +
-/// directive substitution) but stops short of invoking clang —
-/// `CMake`/Ninja owns codegen from v0.4.2 onward (V42D-16). Slice
-/// C will fold this into a single `phase1+rewrites` walk; slice
-/// B keeps them separate so the diff is bounded.
+/// v0.4.5 V45D-3: the lib + bin rewrites this used to produce are
+/// now emitted as `cust internal rewrite-file` custom commands
+/// (so Ninja produces them lazily on input change). Only the
+/// integration-test rewrites stay driver-side (V45D-11 keeps the
+/// test path unchanged this milestone); they must exist at
+/// configure time because their `add_executable` sources are NOT
+/// custom-command outputs yet. No-op for members without a
+/// `tests/` dir or without a lib half (V43D-3).
 pub fn write_rewrite_tree(plan: &BuildPlan<'_>) -> Result<()> {
     let layout = TargetLayout::for_workspace(plan.workspace_root, plan.profile_kind);
     let rewrite_root = layout.profile_root.join(".rewrite");
 
-    if let Some(lib_src) = plan.kind.lib_source() {
-        let lib_modules =
-            modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
-        for m in &lib_modules {
-            write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, false)?;
-        }
-    }
-    // v0.4.4 V44D-8: each `BinTarget` is its own root; discover +
-    // rewrite one module graph per bin (a bin may `#cust use
-    // crate::<mod>`). Two bins sharing a module rewrite it to the
-    // same path idempotently.
-    for bin in plan.kind.bins() {
-        let bin_modules = modules::discover(plan.crate_root, &bin.source)
-            .with_context(|| format!("discovering bin `{}` module graph", bin.name))?;
-        for m in &bin_modules {
-            write_one_rewrite(plan, &layout, &rewrite_root, &m.source_path, m, true)?;
-        }
-    }
     // v0.4.3 V43D-5: rewrite each integration test source into
     // `.rewrite/<crate>/tests/<stem>.c` so the `CMakeLists`
     // `add_executable(<crate>__itest__<stem> ...)` source path
@@ -297,41 +282,6 @@ fn write_integration_rewrite(
     }
     write_if_byte_different(&dst, rewritten.as_bytes())?;
     Ok(())
-}
-
-fn write_one_rewrite(
-    plan: &BuildPlan<'_>,
-    layout: &TargetLayout,
-    rewrite_root: &Path,
-    source_path: &Path,
-    m: &Module,
-    is_bin_half: bool,
-) -> Result<()> {
-    let crate_name = plan.manifest.package_name();
-    // Output path: target/<profile>/.rewrite/<crate>/<rel>.c
-    // where <rel> is the source file's path relative to the
-    // crate root, preserving `src/<...>.c` shape. Matches what
-    // `cmake_emit::collect_view` already expects.
-    let rel = m
-        .source_path
-        .strip_prefix(plan.crate_root)
-        .unwrap_or(&m.source_path);
-    let dst = rewrite_root.join(crate_name).join(rel);
-    let frags_dir = layout.fragments_dir(crate_name);
-    let deps_root = layout.profile_root.join("deps");
-    let own_lib_header = layout.crate_header_path(crate_name);
-    let ctx = crate::generate::RewriteCtx {
-        crate_name,
-        source_path,
-        out_path: &dst,
-        frags_dir: &frags_dir,
-        deps_root: &deps_root,
-        own_lib_header: &own_lib_header,
-        deps: plan.deps,
-        is_bin_half,
-        has_lib: plan.kind.has_lib(),
-    };
-    crate::generate::rewrite_one(&ctx)
 }
 
 /// Write `bytes` to `path` only if the contents differ from

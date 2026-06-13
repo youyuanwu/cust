@@ -99,6 +99,26 @@ fn assert_failure_with(out: &Output, needle: &str) {
     );
 }
 
+/// Like `assert_failure_with` but searches stdout **and** stderr.
+/// v0.4.5 V45D-3: errors raised inside a `cust internal` custom
+/// command (e.g. an undeclared `#cust use <dep>;`) surface through
+/// Ninja's build output, which cust echoes on stdout — same as any
+/// other build error (a clang compile error, a link failure). Use
+/// this for errors that originate in the `cmake --build` phase.
+fn assert_build_failure_with(out: &Output, needle: &str) {
+    assert!(
+        !out.status.success(),
+        "expected failure but cust succeeded:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        combined.contains(needle),
+        "build output did not contain {needle:?}:\n{combined}",
+    );
+}
+
 // ─── Happy-path tests ───────────────────────────────────────────────
 
 #[test]
@@ -974,12 +994,17 @@ fn workspace_dep_cycle_is_detected() {
 fn cust_use_dep_without_dependency_entry_is_error() {
     // The workspace has only `app`. `app/src/lib.c` does
     // `#cust use util;` but app has no [dependencies] entry for
-    // util. The build pipeline should reject this at the rewrite
-    // step.
+    // util. v0.4.5 V45D-3: the rewrite (and its validation) now
+    // runs inside a `cust internal rewrite-file` custom command,
+    // so the error surfaces through the `cmake --build` phase.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
     let (_tmp, dir) = stage("workspace_undeclared_dep");
     let out = cust(&dir, ["build"]);
-    assert_failure_with(&out, "`#cust use util;`");
-    assert_failure_with(&out, "not listed in [dependencies]");
+    assert_build_failure_with(&out, "`#cust use util;`");
+    assert_build_failure_with(&out, "not listed in [dependencies]");
 }
 
 #[test]
@@ -1454,8 +1479,8 @@ fn lib_half_cannot_self_import_via_cust_use() {
     )
     .unwrap();
     let out = cust(&dir, ["build"]);
-    assert_failure_with(&out, "`#cust use badlib;`");
-    assert_failure_with(&out, "not listed in [dependencies]");
+    assert_build_failure_with(&out, "`#cust use badlib;`");
+    assert_build_failure_with(&out, "not listed in [dependencies]");
 }
 
 // ─── Slice D — v0.3.2 `cust test` end-to-end ──────────────────────

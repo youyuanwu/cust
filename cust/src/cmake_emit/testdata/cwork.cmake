@@ -7,6 +7,32 @@ set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ---- crate: cstd (generated rewrites) ----
+add_custom_command(
+    OUTPUT "/ws/target/debug/.rewrite/cstd/src/types.c"
+    COMMAND "/ws/bin/cust" internal rewrite-file
+            --crate-name cstd
+            --in "/ws/cstd/src/types.c"
+            --out "/ws/target/debug/.rewrite/cstd/src/types.c"
+            --frags-dir "/ws/target/debug/.h-fragments/cstd"
+            --deps-root "/ws/target/debug/deps"
+            --own-lib-header "/ws/target/debug/build/cstd/include/cstd.h"
+            --has-lib
+    DEPENDS "/ws/cstd/src/types.c"
+    VERBATIM)
+add_custom_command(
+    OUTPUT "/ws/target/debug/.rewrite/cstd/src/lib.c"
+    COMMAND "/ws/bin/cust" internal rewrite-file
+            --crate-name cstd
+            --in "/ws/cstd/src/lib.c"
+            --out "/ws/target/debug/.rewrite/cstd/src/lib.c"
+            --frags-dir "/ws/target/debug/.h-fragments/cstd"
+            --deps-root "/ws/target/debug/deps"
+            --own-lib-header "/ws/target/debug/build/cstd/include/cstd.h"
+            --has-lib
+    DEPENDS "/ws/cstd/src/lib.c"
+    VERBATIM)
+
 # ---- crate: cstd (library) ----
 add_library(cstd STATIC
     "/ws/target/debug/.rewrite/cstd/src/types.c"
@@ -82,6 +108,20 @@ target_compile_options(cstd__itest__basic PRIVATE
     "-Wno-unknown-attributes"
     "-DCUST_TEST_BUILD=1"
 )
+
+# ---- crate: hello-cstd (generated rewrites) ----
+add_custom_command(
+    OUTPUT "/ws/target/debug/.rewrite/hello-cstd/src/main.c"
+    COMMAND "/ws/bin/cust" internal rewrite-file
+            --crate-name hello-cstd
+            --in "/ws/hello-cstd/src/main.c"
+            --out "/ws/target/debug/.rewrite/hello-cstd/src/main.c"
+            --frags-dir "/ws/target/debug/.h-fragments/hello-cstd"
+            --deps-root "/ws/target/debug/deps"
+            --own-lib-header "/ws/target/debug/build/hello-cstd/include/hello-cstd.h"
+            --dep cstd
+    DEPENDS "/ws/hello-cstd/src/main.c"
+    VERBATIM)
 
 # ---- crate: hello-cstd (binary) ----
 add_executable(hello-cstd
