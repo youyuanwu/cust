@@ -3,7 +3,7 @@ resolver = "2"
 members = ["cust", "plugin-build"]
 
 [workspace.package]
-version      = "0.1.0"
+version      = "0.4.6"
 edition      = "2021"
 rust-version = "1.96.0"
 license      = "MIT"
