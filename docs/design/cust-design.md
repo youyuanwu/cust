@@ -1442,10 +1442,15 @@ Roadmap bullets here are deliberately short:
     `[profile.test]` plumbing, `tests/common/` shared
     helpers + the Cargo `tests/<name>/main.c` multi-file
     form (`tests/` integration tests themselves shipped in
-    v0.4.3). Also picks up the v0.4.5 deferred test-path
-    generation migration (RQ-V45-3: `internal test-sidecar`
-    + `internal test-runner` custom commands; designed in
-    [v0.4.6-test-codegen.md](v0.4.6-test-codegen.md)).
+    v0.4.3). The v0.4.5-deferred test-path generation
+    migration (RQ-V45-3) ✅ **shipped**: `cust test` (unit
+    + integration) now generates sidecars + runner TUs +
+    rewrites entirely through CMake `internal test-sidecar`
+    / `test-runner` custom commands, so a no-op `cust test`
+    spawns zero codegen processes and the test path is
+    emit + configure + build like `cust build`. See
+    [v0.4.6-test-codegen.md](v0.4.6-test-codegen.md). The
+    remaining `cust test` features above are still pending.
   - **v0.4.7** — dependency resolver + registry. Initial
     registry wire protocol (`Index` trait, `file://` first
     per V3D-1's deferral), `cust add`, semver version
