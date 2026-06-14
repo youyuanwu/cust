@@ -36,6 +36,32 @@ cwork/          # in-tree dogfood workspace
 docs/design/    # design docs (cust-design.md + per-milestone v0.N.md)
 ```
 
+## Install
+
+Prebuilt Linux (x86_64) binaries are published on the
+[releases page](https://github.com/youyuanwu/cust/releases). The
+installer auto-detects your `clang` version, downloads the matching
+release, verifies its checksum, and installs the `cust` driver plus its
+clang plugin into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/youyuanwu/cust/main/scripts/install.sh | bash
+```
+
+Options (flags or env vars):
+
+```sh
+# pick a version, install dir, or LLVM major explicitly
+./scripts/install.sh --version v0.4.6 --dir /usr/local/bin --llvm 21
+CUST_VERSION=v0.4.6 CUST_INSTALL_DIR=~/bin ./scripts/install.sh
+```
+
+Each release ships one artifact per LLVM major (currently 18 and 21):
+`libcust_plugin.so` is a clang plugin, ABI-coupled to the LLVM version
+it was built against, so you need a local `clang` whose major version
+matches. The driver and plugin install into the same directory because
+`cust` discovers the plugin next to its own binary.
+
 ## Build & try it
 
 Requires a recent clang/LLVM with plugin support and a Rust
