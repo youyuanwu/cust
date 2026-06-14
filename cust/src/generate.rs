@@ -24,6 +24,7 @@ use crate::{
     build::write_if_byte_different,
     clang::Clang,
     mod_scanner::{self, DirectiveKind},
+    test_discovery, test_runner,
 };
 
 /// Inputs to [`rewrite_one`] — the `#cust use`-lowering pass that
@@ -159,7 +160,15 @@ pub fn surface_one_module(
         .with_context(|| format!("reading `{}`", ctx.source_path.display()))?;
     let scan = mod_scanner::scan(&src_text, ctx.source_path)?;
 
-    let rewritten = lower_surface(ctx, &src_text, &scan)?;
+    let rewritten = lower_cust_use(
+        ctx.source_path,
+        &src_text,
+        &scan,
+        ctx.frags_dir,
+        ctx.deps_root,
+        ctx.deps,
+        ctx.require_upstream,
+    )?;
 
     if let Some(parent) = ctx.surface_out.parent() {
         std::fs::create_dir_all(parent)
@@ -173,58 +182,39 @@ pub fn surface_one_module(
             .with_context(|| format!("creating `{}`", parent.display()))?;
     }
 
-    // Strip trailing `-c -o <obj> <src>` (4 args), replace with
-    // `-fsyntax-only -Wno-error -Wno-implicit-function-declaration <src>`.
-    let mut cflags = base_cflags.to_vec();
-    let new_len = cflags.len().saturating_sub(4);
-    cflags.truncate(new_len);
-    cflags.push("-fsyntax-only".to_string());
-    cflags.push("-Wno-error".to_string());
-    cflags.push("-Wno-implicit-function-declaration".to_string());
-    cflags.push(ctx.surface_out.display().to_string());
-
-    let _ = clang
-        .command()
-        .args(&cflags)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| {
-            format!(
-                "invoking `{}` for surface pass on `{}`",
-                clang.path.display(),
-                ctx.source_path.display()
-            )
-        })?;
-    Ok(())
+    run_surface_clang(clang, base_cflags, ctx.surface_out, ctx.source_path)
 }
 
 /// The `#cust use` → `#include` lowering for the surface pass.
 /// `crate::<m>` is included only if `<m>`'s fragment already exists
 /// (else blanked, or hard-errored under `require_upstream`);
-/// `<dep>` is included when the dep is declared. See `SurfaceCtx`.
-fn lower_surface(
-    ctx: &SurfaceCtx<'_>,
+/// `<dep>` is included when the dep is declared. Shared by
+/// [`surface_one_module`] and [`sidecar_one`].
+fn lower_cust_use(
+    source_path: &Path,
     src_text: &str,
     scan: &mod_scanner::ScanResult,
+    frags_dir: &Path,
+    deps_root: &Path,
+    deps: &[&str],
+    require_upstream: bool,
 ) -> Result<String> {
     let mut missing: Option<String> = None;
-    let rewritten = mod_scanner::rewrite_with(src_text, ctx.source_path, scan, |d| match &d.kind {
+    let rewritten = mod_scanner::rewrite_with(src_text, source_path, scan, |d| match &d.kind {
         DirectiveKind::UseCrate { name } => {
-            let frag = ctx.frags_dir.join(format!("{name}.cust.h"));
+            let frag = frags_dir.join(format!("{name}.cust.h"));
             if frag.is_file() {
                 Some(format!("#include \"{}\"", frag.display()))
             } else {
-                if ctx.require_upstream && missing.is_none() {
+                if require_upstream && missing.is_none() {
                     missing = Some(name.clone());
                 }
                 None
             }
         }
         DirectiveKind::UseDep { name } => {
-            if ctx.deps.iter().any(|n| n == name) {
-                let dep_header = ctx
-                    .deps_root
+            if deps.iter().any(|n| n == name) {
+                let dep_header = deps_root
                     .join(name)
                     .join("include")
                     .join(format!("{name}.h"));
@@ -242,11 +232,47 @@ fn lower_surface(
              not exist on disk (`{}`); the build graph is missing a \
              `DEPENDS` edge for it (internal: surface-module run before \
              its upstream)",
-            ctx.source_path.display(),
-            ctx.frags_dir.join(format!("{name}.cust.h")).display()
+            source_path.display(),
+            frags_dir.join(format!("{name}.cust.h")).display()
         );
     }
     Ok(rewritten)
+}
+
+/// Run the surface-pass clang invocation: strip the trailing
+/// `-c -o <obj> <src>` (4 args) from `base_cflags`, substitute the
+/// `-fsyntax-only` demotions, and compile `compile_target`. The
+/// exit status is intentionally ignored — an unresolved
+/// cross-module reference is the expected case on a cold fragment
+/// dir, and the plugin's `HandleTranslationUnit` runs regardless.
+fn run_surface_clang(
+    clang: &Clang,
+    base_cflags: &[String],
+    compile_target: &Path,
+    diag_source: &Path,
+) -> Result<()> {
+    let mut cflags = base_cflags.to_vec();
+    let new_len = cflags.len().saturating_sub(4);
+    cflags.truncate(new_len);
+    cflags.push("-fsyntax-only".to_string());
+    cflags.push("-Wno-error".to_string());
+    cflags.push("-Wno-implicit-function-declaration".to_string());
+    cflags.push(compile_target.display().to_string());
+
+    let _ = clang
+        .command()
+        .args(&cflags)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| {
+            format!(
+                "invoking `{}` for surface pass on `{}`",
+                clang.path.display(),
+                diag_source.display()
+            )
+        })?;
+    Ok(())
 }
 
 /// One module's fully-resolved surface-pass inputs, owned so a
@@ -415,4 +441,125 @@ pub fn write_crate_header_concat(
     let _ = writeln!(out, "#endif /* {guard} */");
 
     write_if_byte_different(out_path, out.as_bytes())
+}
+
+// ─── v0.4.6 V46D-1: test-discovery sidecar + runner cores ────────
+
+/// Inputs to [`sidecar_one`] — one TU's test-discovery surface
+/// pass, producing a `.cust.tests` sidecar (and **no** fragment).
+/// Shared by the in-process `cust test` path
+/// (`build::surface_pass_integration`, and \u2014 once v0.4.6 migrates
+/// it \u2014 the unit sidecar pass) and the hidden
+/// `cust internal test-sidecar` leaf (V46D-1) \u2014 no logic fork
+/// (V45D-8).
+pub struct SidecarCtx<'a> {
+    /// The TU to surface-pass: an original `src/**.c` (unit) or an
+    /// already-`#cust use`-lowered `.rewrite/<crate>/tests/<stem>.c`
+    /// (integration).
+    pub source_path: &'a Path,
+    /// `Some` for a unit module \u2014 lower `source_path`'s `#cust use`
+    /// directives, write the surface TU here, and compile it.
+    /// `None` for an integration TU (already rewritten \u2014 compile
+    /// `source_path` directly).
+    pub surface_out: Option<&'a Path>,
+    /// Where the plugin writes the `.cust.tests` sidecar. Always
+    /// created (empty when the plugin emits nothing) so a `CMake`
+    /// custom-command `OUTPUT` is always satisfied (V46D-1).
+    pub sidecar_out: &'a Path,
+    /// `.h-fragments/<crate>/` \u2014 sibling-fragment probe for the unit
+    /// `#cust use crate::<m>` lowering (ignored when `surface_out`
+    /// is `None`).
+    pub frags_dir: &'a Path,
+    /// `deps/` \u2014 cross-crate `#cust use <dep>` lowering root (unit
+    /// only).
+    pub deps_root: &'a Path,
+    /// Declared dep names the unit module may `#cust use <dep>;`
+    /// (unit only).
+    pub deps: &'a [&'a str],
+}
+
+/// Surface-compile one TU with `-fsyntax-only` + the plugin so it
+/// emits its per-TU test-discovery sidecar. Unlike
+/// [`surface_one_module`] this writes **no** fragment header
+/// (`base_cflags` must carry `test-sidecar-out` but not
+/// `fragment-out`) and runs no fixed-point loop (sidecars don't
+/// depend on each other). The sidecar is always created so the
+/// caller's declared `OUTPUT` exists even when the plugin is
+/// absent or discovers zero tests (V46D-1).
+pub fn sidecar_one(ctx: &SidecarCtx<'_>, clang: &Clang, base_cflags: &[String]) -> Result<()> {
+    let compile_target: PathBuf = if let Some(surface_out) = ctx.surface_out {
+        // Unit: lower `#cust use` against fragments on disk, write
+        // the surface TU, compile it. `require_upstream = false` \u2014
+        // a missing import only weakens recovery (clang falls back
+        // to implicit decls); test discovery still works.
+        let src_text = std::fs::read_to_string(ctx.source_path)
+            .with_context(|| format!("reading `{}`", ctx.source_path.display()))?;
+        let scan = mod_scanner::scan(&src_text, ctx.source_path)?;
+        let rewritten = lower_cust_use(
+            ctx.source_path,
+            &src_text,
+            &scan,
+            ctx.frags_dir,
+            ctx.deps_root,
+            ctx.deps,
+            false,
+        )?;
+        if let Some(parent) = surface_out.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating `{}`", parent.display()))?;
+        }
+        std::fs::write(surface_out, &rewritten)
+            .with_context(|| format!("writing `{}`", surface_out.display()))?;
+        surface_out.to_path_buf()
+    } else {
+        // Integration: `source_path` is already rewritten.
+        ctx.source_path.to_path_buf()
+    };
+
+    if let Some(parent) = ctx.sidecar_out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+
+    run_surface_clang(clang, base_cflags, &compile_target, ctx.source_path)?;
+
+    // V46D-1: guarantee the sidecar exists even if the plugin was
+    // absent or discovered zero tests (the runner reads a missing
+    // or empty sidecar as "no tests").
+    if !ctx.sidecar_out.exists() {
+        std::fs::write(ctx.sidecar_out, b"")
+            .with_context(|| format!("writing empty sidecar `{}`", ctx.sidecar_out.display()))?;
+    }
+    Ok(())
+}
+
+/// Render one test-runner TU from a set of `.cust.tests` sidecars
+/// and write it to `out_path` (byte-skip if unchanged). Reads each
+/// sidecar (a missing one counts as zero tests), parses the
+/// discovered entries, and renders the runner via
+/// [`test_runner::render_main_c`]. Shared by the unit
+/// (`write_test_runner_tu`) and integration
+/// (`write_integration_runner_tus`) driver paths and the
+/// `cust internal test-runner` leaf (V46D-1).
+pub fn write_runner_tu(out_path: &Path, sidecars: &[PathBuf]) -> Result<()> {
+    let mut tests: Vec<test_discovery::TestEntry> = Vec::new();
+    for sidecar in sidecars {
+        match std::fs::read_to_string(sidecar) {
+            Ok(contents) => {
+                let mut found = test_discovery::parse(&contents, sidecar)?;
+                tests.append(&mut found);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("reading test sidecar `{}`", sidecar.display()));
+            }
+        }
+    }
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    let src = test_runner::render_main_c(&tests);
+    write_if_byte_different(out_path, src.as_bytes())
 }

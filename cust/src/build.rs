@@ -19,7 +19,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{bail, Context, Result};
@@ -32,8 +31,6 @@ use crate::{
     plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
     target_layout::{TargetLayout, TestOrigin},
-    test_discovery::{self, TestEntry},
-    test_runner,
 };
 
 /// Inputs handed to driver entry points by the CLI layer.
@@ -350,36 +347,29 @@ pub fn write_test_runner_tu(plan: &BuildPlan<'_>) -> Result<Option<PathBuf>> {
     let lib_modules =
         modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
 
-    // V40D-6: read every module's test-discovery sidecar.
-    // surface_pass wrote these (in test_build mode) before us;
-    // a missing sidecar means surface_pass didn't visit that
-    // module — bug, hard error.
-    let mut tests: Vec<TestEntry> = Vec::new();
-    for m in &lib_modules {
-        let sidecar_path = layout.test_sidecar_path(
-            crate_name,
-            TestOrigin::Unit {
-                qualified_name: &m.qualified_name,
-            },
-        );
-        let contents = fs::read_to_string(&sidecar_path).with_context(|| {
-            format!(
-                "reading test-discovery sidecar `{}`",
-                sidecar_path.display()
+    // V40D-6: one test-discovery sidecar per lib module. The
+    // surface pass (test_build mode) wrote these before us; the
+    // shared renderer (`generate::write_runner_tu`) tolerates a
+    // missing sidecar as "zero tests for that module."
+    let sidecars: Vec<PathBuf> = lib_modules
+        .iter()
+        .map(|m| {
+            layout.test_sidecar_path(
+                crate_name,
+                TestOrigin::Unit {
+                    qualified_name: &m.qualified_name,
+                },
             )
-        })?;
-        let mut found = test_discovery::parse(&contents, &sidecar_path)?;
-        tests.append(&mut found);
-    }
+        })
+        .collect();
 
-    // Render + write the runner TU at the V42D-14 path.
+    // Render + write the runner TU at the V42D-14 path (V46D-1:
+    // same `generate::write_runner_tu` the `internal test-runner`
+    // leaf calls). Content-skipped, so CMake's restat is happy on
+    // no-op rebuilds.
     let cmake_dir = layout.profile_root.join("cmake");
-    fs::create_dir_all(&cmake_dir)
-        .with_context(|| format!("creating `{}`", cmake_dir.display()))?;
     let runner_path = cmake_dir.join(format!("cust_test_main_{crate_name}.c"));
-    let runner_src = test_runner::render_main_c(&tests);
-    // Content-skip: keeps CMake's restat happy on no-op rebuilds.
-    write_if_byte_different(&runner_path, runner_src.as_bytes())?;
+    crate::generate::write_runner_tu(&runner_path, &sidecars)?;
 
     Ok(Some(layout.test_executable_path(crate_name)))
 }
@@ -426,27 +416,15 @@ pub fn write_integration_runner_tus(plan: &BuildPlan<'_>) -> Result<Vec<Integrat
         let sidecar_path =
             layout.test_sidecar_path(crate_name, TestOrigin::Integration { stem: &it.stem });
         if plan.plugin.is_some() {
-            if let Some(parent) = sidecar_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating `{}`", parent.display()))?;
-            }
             surface_pass_integration(plan, &profile, &prelude_path, &rewritten, &sidecar_path)?;
         }
 
-        // Read the sidecar (empty when no plugin / zero tests).
-        let tests: Vec<TestEntry> = match fs::read_to_string(&sidecar_path) {
-            Ok(contents) => test_discovery::parse(&contents, &sidecar_path)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                return Err(anyhow::Error::new(e)).with_context(|| {
-                    format!("reading integration sidecar `{}`", sidecar_path.display())
-                })
-            }
-        };
-
+        // Render the runner from the sidecar (a missing/empty
+        // sidecar — no plugin, or zero tests — renders zero tests).
+        // Same `generate::write_runner_tu` the `internal test-runner`
+        // leaf calls (V46D-1).
         let runner_path = cmake_dir.join(format!("cust_itest_main_{crate_name}__{}.c", it.stem));
-        let runner_src = test_runner::render_main_c(&tests);
-        write_if_byte_different(&runner_path, runner_src.as_bytes())?;
+        crate::generate::write_runner_tu(&runner_path, &[sidecar_path])?;
 
         out.push(IntegrationTestOutput {
             stem: it.stem.clone(),
@@ -465,6 +443,10 @@ pub fn write_integration_runner_tus(plan: &BuildPlan<'_>) -> Result<Vec<Integrat
 /// fragment dependencies). The plugin `module` arg is `lib` so
 /// the runner renders bare test names (qname drops the root
 /// `lib` module, matching unit tests at crate root).
+///
+/// Delegates to [`generate::sidecar_one`] (V46D-1) — the same core
+/// the `cust internal test-sidecar` leaf runs. `surface_out` is
+/// `None` because `rewritten` is already `#cust use`-lowered.
 fn surface_pass_integration(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -473,7 +455,7 @@ fn surface_pass_integration(
     sidecar_path: &Path,
 ) -> Result<()> {
     let dummy_obj = rewritten.with_extension("surface.o");
-    let mut cflags = build_cflags(
+    let base_cflags = build_cflags(
         plan,
         profile,
         prelude,
@@ -486,32 +468,15 @@ fn surface_pass_integration(
             module: Some("lib"),
         },
     );
-    // Strip trailing `-c -o <obj> <src>` (4 args), replace with
-    // `-fsyntax-only -Wno-error ... <src>` — same demotions the
-    // lib surface pass uses so an unresolved decl doesn't stop
-    // the plugin from emitting the sidecar.
-    let new_len = cflags.len().saturating_sub(4);
-    cflags.truncate(new_len);
-    cflags.push("-fsyntax-only".to_string());
-    cflags.push("-Wno-error".to_string());
-    cflags.push("-Wno-implicit-function-declaration".to_string());
-    cflags.push(rewritten.display().to_string());
-
-    let _ = plan
-        .clang
-        .command()
-        .args(&cflags)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| {
-            format!(
-                "invoking `{}` for integration surface pass on `{}`",
-                plan.clang.path.display(),
-                rewritten.display()
-            )
-        })?;
-    Ok(())
+    let ctx = crate::generate::SidecarCtx {
+        source_path: rewritten,
+        surface_out: None,
+        sidecar_out: sidecar_path,
+        frags_dir: Path::new(""),
+        deps_root: Path::new(""),
+        deps: &[],
+    };
+    crate::generate::sidecar_one(&ctx, plan.clang, &base_cflags)
 }
 
 /// Surface-extraction pass: compile every module with

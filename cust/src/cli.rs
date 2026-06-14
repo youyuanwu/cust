@@ -56,7 +56,7 @@ pub enum Cmd {
     /// surface fragment, or the concatenated crate header) so
     /// Ninja can own generation incrementality.
     #[command(hide = true, subcommand)]
-    Internal(InternalCmd),
+    Internal(Box<InternalCmd>),
 }
 
 /// v0.4.5 V45D-2: the three `cust internal …` leaf generators.
@@ -81,6 +81,15 @@ pub enum InternalCmd {
     /// fragment in the cycle (V45D-6).
     #[command(hide = true)]
     SurfaceCycle(SurfaceCycleArgs),
+    /// Surface-pass one TU (`-fsyntax-only` + plugin) to emit its
+    /// `.cust.tests` test-discovery sidecar (v0.4.6 V46D-1). No
+    /// fragment — the test build reuses the build-mode fragments.
+    #[command(hide = true)]
+    TestSidecar(TestSidecarArgs),
+    /// Render one test-runner TU from a set of `.cust.tests`
+    /// sidecars (v0.4.6 V46D-1).
+    #[command(hide = true)]
+    TestRunner(TestRunnerArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -206,6 +215,85 @@ pub struct SurfaceCycleArgs {
     /// The cust clang plugin `.so`. Omitted ⇒ no plugin.
     #[arg(long)]
     pub plugin: Option<PathBuf>,
+}
+
+/// `unit` vs `integration` mode for the `internal test-sidecar`
+/// leaf (v0.4.6 V46D-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SidecarKind {
+    /// A `src/**.c` lib module — lower its `#cust use` directives,
+    /// plugin `module` arg is the module's qualified name.
+    Unit,
+    /// An already-rewritten `tests/<stem>.c` — plugin `module`
+    /// arg is `lib` (bare test names).
+    Integration,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TestSidecarArgs {
+    /// The crate the TU belongs to (diagnostics only).
+    #[arg(long)]
+    pub crate_name: String,
+    /// `unit` (a `src/**.c` module) or `integration` (a rewritten
+    /// `tests/<stem>.c`).
+    #[arg(long, value_enum)]
+    pub kind: SidecarKind,
+    /// Unit only: the module's qualified name (the plugin `module`
+    /// arg). Ignored for `--kind integration`.
+    #[arg(long)]
+    pub module: Option<String>,
+    /// The TU to surface-pass: the original `src/**.c` (unit) or
+    /// the rewritten `.rewrite/<crate>/tests/<stem>.c`
+    /// (integration).
+    #[arg(long)]
+    pub source: PathBuf,
+    /// Unit only: where to write the `#cust use`-lowered surface TU.
+    #[arg(long)]
+    pub surface_out: Option<PathBuf>,
+    /// Where the plugin writes the `.cust.tests` sidecar (always
+    /// created — empty when the plugin finds no tests).
+    #[arg(long)]
+    pub sidecar_out: PathBuf,
+    /// `target/<profile>/.h-fragments/<crate>/` (unit lowering).
+    #[arg(long)]
+    pub frags_dir: PathBuf,
+    /// `target/<profile>/deps/` (unit lowering).
+    #[arg(long)]
+    pub deps_root: PathBuf,
+    /// Dep crate names the unit module may `#cust use <dep>;`.
+    #[arg(long = "dep")]
+    pub deps: Vec<String>,
+    /// `-std=<value>` for the surface compile.
+    #[arg(long)]
+    pub std: String,
+    /// Mid cflags (profile cflags + `[clang] extra-cflags`).
+    /// Repeated.
+    #[arg(long = "cflag", allow_hyphen_values = true)]
+    pub cflags: Vec<String>,
+    /// Extra `-I<dir>` include dirs. Repeated.
+    #[arg(long = "include")]
+    pub includes: Vec<PathBuf>,
+    /// The materialised prelude header (`-include`d).
+    #[arg(long)]
+    pub prelude: PathBuf,
+    /// The cust clang plugin `.so`. Omitted ⇒ no plugin (empty
+    /// sidecar).
+    #[arg(long)]
+    pub plugin: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TestRunnerArgs {
+    /// The crate the runner belongs to (diagnostics only).
+    #[arg(long)]
+    pub crate_name: String,
+    /// Output path for the rendered runner TU.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// `.cust.tests` sidecar paths to aggregate, in order.
+    /// Repeated.
+    #[arg(long = "sidecar")]
+    pub sidecars: Vec<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -358,7 +446,7 @@ impl Cli {
             ),
             Cmd::Clean => run_clean(),
             Cmd::New(args) => run_new(&args),
-            Cmd::Internal(cmd) => run_internal(cmd),
+            Cmd::Internal(cmd) => run_internal(*cmd),
         }
     }
 }
@@ -635,7 +723,65 @@ fn run_internal(cmd: InternalCmd) -> Result<()> {
             crate::generate::write_crate_header_concat(&a.crate_name, &a.out, &frags)
         }
         InternalCmd::SurfaceCycle(a) => run_surface_cycle(a),
+        InternalCmd::TestSidecar(a) => run_test_sidecar(a),
+        InternalCmd::TestRunner(a) => {
+            trace_internal("test-runner", &a.out);
+            crate::generate::write_runner_tu(&a.out, &a.sidecars)
+        }
     }
+}
+
+/// v0.4.6 V46D-1: the `test-sidecar` leaf. Surface-passes one TU
+/// with `-DCUST_TEST_BUILD=1` + the plugin so the per-TU
+/// `.cust.tests` sidecar is emitted, then delegates to the shared
+/// [`generate::sidecar_one`] core (the same one
+/// `build::surface_pass_integration` calls). Writes **no** fragment
+/// (V46D-7: the test build reuses the build-mode fragments).
+fn run_test_sidecar(a: TestSidecarArgs) -> Result<()> {
+    trace_internal("test-sidecar", &a.sidecar_out);
+    let clang = Clang::discover()?;
+    let plugin = a.plugin.map(|path| crate::plugin::Plugin { path });
+    let includes: Vec<&Path> = a.includes.iter().map(PathBuf::as_path).collect();
+
+    // The plugin `module` arg: the qualified name for a unit
+    // module, `lib` for an integration TU (so the runner renders
+    // bare test names — matches `surface_pass_integration`).
+    let module = match a.kind {
+        SidecarKind::Unit => a.module.as_deref().unwrap_or("lib"),
+        SidecarKind::Integration => "lib",
+    };
+
+    // V46D-1: the full `build_cflags` argv (test_build = true ⇒
+    // `-DCUST_TEST_BUILD=1`), requesting the sidecar but no
+    // fragment. The trailing `-c -o <obj> <src>` is truncated by
+    // `sidecar_one`, so `source` / `object` here are placeholders.
+    let dummy_obj = a.sidecar_out.with_extension("o");
+    let base_cflags = crate::build::build_cflags_raw(
+        &a.std,
+        &a.cflags,
+        true,
+        plugin.as_ref(),
+        &a.prelude,
+        &a.source,
+        &dummy_obj,
+        &includes,
+        crate::build::PluginOutputs {
+            fragment: None,
+            test_sidecar: Some(&a.sidecar_out),
+            module: Some(module),
+        },
+    );
+
+    let deps: Vec<&str> = a.deps.iter().map(String::as_str).collect();
+    let ctx = crate::generate::SidecarCtx {
+        source_path: &a.source,
+        surface_out: a.surface_out.as_deref(),
+        sidecar_out: &a.sidecar_out,
+        frags_dir: &a.frags_dir,
+        deps_root: &a.deps_root,
+        deps: &deps,
+    };
+    crate::generate::sidecar_one(&ctx, &clang, &base_cflags)
 }
 
 /// v0.4.5 V45D-6: the `surface-cycle` leaf. Builds a

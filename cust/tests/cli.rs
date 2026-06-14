@@ -2263,6 +2263,224 @@ fn internal_surface_module_requires_upstream_fragment() {
     assert_failure_with(&out, "does not exist on disk");
 }
 
+// ─── v0.4.6: hidden `cust internal test-{sidecar,runner}` (slice A) ─
+
+#[test]
+fn internal_test_sidecar_unit_matches_build_output() {
+    // V46D-1/V46D-6: the `test-sidecar --kind unit` leaf produces a
+    // `.cust.tests` sidecar byte-identical to the one the driver's
+    // in-process test surface pass writes. Both run the same
+    // `generate::sidecar_one`; the fragment flag the build-mode pass
+    // also sets doesn't affect sidecar bytes (V46D-7).
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_tests");
+    // `cust test` populates the in-process unit sidecar (driver-side
+    // this milestone — slice A doesn't move it yet).
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let dir = dir.canonicalize().expect("canonicalise crate dir");
+    let plugin = plugin_path().unwrap();
+
+    let in_process = dir.join("target/debug/.test-discovery/with_tests/lib.cust.tests");
+    let expected = fs::read(&in_process).expect("in-process unit sidecar");
+
+    let frags_dir = dir.join("target/debug/.h-fragments/with_tests");
+    let deps_root = dir.join("target/debug/deps");
+    let prelude = dir.join("target/debug/prelude.h");
+    let leaf_sidecar = dir.join("target/debug/leaf-lib.cust.tests");
+    let surface_out = dir.join("target/debug/leaf-lib.surface.c");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "test-sidecar",
+            "--crate-name",
+            "with_tests",
+            "--kind",
+            "unit",
+            "--module",
+            "lib",
+            "--source",
+            dir.join("src/lib.c").to_str().unwrap(),
+            "--surface-out",
+            surface_out.to_str().unwrap(),
+            "--sidecar-out",
+            leaf_sidecar.to_str().unwrap(),
+            "--frags-dir",
+            frags_dir.to_str().unwrap(),
+            "--deps-root",
+            deps_root.to_str().unwrap(),
+            "--std",
+            "c23",
+            "--cflag",
+            "-O0",
+            "--cflag",
+            "-g3",
+            "--cflag",
+            "-gdwarf-5",
+            "--cflag",
+            "-Wall",
+            "--cflag",
+            "-Wextra",
+            "--include",
+            dir.join("src").to_str().unwrap(),
+            "--prelude",
+            prelude.to_str().unwrap(),
+            "--plugin",
+            plugin.to_str().unwrap(),
+        ],
+    );
+    assert_success(&out);
+    let got = fs::read(&leaf_sidecar).expect("leaf unit sidecar");
+    assert_eq!(
+        got, expected,
+        "test-sidecar unit leaf differs from in-process sidecar"
+    );
+}
+
+#[test]
+fn internal_test_sidecar_integration_matches_build_output() {
+    // V46D-1/V46D-6: the `test-sidecar --kind integration` leaf
+    // produces a sidecar byte-identical to the driver's in-process
+    // `surface_pass_integration` (both call `generate::sidecar_one`
+    // with `surface_out = None` on the already-rewritten TU).
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_itests");
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let dir = dir.canonicalize().expect("canonicalise crate dir");
+    let plugin = plugin_path().unwrap();
+
+    let in_process = dir.join("target/debug/.test-discovery/with_itests/tests/basic.cust.tests");
+    let expected = fs::read(&in_process).expect("in-process integration sidecar");
+
+    // The leaf surface-passes the *rewritten* test TU (V46D-3).
+    let rewritten = dir.join("target/debug/.rewrite/with_itests/tests/basic.c");
+    let frags_dir = dir.join("target/debug/.h-fragments/with_itests");
+    let deps_root = dir.join("target/debug/deps");
+    let prelude = dir.join("target/debug/prelude.h");
+    let leaf_sidecar = dir.join("target/debug/leaf-basic.cust.tests");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "test-sidecar",
+            "--crate-name",
+            "with_itests",
+            "--kind",
+            "integration",
+            "--source",
+            rewritten.to_str().unwrap(),
+            "--sidecar-out",
+            leaf_sidecar.to_str().unwrap(),
+            "--frags-dir",
+            frags_dir.to_str().unwrap(),
+            "--deps-root",
+            deps_root.to_str().unwrap(),
+            "--std",
+            "c23",
+            "--cflag",
+            "-O0",
+            "--cflag",
+            "-g3",
+            "--cflag",
+            "-gdwarf-5",
+            "--cflag",
+            "-Wall",
+            "--cflag",
+            "-Wextra",
+            "--prelude",
+            prelude.to_str().unwrap(),
+            "--plugin",
+            plugin.to_str().unwrap(),
+        ],
+    );
+    assert_success(&out);
+    let got = fs::read(&leaf_sidecar).expect("leaf integration sidecar");
+    assert_eq!(
+        got, expected,
+        "test-sidecar integration leaf differs from in-process sidecar"
+    );
+}
+
+#[test]
+fn internal_test_runner_matches_build_output() {
+    // V46D-1: the `test-runner` leaf renders a runner TU
+    // byte-identical to the driver's in-process
+    // `write_test_runner_tu` (both call `generate::write_runner_tu`).
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_tests");
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let dir = dir.canonicalize().expect("canonicalise crate dir");
+
+    let in_process = dir.join("target/debug/cmake/cust_test_main_with_tests.c");
+    let expected = fs::read(&in_process).expect("in-process runner TU");
+
+    let sidecar = dir.join("target/debug/.test-discovery/with_tests/lib.cust.tests");
+    let leaf_out = dir.join("target/debug/leaf-runner.c");
+    let out = cust(
+        &dir,
+        [
+            "internal",
+            "test-runner",
+            "--crate-name",
+            "with_tests",
+            "--out",
+            leaf_out.to_str().unwrap(),
+            "--sidecar",
+            sidecar.to_str().unwrap(),
+        ],
+    );
+    assert_success(&out);
+    let got = fs::read(&leaf_out).expect("leaf runner output");
+    assert_eq!(
+        got, expected,
+        "test-runner leaf differs from in-process runner"
+    );
+}
+
+#[test]
+fn test_build_reuses_build_mode_fragment() {
+    // V46D-7 guard: a module's published surface fragment is
+    // identical whether produced by `cust build` (build-mode) or
+    // `cust test` (`-DCUST_TEST_BUILD=1`). If a future change ever
+    // makes pub surface conditional on `CUST_TEST_BUILD`, this fails
+    // loudly — that is the day RQ-V46-3 (namespaced test fragments)
+    // becomes necessary. Both passes write the same fragment path,
+    // so equal bytes ⇒ the test build can safely reuse the
+    // build-mode fragment (V46D-7) instead of regenerating it.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_tests");
+
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+    let frag = dir.join("target/debug/.h-fragments/with_tests/lib.cust.h");
+    let build_mode = fs::read(&frag).expect("build-mode fragment");
+
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+    let test_mode = fs::read(&frag).expect("test-mode fragment");
+
+    assert_eq!(
+        build_mode, test_mode,
+        "build-mode and test-mode fragments differ — pub surface must \
+         not depend on CUST_TEST_BUILD (RQ-V46-3)"
+    );
+}
+
 // ─── v0.4.5: slice C — incremental generation properties ─────────
 
 /// Like `cust` but with extra environment variables applied. Used
