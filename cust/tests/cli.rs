@@ -171,6 +171,30 @@ fn check_hello_succeeds() {
 }
 
 #[test]
+fn check_fails_on_type_error() {
+    // incremental-check CHK-D-1: `cust check` is now an
+    // error-reporting pass — a type error in a lib module must fail
+    // the check (exit non-zero) with the clang diagnostic, the case
+    // the old tolerant surface pass (V42D-15) silently passed. The
+    // error surfaces through the `cmake --build` phase (Ninja),
+    // which cust echoes — so search combined stdout+stderr.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("hello");
+    // A clean check first proves the baseline passes.
+    assert_success(&cust(&dir, ["check"]));
+    // Inject a return-type error into the lib module.
+    let lib = dir.join("src/lib.c");
+    let mut src = fs::read_to_string(&lib).unwrap();
+    src.push_str("\n[[cust::pub]] int32_t hello_broken(void) { return \"nope\"; }\n");
+    fs::write(&lib, src).unwrap();
+    let out = cust(&dir, ["check"]);
+    assert_build_failure_with(&out, "hello_broken");
+}
+
+#[test]
 fn clean_removes_target_dir() {
     let (_tmp, dir) = stage("hello");
     assert_success(&cust(&dir, ["build"]));

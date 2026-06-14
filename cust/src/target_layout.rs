@@ -113,7 +113,6 @@ impl TargetLayout {
     /// Ninja restat token (its bytes are irrelevant), so the
     /// directory must exist before `cmake -E touch` runs — the
     /// driver creates it (check has no leaf to self-create it).
-    #[allow(dead_code)] // created by the check driver (slice C); helper landed in slice A
     pub fn check_dir(&self, crate_name: &str) -> PathBuf {
         self.profile_root.join(".check").join(crate_name)
     }

@@ -723,6 +723,7 @@ pub fn build_workspace(
             bin: opts.bin,
             jobs: opts.jobs,
             test_build: false,
+            check_build: false,
         },
     )
     .context("driving cmake build")?;
@@ -738,40 +739,91 @@ pub fn build_workspace(
     Ok(WorkspaceBuildOutputs { per_member })
 }
 
-/// V42D-15: `cust check` runs phase 1 (surface pass + crate
-/// header concat) per member and stops. No codegen, no `CMake`.
-/// Cross-crate `#cust use <dep>;` resolves through the dep view
-/// symlink to the upstream member's crate header — same path
-/// the build mode produces.
+/// incremental-check (CHK-D-1/CHK-D-3/CHK-D-4): `cust check` is now
+/// a CMake-owned, incremental, error-reporting pass — the reversal
+/// of V42D-15. The driver no longer runs `run_phase1`; it
+/// materialises the prelude, prepares each member's per-crate build
+/// and `.check` dirs and dep symlink, then a single `cmake -G
+/// Ninja` configure plus `cmake --build --target cust_check` (or
+/// `cust_check_<member>` under `-p`) drives a per-module direct-clang
+/// `-fsyntax-only` check in one Ninja graph. Each module's check is
+/// a custom command whose `.checked` stamp and `DEPENDS` (the
+/// `.rewrite` TU, plugin, build-mode fragments, dep headers) make
+/// it incremental and restat-skippable. A type error fails the
+/// check (CHK-D-1) — unlike the old tolerant surface pass.
+///
+/// `-p` on a member with no lib half has nothing to check (no
+/// `cust_check_<member>` target exists); the drive is skipped so a
+/// missing `--target` never falls back to building `all`.
 fn run_check_path(
     ws: &Workspace,
     to_build: &[String],
     opts: &WorkspaceBuildOptions<'_>,
     layout: &TargetLayout,
 ) -> Result<WorkspaceBuildOutputs> {
+    build::ensure_prelude(layout).context("materialising prelude")?;
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
-    for name in to_build {
-        let m = ws
-            .member(name)
-            .expect("build_order returned a member not in ws");
+    for m in &ws.members {
+        let name = &m.name;
+        std::fs::create_dir_all(layout.build_dir(name))
+            .with_context(|| format!("creating build dir for member `{name}`"))?;
+        // CHK-D-3: a `cmake -E touch` of the check stamp does not
+        // create parent dirs, and check has no leaf to self-create
+        // them — so the driver makes each lib member's
+        // `.check/<crate>/` tree before the build runs.
+        if m.kind.has_lib() {
+            std::fs::create_dir_all(layout.check_dir(name))
+                .with_context(|| format!("creating check dir for member `{name}`"))?;
+        }
         with_plan(ws, m, opts, |plan| {
-            build::run_phase1(plan).with_context(|| format!("checking member `{name}`"))?;
+            let _ = plan;
             refresh_dep_symlink(layout, &m.name, &m.root)
                 .with_context(|| format!("publishing dep view for `{name}`"))?;
-            per_member.push((
-                name.clone(),
-                BuildOutputs {
-                    objects: Vec::new(),
-                    archive: None,
-                    executables: Vec::new(),
-                    test_executable: None,
-                    integration_tests: Vec::new(),
-                    compile_commands: layout.target_root.join("compile_commands.json"),
-                },
-            ));
+            // Report only the `-p`-scoped subset (matches build/run
+            // shape — siblings outside scope stay silent).
+            if to_build.iter().any(|n| n == name) {
+                per_member.push((
+                    name.clone(),
+                    BuildOutputs {
+                        objects: Vec::new(),
+                        archive: None,
+                        executables: Vec::new(),
+                        test_executable: None,
+                        integration_tests: Vec::new(),
+                        compile_commands: layout.target_root.join("compile_commands.json"),
+                    },
+                ));
+            }
             Ok(())
         })?;
     }
+
+    // CHK-D-4/CHK-D-10: `-p` on a lib-less member checks nothing —
+    // skip the drive so `cmake --build` never falls back to `all`.
+    // (Without `-p`, the umbrella `cust_check` covers every lib
+    // member; if the workspace has no lib half at all there is also
+    // nothing to check.)
+    let nothing_to_check = opts.only.map_or_else(
+        || !ws.members.iter().any(|m| m.kind.has_lib()),
+        |only| ws.member(only).is_none_or(|m| !m.kind.has_lib()),
+    );
+    if !nothing_to_check {
+        crate::cmake_emit::emit_and_drive_cmake(
+            ws,
+            opts.profile_kind,
+            opts.clang,
+            opts.plugin,
+            &crate::cmake_emit::DriveOptions {
+                only: opts.only,
+                bin: None,
+                jobs: opts.jobs,
+                test_build: false,
+                check_build: true,
+            },
+        )
+        .context("driving cmake check")?;
+    }
+
     // No lock write in check mode (matches v0.3.x behaviour).
     Ok(WorkspaceBuildOutputs { per_member })
 }
@@ -867,6 +919,7 @@ fn run_test_build_path(
             bin: None,
             jobs: opts.jobs,
             test_build: true,
+            check_build: false,
         },
     )
     .context("driving cmake test build")?;

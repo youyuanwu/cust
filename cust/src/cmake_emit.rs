@@ -1037,7 +1037,13 @@ fn emit_check_commands(out: &mut String, m: &MemberView) {
 /// incremental-check (CHK-D-4): emit the umbrella `cust_check`
 /// target depending on every per-member `cust_check_<member>`
 /// target, marked `EXCLUDE_FROM_ALL`. `cust check` (no `-p`) builds
-/// this. No-op when no member has a lib half (nothing to check).
+/// this. Also wires each member's check target to its lib deps'
+/// check targets (CHK-D-10), so `cust check -p <m>` checks `<m>`
+/// *and* its transitive lib deps — the check analogue of the
+/// `target_link_libraries(<lib> PUBLIC <dep>)` propagation the build
+/// path relies on. Emitted after the member loop so every
+/// `cust_check_<member>` target already exists. No-op when no
+/// member has a lib half (nothing to check).
 fn emit_check_umbrella(out: &mut String, members: &[MemberView]) {
     let names: Vec<&str> = members
         .iter()
@@ -1049,6 +1055,21 @@ fn emit_check_umbrella(out: &mut String, members: &[MemberView]) {
     }
     out.push('\n');
     out.push_str("# ---- aggregate: cust_check ----\n");
+    // CHK-D-10: a member's check target pulls its lib deps' check
+    // targets, so `-p <m>` checks the transitive lib closure. A lib
+    // workspace dep always has a lib half, hence a `cust_check_<dep>`
+    // target; guard on `names` anyway for safety.
+    for m in members.iter().filter(|m| !m.check_commands.is_empty()) {
+        for dep in &m.lib_workspace_deps {
+            if names.contains(&dep.as_str()) {
+                let _ = writeln!(
+                    out,
+                    "add_dependencies(cust_check_{} cust_check_{dep})",
+                    m.name
+                );
+            }
+        }
+    }
     out.push_str("add_custom_target(cust_check\n");
     let _ = writeln!(out, "    DEPENDS cust_check_{}", names[0]);
     for name in &names[1..] {
@@ -2870,6 +2891,15 @@ pub struct DriveOptions<'a> {
     /// flipping modes neither churns the V42D-8 stamp nor
     /// triggers a `CMake` reconfigure.
     pub test_build: bool,
+    /// incremental-check (CHK-D-4): when `true`, the build step
+    /// drives the `cust_check` umbrella target (or
+    /// `cust_check_<member>` when `only` is set) instead of the
+    /// default lib/bin targets. All check targets are
+    /// `EXCLUDE_FROM_ALL`, so — like `test_build` — the emitted
+    /// `CMakeLists` is identical and flipping `cust build` ⇄ `cust
+    /// check` neither reconfigures nor churns the V42D-8 stamp.
+    /// Mutually exclusive with `test_build`.
+    pub check_build: bool,
 }
 
 /// One-shot orchestrator for the v0.4.2 `CMake`-driven build path.
@@ -2952,7 +2982,24 @@ pub fn emit_and_drive_cmake(
     // Build.
     let mut cmd = Command::new(&cmake.path);
     cmd.arg("--build").arg(&build_dir);
-    if let Some(bin_name) = opts.bin {
+    if opts.check_build {
+        // incremental-check (CHK-D-4/CHK-D-10): `cust check` drives
+        // the `cust_check` umbrella (all lib members) or, under
+        // `-p <member>`, that member's `cust_check_<member>`
+        // target. Both are `EXCLUDE_FROM_ALL`; the check command's
+        // DEPENDS pull the `.rewrite` TUs + build-mode fragments +
+        // dep crate-headers, so a cold check materialises whatever
+        // the surface DAG needs. A `-p` on a member with no lib
+        // half has nothing to check (the caller skips the drive).
+        match opts.only {
+            Some(member) => {
+                cmd.arg("--target").arg(format!("cust_check_{member}"));
+            }
+            None => {
+                cmd.arg("--target").arg("cust_check");
+            }
+        }
+    } else if let Some(bin_name) = opts.bin {
         // v0.4.4 V44D-7: `--bin <name>` scopes to the single bin's
         // CMake target (CMake pulls its transitive lib deps).
         // `opts.only` (if set) restricts the search to one member;

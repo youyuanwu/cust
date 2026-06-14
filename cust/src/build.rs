@@ -138,6 +138,12 @@ pub struct IntegrationTestOutput {
 /// Bin-half modules are NOT surface-passed because nothing reads
 /// their surface (bin has no downstream consumers). Matches the
 /// existing v0.4.0 behaviour.
+///
+/// incremental-check slice C: the check path stopped calling this
+/// (check is now a CMake-owned pass), leaving it without any
+/// caller. The function is deleted outright in slice E; the
+/// `allow` keeps `-D warnings` green in the interim.
+#[allow(dead_code)] // last caller removed in slice C; deleted in slice E
 pub fn run_phase1(plan: &BuildPlan<'_>) -> Result<()> {
     let profile_override = match plan.profile_kind {
         ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
