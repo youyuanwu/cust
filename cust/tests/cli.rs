@@ -63,6 +63,22 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Recursively collect every regular file under `root`.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path));
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 fn cust<I, S>(crate_dir: &Path, args: I) -> Output
 where
     I: IntoIterator<Item = S>,
@@ -192,6 +208,104 @@ fn check_fails_on_type_error() {
     fs::write(&lib, src).unwrap();
     let out = cust(&dir, ["check"]);
     assert_build_failure_with(&out, "hello_broken");
+}
+
+/// incremental-check helper: mtime of a per-module `.checked`
+/// stamp (`target/debug/.check/<crate>/<qname>.checked`).
+fn check_stamp_mtime(dir: &Path, crate_name: &str, qname: &str) -> std::time::SystemTime {
+    let p = dir
+        .join("target/debug/.check")
+        .join(crate_name)
+        .join(format!("{qname}.checked"));
+    fs::metadata(&p)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+        .modified()
+        .unwrap()
+}
+
+#[test]
+fn check_noop_does_no_work() {
+    // incremental-check CHK-D-7: a second `cust check` with no edits
+    // runs no check command — Ninja reports nothing to do, so no
+    // `.checked` stamp is (re)generated. Probe: the no-op run's
+    // output mentions no `.checked` generation.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_module");
+    assert_success(&cust(&dir, ["check"]));
+    let out = cust(&dir, ["check"]);
+    assert_success(&out);
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !combined.contains(".checked"),
+        "no-op check re-ran a check command:\n{combined}"
+    );
+}
+
+#[test]
+fn check_single_module_incrementality() {
+    // incremental-check CHK-D-8: editing one module's body re-fires
+    // that module's check command and nothing unrelated. `util`'s
+    // body change re-checks `util` but leaves the unrelated
+    // `parser` module's stamp untouched.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_module");
+    assert_success(&cust(&dir, ["check"]));
+    let parser_before = check_stamp_mtime(&dir, "multi_module", "parser");
+    let util_before = check_stamp_mtime(&dir, "multi_module", "util");
+
+    // Distinct mtimes need a tick of wall-clock separation (stamp
+    // mtime has second granularity on most filesystems).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let util_src = dir.join("src/util.c");
+    let edited = fs::read_to_string(&util_src)
+        .unwrap()
+        .replace("return 42;", "return 43;");
+    fs::write(&util_src, edited).unwrap();
+    assert_success(&cust(&dir, ["check"]));
+
+    assert_ne!(
+        util_before,
+        check_stamp_mtime(&dir, "multi_module", "util"),
+        "edited module's check stamp must be refreshed"
+    );
+    assert_eq!(
+        parser_before,
+        check_stamp_mtime(&dir, "multi_module", "parser"),
+        "unrelated module's check stamp must stay untouched"
+    );
+}
+
+#[test]
+fn build_fires_no_check_work() {
+    // incremental-check CHK-D-4 / verification item 5: `cust_check`
+    // is EXCLUDE_FROM_ALL, so `cust build` never fires a check
+    // command — no `.checked` stamp is produced by a pure build.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping (run `cargo run -p plugin-build`)");
+        return;
+    }
+    let (_tmp, dir) = stage("multi_module");
+    assert_success(&cust(&dir, ["build"]));
+    let check_root = dir.join("target/debug/.check");
+    let stamps: Vec<PathBuf> = if check_root.is_dir() {
+        walk_files(&check_root)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "checked"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert!(
+        stamps.is_empty(),
+        "cust build produced check stamps: {stamps:?}"
+    );
 }
 
 #[test]
