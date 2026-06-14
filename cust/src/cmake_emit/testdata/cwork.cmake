@@ -161,6 +161,48 @@ target_compile_options(cstd__itest__basic PRIVATE
     "-DCUST_TEST_BUILD=1"
 )
 
+# ---- crate: cstd (check) ----
+add_custom_command(
+    OUTPUT "/ws/target/debug/.check/cstd/cstd__types.checked"
+    COMMAND "${CMAKE_C_COMPILER}"
+            "-std=c23"
+            "-O0"
+            "-g3"
+            "-fvisibility=hidden"
+            "-include"
+            "/ws/target/debug/prelude.h"
+            "-fplugin=/ws/target/debug/libcust_plugin.so"
+            "-Wno-unknown-attributes"
+            "-fsyntax-only"
+            "/ws/target/debug/.rewrite/cstd/src/types.c"
+    COMMAND "${CMAKE_COMMAND}" -E touch "/ws/target/debug/.check/cstd/cstd__types.checked"
+    DEPENDS "/ws/target/debug/.rewrite/cstd/src/types.c"
+            "/ws/target/debug/libcust_plugin.so"
+    VERBATIM)
+add_custom_command(
+    OUTPUT "/ws/target/debug/.check/cstd/cstd__lib.checked"
+    COMMAND "${CMAKE_C_COMPILER}"
+            "-std=c23"
+            "-O0"
+            "-g3"
+            "-fvisibility=hidden"
+            "-include"
+            "/ws/target/debug/prelude.h"
+            "-fplugin=/ws/target/debug/libcust_plugin.so"
+            "-Wno-unknown-attributes"
+            "-fsyntax-only"
+            "/ws/target/debug/.rewrite/cstd/src/lib.c"
+    COMMAND "${CMAKE_COMMAND}" -E touch "/ws/target/debug/.check/cstd/cstd__lib.checked"
+    DEPENDS "/ws/target/debug/.rewrite/cstd/src/lib.c"
+            "/ws/target/debug/libcust_plugin.so"
+            "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
+    VERBATIM)
+add_custom_target(cust_check_cstd
+    DEPENDS "/ws/target/debug/.check/cstd/cstd__types.checked"
+            "/ws/target/debug/.check/cstd/cstd__lib.checked"
+)
+set_target_properties(cust_check_cstd PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
 # ---- crate: hello-cstd (generated rewrites) ----
 add_custom_command(
     OUTPUT "/ws/target/debug/.rewrite/hello-cstd/src/main.c"
@@ -203,3 +245,9 @@ target_compile_options(hello-cstd PRIVATE
     "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
     "-Wno-unknown-attributes"
 )
+
+# ---- aggregate: cust_check ----
+add_custom_target(cust_check
+    DEPENDS cust_check_cstd
+)
+set_target_properties(cust_check PROPERTIES EXCLUDE_FROM_ALL TRUE)

@@ -234,10 +234,9 @@ pub struct MemberView {
     /// members, for unit-test fixtures that don't exercise the lib
     /// path, and for plugin-less views (CHK-D-10: the plugin is
     /// mandatory for `cust check`, so a `None` plugin yields no
-    /// check commands rather than a plugin-less one). Wired into
-    /// `generate` + anchored by `cust_check_<member>` in slice B;
-    /// populated-but-not-emitted in slice A.
-    #[allow(dead_code)] // consumed by `emit_check_commands` (slice B)
+    /// check commands rather than a plugin-less one). Emitted by
+    /// `emit_check_commands` + anchored by the per-member
+    /// `cust_check_<member>` target and the `cust_check` umbrella.
     pub check_commands: Vec<CheckCommand>,
 }
 
@@ -637,7 +636,6 @@ pub struct SourceFile {
 /// command it depends on, so it invokes clang directly the same way
 /// the real lib target does.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by `emit_check_commands` (slice B); populated in slice A
 pub struct CheckCommand {
     /// The command's sole `OUTPUT` and its `touch` target:
     /// `target/<profile>/.check/<crate>/<qname>.checked`.
@@ -709,7 +707,15 @@ pub fn generate(view: &WorkspaceView) -> String {
         for it in &m.integration_tests {
             emit_integration_test_executable(&mut out, m, it);
         }
+        emit_check_commands(&mut out, m);
     }
+
+    // incremental-check (CHK-D-4/CHK-D-10): the umbrella
+    // `cust_check` target depends on every per-member
+    // `cust_check_<member>` target, so it must be emitted after the
+    // member loop. All check targets are `EXCLUDE_FROM_ALL` so
+    // `cust build` never fires a check command.
+    emit_check_umbrella(&mut out, &view.members);
 
     out
 }
@@ -957,6 +963,99 @@ fn emit_crate_header_command(out: &mut String, cust_exe: &Path, m: &MemberView) 
     let _ = writeln!(out, "add_custom_target({}_header ALL", m.name);
     let _ = writeln!(out, "    DEPENDS \"{}\")", ch.out.display());
     let _ = writeln!(out, "add_dependencies({0} {0}_header)", m.name);
+}
+
+/// incremental-check (CHK-D-3/CHK-D-4): emit one direct-clang
+/// `add_custom_command` per lib module — a `${CMAKE_C_COMPILER}`
+/// `-fsyntax-only` compile of the module's `.rewrite` TU followed
+/// by a `${CMAKE_COMMAND} -E touch` of the `.checked` stamp — plus
+/// the per-member `cust_check_<member>` aggregate target. The
+/// compiler variable expands to the same clang the build uses
+/// (configure passes `-DCMAKE_C_COMPILER=<abs/clang>`), so check
+/// validates the bytes the build compiles under the build's flags
+/// (CHK-D-1). The two `COMMAND`s are ordered: Ninja runs the
+/// `touch` only if clang exits zero, so a failed check leaves the
+/// stamp unproduced and re-fires next run (RQ-CHK-5). The
+/// per-member target is marked `EXCLUDE_FROM_ALL` (CHK-D-4) so
+/// `cust build` never drags a check command into `all`. No-op for
+/// members without check commands (bin-only / plugin-less).
+fn emit_check_commands(out: &mut String, m: &MemberView) {
+    if m.check_commands.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(out, "# ---- crate: {} (check) ----", m.name);
+    for cc in &m.check_commands {
+        out.push_str("add_custom_command(\n");
+        let _ = writeln!(out, "    OUTPUT \"{}\"", cc.stamp_out.display());
+        // Direct clang `-fsyntax-only` of the `.rewrite` TU. The
+        // compiler variable, not a `cust internal` leaf (RQ-CHK-6);
+        // the argv is the lib target's flags + explicit `-std` + a
+        // bare `-fplugin` (CHK-D-2), each token a separate quoted
+        // list element so VERBATIM passes them through unsplit.
+        out.push_str("    COMMAND \"${CMAKE_C_COMPILER}\"\n");
+        for arg in &cc.argv {
+            let _ = writeln!(out, "            \"{arg}\"");
+        }
+        // Stamp success: only runs if the clang COMMAND exited zero.
+        let _ = writeln!(
+            out,
+            "    COMMAND \"${{CMAKE_COMMAND}}\" -E touch \"{}\"",
+            cc.stamp_out.display()
+        );
+        // DEPENDS: the `.rewrite` TU + plugin + imported build-mode
+        // fragments / dep headers (CHK-D-5). The TU also appears as
+        // the final argv token; Ninja needs it in DEPENDS to order
+        // the rewrite/surface DAG before the check.
+        let _ = writeln!(out, "    DEPENDS \"{}\"", cc.rewrite_tu.display());
+        let _ = writeln!(out, "            \"{}\"", cc.plugin.display());
+        for frag in &cc.frag_depends {
+            let _ = writeln!(out, "            \"{}\"", frag.display());
+        }
+        out.push_str("    VERBATIM)\n");
+    }
+    // CHK-D-4/CHK-D-10: per-member aggregate target over this
+    // member's `.checked` stamps. `cust check -p <member>` builds
+    // exactly this target.
+    let _ = writeln!(out, "add_custom_target(cust_check_{}", m.name);
+    let _ = writeln!(
+        out,
+        "    DEPENDS \"{}\"",
+        m.check_commands[0].stamp_out.display()
+    );
+    for cc in &m.check_commands[1..] {
+        let _ = writeln!(out, "            \"{}\"", cc.stamp_out.display());
+    }
+    out.push_str(")\n");
+    let _ = writeln!(
+        out,
+        "set_target_properties(cust_check_{} PROPERTIES EXCLUDE_FROM_ALL TRUE)",
+        m.name
+    );
+}
+
+/// incremental-check (CHK-D-4): emit the umbrella `cust_check`
+/// target depending on every per-member `cust_check_<member>`
+/// target, marked `EXCLUDE_FROM_ALL`. `cust check` (no `-p`) builds
+/// this. No-op when no member has a lib half (nothing to check).
+fn emit_check_umbrella(out: &mut String, members: &[MemberView]) {
+    let names: Vec<&str> = members
+        .iter()
+        .filter(|m| !m.check_commands.is_empty())
+        .map(|m| m.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    out.push('\n');
+    out.push_str("# ---- aggregate: cust_check ----\n");
+    out.push_str("add_custom_target(cust_check\n");
+    let _ = writeln!(out, "    DEPENDS cust_check_{}", names[0]);
+    for name in &names[1..] {
+        let _ = writeln!(out, "            cust_check_{name}");
+    }
+    out.push_str(")\n");
+    out.push_str("set_target_properties(cust_check PROPERTIES EXCLUDE_FROM_ALL TRUE)\n");
 }
 
 /// v0.4.6 V46D-2: emit one `cust internal test-sidecar` custom

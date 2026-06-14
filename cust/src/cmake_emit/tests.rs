@@ -211,7 +211,48 @@ fn cwork_view() -> WorkspaceView {
                 test_runner: None,
                 integration_test_sidecars: vec![],
                 integration_test_runners: vec![],
-                check_commands: vec![],
+                check_commands: vec![
+                    CheckCommand {
+                        stamp_out: PathBuf::from(
+                            "/ws/target/debug/.check/cstd/cstd__types.checked",
+                        ),
+                        argv: vec![
+                            "-std=c23".to_string(),
+                            "-O0".to_string(),
+                            "-g3".to_string(),
+                            "-fvisibility=hidden".to_string(),
+                            "-include".to_string(),
+                            "/ws/target/debug/prelude.h".to_string(),
+                            "-fplugin=/ws/target/debug/libcust_plugin.so".to_string(),
+                            "-Wno-unknown-attributes".to_string(),
+                            "-fsyntax-only".to_string(),
+                            "/ws/target/debug/.rewrite/cstd/src/types.c".to_string(),
+                        ],
+                        rewrite_tu: PathBuf::from("/ws/target/debug/.rewrite/cstd/src/types.c"),
+                        plugin: PathBuf::from("/ws/target/debug/libcust_plugin.so"),
+                        frag_depends: vec![],
+                    },
+                    CheckCommand {
+                        stamp_out: PathBuf::from("/ws/target/debug/.check/cstd/cstd__lib.checked"),
+                        argv: vec![
+                            "-std=c23".to_string(),
+                            "-O0".to_string(),
+                            "-g3".to_string(),
+                            "-fvisibility=hidden".to_string(),
+                            "-include".to_string(),
+                            "/ws/target/debug/prelude.h".to_string(),
+                            "-fplugin=/ws/target/debug/libcust_plugin.so".to_string(),
+                            "-Wno-unknown-attributes".to_string(),
+                            "-fsyntax-only".to_string(),
+                            "/ws/target/debug/.rewrite/cstd/src/lib.c".to_string(),
+                        ],
+                        rewrite_tu: PathBuf::from("/ws/target/debug/.rewrite/cstd/src/lib.c"),
+                        plugin: PathBuf::from("/ws/target/debug/libcust_plugin.so"),
+                        frag_depends: vec![PathBuf::from(
+                            "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h",
+                        )],
+                    },
+                ],
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -292,6 +333,93 @@ fn golden_cwork() {
 }
 
 #[test]
+fn check_commands_emit_per_module_stamps_and_aggregate_targets() {
+    // incremental-check slice B (CHK-D-3/CHK-D-4/CHK-D-10): the
+    // emitter renders one direct-clang check command per lib
+    // module, a per-member `cust_check_<member>` target, and the
+    // `cust_check` umbrella — all EXCLUDE_FROM_ALL.
+    let out = generate(&cwork_view());
+
+    // Per-module check command: OUTPUT is the .checked stamp, the
+    // compile is a direct ${CMAKE_C_COMPILER} -fsyntax-only of the
+    // .rewrite TU, and a ${CMAKE_COMMAND} -E touch stamps success.
+    assert!(
+        out.contains("OUTPUT \"/ws/target/debug/.check/cstd/cstd__types.checked\""),
+        "per-module check stamp OUTPUT emitted"
+    );
+    assert!(
+        out.contains("COMMAND \"${CMAKE_C_COMPILER}\""),
+        "check uses the compiler variable directly (no cust leaf, RQ-CHK-6)"
+    );
+    assert!(
+        out.contains("\"-fsyntax-only\"")
+            && out.contains("\"/ws/target/debug/.rewrite/cstd/src/types.c\""),
+        "check is -fsyntax-only over the .rewrite TU (CHK-D-1)"
+    );
+    assert!(
+        out.contains(
+            "COMMAND \"${CMAKE_COMMAND}\" -E touch \
+             \"/ws/target/debug/.check/cstd/cstd__types.checked\""
+        ),
+        "a second COMMAND touches the stamp on success (RQ-CHK-5)"
+    );
+
+    // The `lib` module DEPENDS its imported build-mode fragment
+    // (CHK-D-5) in addition to the TU + plugin.
+    let lib_block = out
+        .split("OUTPUT \"/ws/target/debug/.check/cstd/cstd__lib.checked\"")
+        .nth(1)
+        .expect("lib check command present");
+    let lib_block = lib_block.split("VERBATIM)").next().unwrap();
+    assert!(
+        lib_block.contains("DEPENDS \"/ws/target/debug/.rewrite/cstd/src/lib.c\"")
+            && lib_block.contains("\"/ws/target/debug/libcust_plugin.so\"")
+            && lib_block.contains("\"/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h\""),
+        "lib check DEPENDS the TU + plugin + imported build-mode fragment (CHK-D-5)"
+    );
+
+    // Per-member aggregate target over the member's stamps.
+    assert!(
+        out.contains("add_custom_target(cust_check_cstd"),
+        "per-member cust_check_<member> target emitted (CHK-D-4/CHK-D-10)"
+    );
+    assert!(
+        out.contains("set_target_properties(cust_check_cstd PROPERTIES EXCLUDE_FROM_ALL TRUE)"),
+        "per-member check target is EXCLUDE_FROM_ALL"
+    );
+
+    // Umbrella target over the per-member targets.
+    assert!(
+        out.contains("add_custom_target(cust_check\n    DEPENDS cust_check_cstd"),
+        "umbrella cust_check target depends on the per-member targets (CHK-D-4)"
+    );
+    assert!(
+        out.contains("set_target_properties(cust_check PROPERTIES EXCLUDE_FROM_ALL TRUE)"),
+        "umbrella check target is EXCLUDE_FROM_ALL — cust build fires no check work"
+    );
+
+    // No tolerance / codegen flags leaked into the check argv.
+    assert!(!out.contains("\"-Wno-error\""), "no -Wno-error in check");
+}
+
+#[test]
+fn check_commands_absent_without_plugin() {
+    // CHK-D-10: a plugin-less view emits no check commands and no
+    // check targets (the per-module CheckCommands are dropped at
+    // collect time; the umbrella then has nothing to anchor).
+    let mut view = cwork_view();
+    view.plugin_path = None;
+    for m in &mut view.members {
+        m.check_commands.clear();
+    }
+    let out = generate(&view);
+    assert!(
+        !out.contains("(check) ----") && !out.contains("cust_check"),
+        "plugin-less view emits no check block or targets (CHK-D-10)"
+    );
+}
+
+#[test]
 fn determinism_no_plugin() {
     // No plugin → the `SHELL:-fplugin=…` entry drops out of
     // each member's compile_options. Output is still well-formed.
@@ -302,6 +430,9 @@ fn determinism_no_plugin() {
         for it in &mut m.integration_tests {
             it.compile_options.retain(|o| !o.contains("-fplugin="));
         }
+        // CHK-D-10: a plugin-less view carries no check commands
+        // (they bake `-fplugin`); collect_view drops them at source.
+        m.check_commands.clear();
     }
     let out = generate(&view);
     assert!(
