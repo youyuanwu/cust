@@ -22,7 +22,7 @@
  *
  *   max(3, 7) = 7
  *   strlen("hello, cstd") = 11
- *   cstd version = 0x000404 (0.4.4)
+ *   cstd version = 0x000405 (0.4.5)
  *   distance_sq((0,0), (3,4)) = 25
  */
 
@@ -51,6 +51,6 @@
            origin.x, origin.y, target.x, target.y,
            cstd_point_distance_sq(origin, target));
 
-    printf("cstd version = 0x%06x (0.4.4)\n", cstd_version());
+    printf("cstd version = 0x%06x (0.4.5)\n", cstd_version());
     return 0;
 }

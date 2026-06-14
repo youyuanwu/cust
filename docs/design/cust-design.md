@@ -1420,7 +1420,8 @@ Roadmap bullets here are deliberately short:
     bin-internal tests (RQ-V44-1/2/3). See [v0.4.4.md](v0.4.4.md).
   - **v0.4.5** — CMake-owned generation
     (`add_custom_command` codegen graph — V45D-1 through
-    V45D-13). Moves fragment-header + `#cust use` rewrite
+    V45D-15).
+    ✅ **shipped.** Moves fragment-header + `#cust use` rewrite
     generation out of the driver's unconditional pre-pass
     and into CMake custom commands with declared
     `OUTPUT`/`DEPENDS` edges, so Ninja owns generation
@@ -1429,11 +1430,11 @@ Roadmap bullets here are deliberately short:
     becomes a topological DAG (V45D-4), so a no-op `cust
     build` spawns zero codegen processes (V45D-12). A new
     hidden `cust internal {rewrite-file,surface-module,
-    crate-header}` group (V45D-2) is the callback CMake
-    invokes. Cyclic `[[cust::pub_repr]]` SCCs fall back to
-    one coarse command (V45D-6). `cust check` (V45D-8) and
-    `cust test` (V45D-11) generation stay driver-side this
-    milestone. See [v0.4.5.md](v0.4.5.md).
+    crate-header,surface-cycle}` group (V45D-2/V45D-6) is the
+    callback CMake invokes. Cyclic `[[cust::pub_repr]]` SCCs
+    fall back to one coarse `surface-cycle` command (V45D-6).
+    `cust check` (V45D-8) and `cust test` (V45D-11) generation
+    stay driver-side this milestone. See [v0.4.5.md](v0.4.5.md).
   - **v0.4.6** — `cust test` follow-ups:
     `[[cust::test(inline)]]`,
     `should_panic`, per-test timeout, `--nocapture` /
