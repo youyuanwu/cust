@@ -2604,11 +2604,21 @@ fn pub_repr_cycle_builds_via_surface_cycle() {
     );
     // `a` / `b` must NOT each have their own surface-module command
     // (they are produced by the coarse cycle command instead); only
-    // `lib` is fine-grained.
-    let surface_module_sources: Vec<&str> = cml
-        .lines()
-        .filter(|l| l.contains("--source") && l.trim_start().starts_with("--source"))
-        .collect();
+    // `lib` is fine-grained. Scope this to `internal surface-module`
+    // command blocks — the per-module `internal test-sidecar`
+    // commands (V46D-2) legitimately carry a `--source` for every
+    // module, cycle members included, so a bare `--source` filter
+    // would false-positive on them.
+    let mut current_leaf = "";
+    let mut surface_module_sources: Vec<&str> = Vec::new();
+    for l in cml.lines() {
+        if let Some(idx) = l.find("internal ") {
+            current_leaf = l[idx + "internal ".len()..].trim();
+        }
+        if l.trim_start().starts_with("--source") && current_leaf == "surface-module" {
+            surface_module_sources.push(l);
+        }
+    }
     assert!(
         surface_module_sources.iter().all(|l| l.contains("lib.c")),
         "a fine-grained surface-module command leaked for a cycle member:\n{surface_module_sources:?}"

@@ -201,6 +201,21 @@ pub struct MemberView {
     /// `add_custom_target(<crate>_header ALL)` (V45D-14) since
     /// nothing in `CMake` consumes `<crate>.h` as a tracked input.
     pub crate_header: Option<CrateHeaderCommand>,
+    /// v0.4.6 V46D-2: one `cust internal test-sidecar` command per
+    /// **lib** module, producing the module's
+    /// `.test-discovery/<crate>/<q>.cust.tests` sidecar. Empty for
+    /// bin-only members and unit-test fixtures that don't exercise
+    /// the test path. Reachable only via the `test_runner`
+    /// command's `DEPENDS`, which the `EXCLUDE_FROM_ALL`
+    /// `<crate>__test` target anchors — so `cust build` never
+    /// fires them (V46D-4).
+    pub test_sidecars: Vec<TestSidecarCommand>,
+    /// v0.4.6 V46D-2: the per-crate `cust internal test-runner`
+    /// command rendering `cust_test_main_<crate>.c` from the unit
+    /// sidecars. `Some` for every lib-bearing member, `None`
+    /// otherwise. Its `OUTPUT` is a SOURCE of the `<crate>__test`
+    /// target (the anchor, V46D-4).
+    pub test_runner: Option<TestRunnerCommand>,
 }
 
 /// v0.4.5 V45D-3: one `cust internal rewrite-file` invocation,
@@ -334,6 +349,77 @@ pub struct CrateHeaderCommand {
     /// also the command's `DEPENDS` (a surface change in any
     /// module republishes the header).
     pub frags: Vec<PathBuf>,
+}
+
+/// v0.4.6 V46D-2: one `cust internal test-sidecar --kind unit`
+/// invocation for one lib module. The emitter lowers it to an
+/// `add_custom_command(OUTPUT <sidecar_out> … DEPENDS …)`. Emitted
+/// for lib modules only; anchored (indirectly) by the per-crate
+/// `test-runner` command that `DEPENDS` on every sidecar.
+#[derive(Debug, Clone)]
+pub struct TestSidecarCommand {
+    /// `--crate-name`.
+    pub crate_name: String,
+    /// `--module`: the module's qualified name (the plugin
+    /// `module` arg, so discovered `[[cust::test]]` names qualify
+    /// correctly).
+    pub module: String,
+    /// `--source`: the module's original `src/<…>.c`.
+    pub source: PathBuf,
+    /// `--surface-out`: scratch `#cust use`-lowered surface TU. A
+    /// **distinct** `<qname>.test-surface.c` path (NOT the build-
+    /// mode `<qname>.surface.c`) so the build-mode `surface-module`
+    /// and this test-sidecar command never race on a shared file
+    /// during a test build (V46D-2).
+    pub surface_out: PathBuf,
+    /// `--sidecar-out`: the produced `.cust.tests` sidecar — also
+    /// the command's sole `OUTPUT`.
+    pub sidecar_out: PathBuf,
+    /// `--frags-dir`: `target/<profile>/.h-fragments/<crate>/`.
+    pub frags_dir: PathBuf,
+    /// `--deps-root`: `target/<profile>/deps/`.
+    pub deps_root: PathBuf,
+    /// `--dep <d>` for each declared dependency (sorted, V45D-15).
+    pub deps: Vec<String>,
+    /// `--std <value>`.
+    pub std: String,
+    /// `--cflag <f>`: mid cflags (profile + `[clang] extra-cflags`);
+    /// the `-DCUST_TEST_BUILD=1` define is added by the leaf, not
+    /// here (V46D-1).
+    pub cflags: Vec<String>,
+    /// `--include <dir>`: the module's own source dir.
+    pub includes: Vec<PathBuf>,
+    /// `--prelude`: the materialised prelude header.
+    pub prelude: PathBuf,
+    /// `--plugin`: the cust clang plugin `.so` (also a `DEPENDS`).
+    /// `None` only in plugin-less test environments.
+    pub plugin: Option<PathBuf>,
+    /// `DEPENDS`: fragments of intra-crate imports (the **build-
+    /// mode** `surface-module` outputs, V46D-7 — the test build
+    /// reuses them, never regenerates them), sorted (V45D-15).
+    pub import_fragments: Vec<PathBuf>,
+    /// `DEPENDS`: the real crate-header `OUTPUT` of every
+    /// cross-crate dep this module uses, sorted (V45D-15).
+    pub dep_headers: Vec<PathBuf>,
+}
+
+/// v0.4.6 V46D-2: the per-crate `cust internal test-runner`
+/// invocation that renders one `cust_test_main_<crate>.c` from the
+/// member's unit sidecars. Its `OUTPUT` is a SOURCE of the
+/// `<crate>__test` target (so the target's source list anchors it —
+/// no `add_custom_target` needed, V46D-4). `None` for bin-only
+/// members.
+#[derive(Debug, Clone)]
+pub struct TestRunnerCommand {
+    /// `--crate-name`.
+    pub crate_name: String,
+    /// `--out`: the rendered runner TU — also the command's sole
+    /// `OUTPUT`.
+    pub out: PathBuf,
+    /// `--sidecar <p>` for every unit sidecar, in module-discovery
+    /// order (matches the in-process `write_test_runner_tu` test
+    /// ordering) — also the command's `DEPENDS`.
+    pub sidecars: Vec<PathBuf>,
 }
 
 /// v0.4.4 V44D-5: one binary target. A member emits one
@@ -510,6 +596,8 @@ pub fn generate(view: &WorkspaceView) -> String {
             emit_executable(&mut out, m);
         }
         if let Some(t) = &m.test_target {
+            emit_test_sidecar_commands(&mut out, &view.cust_exe, m);
+            emit_test_runner_command(&mut out, &view.cust_exe, m);
             emit_test_executable(&mut out, m, t);
         }
         for it in &m.integration_tests {
@@ -760,6 +848,120 @@ fn emit_crate_header_command(out: &mut String, cust_exe: &Path, m: &MemberView) 
     let _ = writeln!(out, "add_custom_target({}_header ALL", m.name);
     let _ = writeln!(out, "    DEPENDS \"{}\")", ch.out.display());
     let _ = writeln!(out, "add_dependencies({0} {0}_header)", m.name);
+}
+
+/// v0.4.6 V46D-2: emit one `cust internal test-sidecar` custom
+/// command per lib module so Ninja produces each unit
+/// `.test-discovery/<crate>/<q>.cust.tests` sidecar lazily during a
+/// test build. The `DEPENDS` set (source + plugin `.so` + imported
+/// **build-mode** fragments + cross-crate dep headers) reuses the
+/// build-mode surface outputs (V46D-7 — no test-mode fragments).
+/// Reached only via the `test-runner` command's `DEPENDS`, anchored
+/// by the `EXCLUDE_FROM_ALL` `<crate>__test` target, so `cust build`
+/// never fires these (V46D-4).
+fn emit_test_sidecar_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    if m.test_sidecars.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# ---- crate: {} (test-discovery sidecars) ----",
+        m.name
+    );
+    for sc in &m.test_sidecars {
+        out.push_str("add_custom_command(\n");
+        let _ = writeln!(out, "    OUTPUT \"{}\"", sc.sidecar_out.display());
+        let _ = writeln!(
+            out,
+            "    COMMAND \"{}\" internal test-sidecar",
+            cust_exe.display()
+        );
+        let _ = writeln!(out, "            --crate-name {}", sc.crate_name);
+        out.push_str("            --kind unit\n");
+        let _ = writeln!(out, "            --module {}", sc.module);
+        let _ = writeln!(out, "            --source \"{}\"", sc.source.display());
+        let _ = writeln!(
+            out,
+            "            --surface-out \"{}\"",
+            sc.surface_out.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --sidecar-out \"{}\"",
+            sc.sidecar_out.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --frags-dir \"{}\"",
+            sc.frags_dir.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --deps-root \"{}\"",
+            sc.deps_root.display()
+        );
+        let _ = writeln!(out, "            --std {}", sc.std);
+        for cflag in &sc.cflags {
+            let _ = writeln!(out, "            --cflag \"{cflag}\"");
+        }
+        for inc in &sc.includes {
+            let _ = writeln!(out, "            --include \"{}\"", inc.display());
+        }
+        for dep in &sc.deps {
+            let _ = writeln!(out, "            --dep {dep}");
+        }
+        let _ = writeln!(out, "            --prelude \"{}\"", sc.prelude.display());
+        if let Some(plugin) = &sc.plugin {
+            let _ = writeln!(out, "            --plugin \"{}\"", plugin.display());
+        }
+        let _ = writeln!(out, "    DEPENDS \"{}\"", sc.source.display());
+        if let Some(plugin) = &sc.plugin {
+            let _ = writeln!(out, "            \"{}\"", plugin.display());
+        }
+        for frag in &sc.import_fragments {
+            let _ = writeln!(out, "            \"{}\"", frag.display());
+        }
+        for hdr in &sc.dep_headers {
+            let _ = writeln!(out, "            \"{}\"", hdr.display());
+        }
+        out.push_str("    VERBATIM)\n");
+    }
+}
+
+/// v0.4.6 V46D-2: emit the per-crate `cust internal test-runner`
+/// command. Its `OUTPUT` (`cust_test_main_<crate>.c`) is a SOURCE
+/// of the `<crate>__test` target, so the target's source list
+/// anchors it (V46D-4) — no `add_custom_target` needed (unlike the
+/// crate header, which no target lists directly). No-op for
+/// bin-only members.
+fn emit_test_runner_command(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    let Some(tr) = &m.test_runner else {
+        return;
+    };
+    out.push('\n');
+    let _ = writeln!(out, "# ---- crate: {} (test runner TU) ----", m.name);
+    out.push_str("add_custom_command(\n");
+    let _ = writeln!(out, "    OUTPUT \"{}\"", tr.out.display());
+    let _ = writeln!(
+        out,
+        "    COMMAND \"{}\" internal test-runner",
+        cust_exe.display()
+    );
+    let _ = writeln!(out, "            --crate-name {}", tr.crate_name);
+    let _ = writeln!(out, "            --out \"{}\"", tr.out.display());
+    for s in &tr.sidecars {
+        let _ = writeln!(out, "            --sidecar \"{}\"", s.display());
+    }
+    if tr.sidecars.is_empty() {
+        let _ = writeln!(out, "    DEPENDS");
+    } else {
+        let _ = writeln!(out, "    DEPENDS \"{}\"", tr.sidecars[0].display());
+        for s in &tr.sidecars[1..] {
+            let _ = writeln!(out, "            \"{}\"", s.display());
+        }
+    }
+    out.push_str("    VERBATIM)\n");
 }
 
 fn emit_library(out: &mut String, m: &MemberView) {
@@ -1270,7 +1472,7 @@ use crate::{
     modules,
     plugin::Plugin,
     profile::{ProfileKind, ResolvedProfile},
-    target_layout::TargetLayout,
+    target_layout::{TargetLayout, TestOrigin},
     workspace::{Member, Workspace},
 };
 
@@ -1307,6 +1509,8 @@ struct LibArtifacts {
     surface_commands: Vec<SurfaceCommand>,
     surface_cycles: Vec<SurfaceCycleCommand>,
     crate_header: Option<CrateHeaderCommand>,
+    test_sidecars: Vec<TestSidecarCommand>,
+    test_runner: Option<TestRunnerCommand>,
 }
 
 /// v0.4.5 V45D-3/V45D-4/V45D-5: collect the lib half's sources,
@@ -1327,6 +1531,8 @@ fn collect_lib_artifacts(
             surface_commands: Vec::new(),
             surface_cycles: Vec::new(),
             crate_header: None,
+            test_sidecars: Vec::new(),
+            test_runner: None,
         });
     };
     let c = collect_sources(
@@ -1352,6 +1558,8 @@ fn collect_lib_artifacts(
         surface_commands: c.surface_commands,
         surface_cycles: c.surface_cycles,
         crate_header: Some(header),
+        test_sidecars: c.test_sidecars,
+        test_runner: c.test_runner,
     })
 }
 
@@ -1445,6 +1653,8 @@ pub fn collect_view(
         let surface_commands = lib.surface_commands;
         let surface_cycles = lib.surface_cycles;
         let crate_header = lib.crate_header;
+        let test_sidecars = lib.test_sidecars;
+        let test_runner = lib.test_runner;
         // v0.4.4 V44D-5/V44D-8: one `BinView` per `BinTarget`.
         let (bins, bin_rewrites) = collect_bin_views(m, kind, &rewrite_root, &layout, &gen_ctx)?;
         rewrites.extend(bin_rewrites);
@@ -1524,6 +1734,8 @@ pub fn collect_view(
             surface_commands,
             surface_cycles,
             crate_header,
+            test_sidecars,
+            test_runner,
         });
     }
 
@@ -1710,6 +1922,12 @@ struct CollectedSources {
     /// Topo-ordered fragment paths for the member's `crate-header`
     /// command (V45D-5). Empty for bins.
     header_frags: Vec<PathBuf>,
+    /// v0.4.6 V46D-2: one `test-sidecar` command per lib module.
+    /// Empty for bins.
+    test_sidecars: Vec<TestSidecarCommand>,
+    /// v0.4.6 V46D-2: the per-crate `test-runner` command. `Some`
+    /// for the lib half, `None` for bins.
+    test_runner: Option<TestRunnerCommand>,
 }
 
 /// v0.4.5 V45D-3/V45D-4: per-member context for building the
@@ -1891,12 +2109,40 @@ fn collect_sources(
         Vec::new()
     };
 
+    // V46D-2: per-module unit test-sidecar commands + the per-crate
+    // test-runner command (lib half only — bins have no tests). The
+    // sidecar list is in module-discovery order, matching the
+    // in-process runner-TU test ordering so the rendered runner is
+    // byte-identical.
+    let (test_sidecars, test_runner) = if is_lib_half {
+        let mut sidecars: Vec<TestSidecarCommand> = Vec::with_capacity(modules.len());
+        let mut sidecar_paths: Vec<PathBuf> = Vec::with_capacity(modules.len());
+        for m in &modules {
+            let sc = test_sidecar_command_for(m, crate_name, layout, rw_ctx);
+            sidecar_paths.push(sc.sidecar_out.clone());
+            sidecars.push(sc);
+        }
+        let runner = TestRunnerCommand {
+            crate_name: crate_name.to_string(),
+            out: layout
+                .profile_root
+                .join("cmake")
+                .join(format!("cust_test_main_{crate_name}.c")),
+            sidecars: sidecar_paths,
+        };
+        (sidecars, Some(runner))
+    } else {
+        (Vec::new(), None)
+    };
+
     Ok(CollectedSources {
         sources: out,
         rewrites,
         surface_commands,
         surface_cycles,
         header_frags,
+        test_sidecars,
+        test_runner,
     })
 }
 
@@ -1954,6 +2200,65 @@ fn surface_command_for(
         source: m.source_path.clone(),
         surface_out,
         fragment_out: layout.fragment_path(crate_name, &m.qualified_name),
+        frags_dir: rw_ctx.frags_dir.clone(),
+        deps_root: rw_ctx.deps_root.clone(),
+        deps: rw_ctx.deps.clone(),
+        std: rw_ctx.std.clone(),
+        cflags: rw_ctx.mid_cflags.clone(),
+        includes: vec![src_dir],
+        prelude: rw_ctx.prelude.clone(),
+        plugin: rw_ctx.plugin.clone(),
+        import_fragments,
+        dep_headers,
+    }
+}
+
+/// v0.4.6 V46D-2: build the unit `TestSidecarCommand` for one lib
+/// module. Mirrors [`surface_command_for`]'s `DEPENDS` shape
+/// (imported build-mode fragments + cross-crate dep headers, both
+/// sorted — V45D-15/V46D-7) but targets the `.cust.tests` sidecar
+/// instead of the fragment, and uses a distinct `.test-surface.c`
+/// scratch path so it never races the build-mode surface command.
+fn test_sidecar_command_for(
+    m: &modules::Module,
+    crate_name: &str,
+    layout: &TargetLayout,
+    rw_ctx: &MemberGenCtx,
+) -> TestSidecarCommand {
+    let surface_out = layout
+        .build_dir(crate_name)
+        .join(format!("{}.test-surface.c", m.qualified_name));
+    let src_dir = m
+        .source_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+
+    let mut import_fragments: Vec<PathBuf> = m
+        .imports
+        .iter()
+        .map(|importee| layout.fragment_path(crate_name, importee))
+        .collect();
+    import_fragments.sort();
+
+    let mut dep_headers: Vec<PathBuf> = m
+        .dep_imports
+        .iter()
+        .filter(|dep| dep_edge_is_valid(dep, crate_name, rw_ctx, false))
+        .map(|dep| layout.crate_header_path(dep))
+        .collect();
+    dep_headers.sort();
+
+    TestSidecarCommand {
+        crate_name: crate_name.to_string(),
+        module: m.qualified_name.clone(),
+        source: m.source_path.clone(),
+        surface_out,
+        sidecar_out: layout.test_sidecar_path(
+            crate_name,
+            TestOrigin::Unit {
+                qualified_name: &m.qualified_name,
+            },
+        ),
         frags_dir: rw_ctx.frags_dir.clone(),
         deps_root: rw_ctx.deps_root.clone(),
         deps: rw_ctx.deps.clone(),
@@ -2131,15 +2436,21 @@ pub fn emit_and_drive_cmake(
     let bytes = generate(&view).into_bytes();
     let outcome = write_if_changed(&cmakelists, &bytes, &stamp, view.plugin_path.as_deref())?;
 
-    // V42D-14: ensure every member's `cust_test_main_<crate>.c`
-    // runner TU exists on disk before configure. CMake validates
-    // every `add_executable` source path at configure time even
-    // when the target is `EXCLUDE_FROM_ALL`, so a missing runner
-    // TU during `cust build` would fail configure. The build
-    // path doesn't need real runner content (the target is
-    // never built); a tiny stub is enough. `cust test` calls
-    // `build::write_test_runner_tu` to overwrite the stub with
-    // the real concatenation before reaching the build step.
+    // V42D-14: ensure every member's integration-test runner TU
+    // exists on disk before configure. CMake validates every
+    // `add_executable` source path at configure time even when the
+    // target is `EXCLUDE_FROM_ALL`, so a missing runner TU during
+    // `cust build` would fail configure. The build path doesn't
+    // need real runner content (the target is never built); a tiny
+    // stub is enough.
+    //
+    // v0.4.6 V46D-2: the *unit* runner TU
+    // (`cust_test_main_<crate>.c`) is now produced by the
+    // `cust internal test-runner` custom command, so CMake treats
+    // it as GENERATED and the stub for it is redundant (harmless —
+    // the command overwrites it). Integration runner TUs are still
+    // driver-generated (V46D-3 / slice C), so they still need the
+    // stub.
     ensure_runner_tu_stubs(&view, &cmake_dir)?;
 
     // Configure if the CMakeLists was just written OR there's no
@@ -2263,27 +2574,30 @@ fn target_names_for<'a>(
     out
 }
 
-/// V42D-14: ensure each member's `cust_test_main_<crate>.c`
-/// runner TU exists on disk before `CMake` configure runs.
-/// `CMake` validates every `add_executable` source path at
-/// configure time even for `EXCLUDE_FROM_ALL` targets, so a
-/// missing runner TU would fail configure during `cust build`.
+/// V42D-14: ensure each member's runner TU exists on disk before
+/// `CMake` configure runs. `CMake` validates every
+/// `add_executable` source path at configure time even for
+/// `EXCLUDE_FROM_ALL` targets, so a missing runner TU would fail
+/// configure during `cust build`.
 ///
-/// On the test path `build::write_test_runner_tu` overwrites the
-/// stub with the real runner before reaching the build step;
-/// the stub itself is never compiled (the test target only
-/// reaches the `Ninja` graph when `cust test` selects it via
-/// `cmake --build --target <crate>__test`).
+/// v0.4.6 V46D-2: the unit runner TU (`cust_test_main_<crate>.c`)
+/// is now a `cust internal test-runner` custom-command OUTPUT, so
+/// `CMake` knows it is GENERATED and won't validate its existence
+/// — the stub written here for it is harmless redundancy (the
+/// command overwrites it on the test build). The integration
+/// runner TUs (`cust_itest_main_<crate>__<stem>.c`) are still
+/// driver-generated (V46D-3 / slice C) and genuinely need the
+/// stub.
 ///
 /// Idempotent + cheap: stubs are only written when the runner
 /// TU file is missing, and the stub content is small enough
 /// that any subsequent `write_if_byte_different` from the test
-/// path always replaces it.
+/// path or the Ninja command always replaces it.
 fn ensure_runner_tu_stubs(view: &WorkspaceView, cmake_dir: &Path) -> Result<()> {
     const STUB: &[u8] = b"/* @generated by cust \xe2\x80\x94 build-mode stub.\n\
- * The real runner is concatenated by `cust test`'s\n\
- * build::write_test_runner_tu before this target is built;\n\
- * see cust/src/test_runner.rs.\n\
+ * The real runner is rendered by the `cust internal test-runner`\n\
+ * custom command (unit) or `cust test`'s driver path (integration)\n\
+ * before this target is built; see cust/src/test_runner.rs.\n\
  */\n";
     for m in &view.members {
         let Some(t) = &m.test_target else { continue };

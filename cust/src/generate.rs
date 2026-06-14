@@ -537,10 +537,10 @@ pub fn sidecar_one(ctx: &SidecarCtx<'_>, clang: &Clang, base_cflags: &[String]) 
 /// and write it to `out_path` (byte-skip if unchanged). Reads each
 /// sidecar (a missing one counts as zero tests), parses the
 /// discovered entries, and renders the runner via
-/// [`test_runner::render_main_c`]. Shared by the unit
-/// (`write_test_runner_tu`) and integration
-/// (`write_integration_runner_tus`) driver paths and the
-/// `cust internal test-runner` leaf (V46D-1).
+/// [`test_runner::render_main_c`]. Shared by the integration
+/// driver path (`write_integration_runner_tus`) and the
+/// `cust internal test-runner` leaf (V46D-1/V46D-2 — the unit
+/// runner is rendered exclusively by the leaf now).
 pub fn write_runner_tu(out_path: &Path, sidecars: &[PathBuf]) -> Result<()> {
     let mut tests: Vec<test_discovery::TestEntry> = Vec::new();
     for sidecar in sidecars {

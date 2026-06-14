@@ -205,6 +205,8 @@ fn cwork_view() -> WorkspaceView {
                     ],
                 }),
                 surface_cycles: vec![],
+                test_sidecars: vec![],
+                test_runner: None,
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -245,6 +247,8 @@ fn cwork_view() -> WorkspaceView {
                 surface_commands: vec![],
                 crate_header: None,
                 surface_cycles: vec![],
+                test_sidecars: vec![],
+                test_runner: None,
             },
         ],
     }
@@ -388,6 +392,8 @@ fn lib_and_bin_member_emits_both_targets() {
                 )],
             }),
             surface_cycles: vec![],
+            test_sidecars: vec![],
+            test_runner: None,
         }],
     };
     let out = generate(&view);
@@ -404,6 +410,119 @@ fn lib_and_bin_member_emits_both_targets() {
         "rewrite custom commands emitted"
     );
     assert!(out.contains("--bin-half"), "bin-half flag present");
+}
+
+#[test]
+fn unit_test_sidecar_and_runner_commands_emitted() {
+    // v0.4.6 V46D-2: a lib member with unit tests emits one
+    // `internal test-sidecar --kind unit` custom command per lib
+    // module plus one per-crate `internal test-runner` command
+    // whose OUTPUT is the runner TU (a SOURCE of `<crate>__test`).
+    let profile_root = PathBuf::from("/ws/target/debug");
+    let view = WorkspaceView {
+        cust_version: "0.4.6".to_string(),
+        c_standard: "23".to_string(),
+        plugin_path: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+        cust_exe: PathBuf::from("/ws/bin/cust"),
+        members: vec![MemberView {
+            name: "app".to_string(),
+            kind: MemberKind::LibOnly,
+            lib_sources: vec![SourceFile {
+                path: PathBuf::from("/ws/target/debug/.rewrite/app/src/lib.c"),
+                object_depends: vec![],
+            }],
+            bins: vec![],
+            archive_output_dir: PathBuf::from("/ws/target/debug/build/app"),
+            runtime_output_dir: profile_root,
+            bin_include_dirs: vec![],
+            workspace_link_deps: vec![],
+            lib_workspace_deps: vec![],
+            compile_options: vec!["-O0".to_string()],
+            test_target: Some(TestTargetView {
+                target_name: "app__test".to_string(),
+                sources: vec![
+                    SourceFile {
+                        path: PathBuf::from("/ws/target/debug/.rewrite/app/src/lib.c"),
+                        object_depends: vec![],
+                    },
+                    SourceFile {
+                        path: PathBuf::from("/ws/target/debug/cmake/cust_test_main_app.c"),
+                        object_depends: vec![],
+                    },
+                ],
+                include_dirs: vec![PathBuf::from("/ws/target/debug/build/app/include")],
+                link_deps: vec![],
+                compile_options: vec!["-O0".to_string(), "-DCUST_TEST_BUILD=1".to_string()],
+                runtime_output_dir: PathBuf::from("/ws/target/debug/test/app"),
+            }),
+            integration_tests: vec![],
+            rewrites: vec![],
+            surface_commands: vec![],
+            surface_cycles: vec![],
+            crate_header: Some(CrateHeaderCommand {
+                crate_name: "app".to_string(),
+                out: PathBuf::from("/ws/target/debug/build/app/include/app.h"),
+                frags: vec![PathBuf::from(
+                    "/ws/target/debug/.h-fragments/app/app__lib.cust.h",
+                )],
+            }),
+            test_sidecars: vec![TestSidecarCommand {
+                crate_name: "app".to_string(),
+                module: "lib".to_string(),
+                source: PathBuf::from("/ws/app/src/lib.c"),
+                surface_out: PathBuf::from("/ws/target/debug/build/app/lib.test-surface.c"),
+                sidecar_out: PathBuf::from("/ws/target/debug/.test-discovery/app/lib.cust.tests"),
+                frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/app"),
+                deps_root: PathBuf::from("/ws/target/debug/deps"),
+                deps: vec![],
+                std: "c23".to_string(),
+                cflags: vec!["-O0".to_string()],
+                includes: vec![PathBuf::from("/ws/app/src")],
+                prelude: PathBuf::from("/ws/target/debug/prelude.h"),
+                plugin: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+                import_fragments: vec![],
+                dep_headers: vec![],
+            }],
+            test_runner: Some(TestRunnerCommand {
+                crate_name: "app".to_string(),
+                out: PathBuf::from("/ws/target/debug/cmake/cust_test_main_app.c"),
+                sidecars: vec![PathBuf::from(
+                    "/ws/target/debug/.test-discovery/app/lib.cust.tests",
+                )],
+            }),
+        }],
+    };
+    let out = generate(&view);
+    // The unit sidecar command (OUTPUT = the .cust.tests sidecar).
+    assert!(
+        out.contains("internal test-sidecar"),
+        "test-sidecar command emitted"
+    );
+    assert!(out.contains("--kind unit"), "unit kind flag present");
+    assert!(
+        out.contains("OUTPUT \"/ws/target/debug/.test-discovery/app/lib.cust.tests\""),
+        "sidecar OUTPUT is the .cust.tests path"
+    );
+    // The distinct test-surface scratch (must not collide with the
+    // build-mode .surface.c — V46D-2).
+    assert!(
+        out.contains("lib.test-surface.c"),
+        "test sidecar uses a distinct .test-surface.c scratch path"
+    );
+    // The per-crate runner command (OUTPUT = the runner TU, which
+    // the `app__test` target lists as a source → anchor).
+    assert!(
+        out.contains("internal test-runner"),
+        "test-runner command emitted"
+    );
+    assert!(
+        out.contains("OUTPUT \"/ws/target/debug/cmake/cust_test_main_app.c\""),
+        "runner OUTPUT is the runner TU consumed by app__test"
+    );
+    assert!(
+        out.contains("--sidecar \"/ws/target/debug/.test-discovery/app/lib.cust.tests\""),
+        "runner depends on the unit sidecar"
+    );
 }
 
 #[test]

@@ -809,13 +809,18 @@ fn run_test_build_path(
             build::run_phase1(plan).with_context(|| format!("phase 1 for member `{name}`"))?;
             build::write_rewrite_tree(plan)
                 .with_context(|| format!("writing rewrite tree for member `{name}`"))?;
-            // V42D-14 runner TU. Returns None for bin-only
-            // members; the test runner won't try to spawn
-            // anything for them (V32D-12).
-            let test_exe = build::write_test_runner_tu(plan)
-                .with_context(|| format!("writing test runner TU for member `{name}`"))?;
+            // v0.4.6 V46D-2: the unit runner TU is now produced by
+            // the `cust internal test-runner` CMake command (its
+            // OUTPUT is a SOURCE of the `<crate>__test` target). The
+            // driver only needs the exe *path* for the runner to
+            // spawn — `None` for bin-only members (V32D-12).
+            let test_exe = plan
+                .kind
+                .has_lib()
+                .then(|| layout.test_executable_path(plan.manifest.package_name()));
             // v0.4.3 V43D-5: integration runner TUs (surface
             // pass each `tests/<stem>.c`, render its runner).
+            // Still driver-side this slice (V46D-3 / slice C).
             let itests = build::write_integration_runner_tus(plan)
                 .with_context(|| format!("writing integration runner TUs for `{name}`"))?;
             // Only report `per_member` for members the caller

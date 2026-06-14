@@ -324,56 +324,6 @@ pub fn cmake_outputs_for(plan: &BuildPlan<'_>, layout: &TargetLayout) -> BuildOu
     }
 }
 
-/// V42D-14 test-runner TU generator. Reads the per-module test-
-/// discovery sidecars `surface_pass` wrote (when `plan.test_build`
-/// is `true`) and renders one `cust_test_main_<crate>.c` into
-/// `target/<profile>/cmake/`, where the workspace `CMakeLists`
-/// expects to find it.
-///
-/// Returns the absolute path of the per-member test executable
-/// `CMake` will produce (so the caller can plumb it into
-/// `BuildOutputs::test_executable` for the test runner to spawn).
-/// Returns `None` for bin-only members (V32D-11: those don't get
-/// tested in v0.4.x — `cust test` skips them).
-pub fn write_test_runner_tu(plan: &BuildPlan<'_>) -> Result<Option<PathBuf>> {
-    if !plan.kind.has_lib() {
-        return Ok(None);
-    }
-    let layout = TargetLayout::for_workspace(plan.workspace_root, plan.profile_kind);
-    let crate_name = plan.manifest.package_name();
-    let Some(lib_src) = plan.kind.lib_source() else {
-        return Ok(None);
-    };
-    let lib_modules =
-        modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
-
-    // V40D-6: one test-discovery sidecar per lib module. The
-    // surface pass (test_build mode) wrote these before us; the
-    // shared renderer (`generate::write_runner_tu`) tolerates a
-    // missing sidecar as "zero tests for that module."
-    let sidecars: Vec<PathBuf> = lib_modules
-        .iter()
-        .map(|m| {
-            layout.test_sidecar_path(
-                crate_name,
-                TestOrigin::Unit {
-                    qualified_name: &m.qualified_name,
-                },
-            )
-        })
-        .collect();
-
-    // Render + write the runner TU at the V42D-14 path (V46D-1:
-    // same `generate::write_runner_tu` the `internal test-runner`
-    // leaf calls). Content-skipped, so CMake's restat is happy on
-    // no-op rebuilds.
-    let cmake_dir = layout.profile_root.join("cmake");
-    let runner_path = cmake_dir.join(format!("cust_test_main_{crate_name}.c"));
-    crate::generate::write_runner_tu(&runner_path, &sidecars)?;
-
-    Ok(Some(layout.test_executable_path(crate_name)))
-}
-
 /// v0.4.3 V43D-4/V43D-5: for each integration test under
 /// `<crate>/tests/`, surface-pass the already-rewritten
 /// `.rewrite/<crate>/tests/<stem>.c` to emit its test-discovery
