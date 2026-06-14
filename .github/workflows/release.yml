@@ -1,0 +1,202 @@
+name: Release
+
+# Cut a release by pushing a semver tag:
+#
+#   git tag v0.4.6
+#   git push origin v0.4.6
+#
+# The `build` matrix builds, for every LLVM version, the release `cust`
+# driver + `libcust_plugin.so`, smoke-tests the pair against the in-tree
+# `cwork` workspace, packages them into a tarball + SHA-256, and uploads
+# them as workflow artifacts. A single `publish` job then downloads every
+# matrix artifact and creates ONE GitHub Release carrying them all — so
+# there is no race between matrix jobs over who creates the release.
+# `workflow_dispatch` runs the build matrix only (no Release).
+#
+# The clang plugin is ABI-coupled to the LLVM major version it was built
+# against — a user must run a matching `clang`. We therefore ship one
+# artifact per supported LLVM major (encoded in the filename), each built
+# with the corresponding clang put first on PATH.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: build (llvm ${{ matrix.llvm.major }})
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm:
+          # LLVM 18 ships in the ubuntu-24.04 base repos.
+          - major: "18"
+            source: system
+          # LLVM 21 comes from apt.llvm.org.
+          - major: "21"
+            source: llvm-org
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang + LLVM ${{ matrix.llvm.major }}
+        run: |
+          set -euo pipefail
+          MAJOR="${{ matrix.llvm.major }}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build wget gnupg
+
+          # apt.llvm.org carries versions newer than the base repos.
+          if [[ "${{ matrix.llvm.source }}" == "llvm-org" ]]; then
+            source /etc/os-release
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+            echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${MAJOR} main" \
+              | sudo tee /etc/apt/sources.list.d/llvm-${MAJOR}.list > /dev/null
+            sudo apt-get update
+          fi
+
+          sudo apt-get install -y --no-install-recommends \
+            "clang-${MAJOR}" \
+            "clang-tools-${MAJOR}" \
+            "libclang-${MAJOR}-dev" \
+            "llvm-${MAJOR}-dev"
+
+          # Put the matrix clang first on PATH so both the plugin build
+          # (clang++) and the driver (CC -> clang) use this exact LLVM.
+          mkdir -p "${HOME}/llvm-bin"
+          ln -sf "/usr/bin/clang-${MAJOR}" "${HOME}/llvm-bin/clang"
+          ln -sf "/usr/bin/clang++-${MAJOR}" "${HOME}/llvm-bin/clang++"
+          echo "${HOME}/llvm-bin" >> "$GITHUB_PATH"
+          echo "CUST_LLVM_PREFIX=/usr/lib/llvm-${MAJOR}" >> "$GITHUB_ENV"
+          echo "LLVM_MAJOR=${MAJOR}" >> "$GITHUB_ENV"
+
+      - name: Verify clang version
+        run: |
+          clang --version
+          clang++ --version
+          test "$(clang --version | grep -oP 'clang version \K[0-9]+' | head -1)" = "${LLVM_MAJOR}"
+
+      - name: Read toolchain version from rust-toolchain.toml
+        id: toolchain
+        run: |
+          channel=$(awk -F\" '/^channel/ {print $2}' rust-toolchain.toml)
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+          echo "Using Rust ${channel}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-${{ matrix.llvm.major }}
+
+      - name: Derive release metadata
+        id: meta
+        run: |
+          # Version comes from the tag (v0.4.6 -> 0.4.6) on a tag push,
+          # otherwise from the workspace Cargo.toml for manual runs.
+          ref="${GITHUB_REF}"
+          if [[ "${ref}" == refs/tags/v* ]]; then
+            version="${ref#refs/tags/v}"
+          else
+            version="$(awk -F\" '/^version/ {print $2; exit}' Cargo.toml)"
+          fi
+          target="$(rustc -vV | awk '/^host:/ {print $2}')"
+          name="cust-v${version}-${target}-llvm${LLVM_MAJOR}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "Release artifact: ${name}"
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cargo_version="$(awk -F\" '/^version/ {print $2; exit}' Cargo.toml)"
+          if [[ "${cargo_version}" != "${{ steps.meta.outputs.version }}" ]]; then
+            echo "::error::tag v${{ steps.meta.outputs.version }} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
+      - name: Build release driver
+        run: just build-release
+
+      - name: Build release plugin
+        env:
+          CUST_PLUGIN_PROFILE: release
+        run: cargo run -p plugin-build
+
+      - name: Smoke-test the packaged pair against cwork
+        run: |
+          # The release `cust` discovers `libcust_plugin.so` next to its
+          # own binary; both live in target/release/, so this exercises
+          # exactly what we are about to ship.
+          ./target/release/cust --version
+          cd cwork && ../target/release/cust build && ../target/release/cust test
+
+      - name: Stage and package artifacts
+        id: package
+        run: |
+          name="${{ steps.meta.outputs.name }}"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          cp target/release/cust "${staging}/"
+          cp target/release/libcust_plugin.so "${staging}/"
+          cp LICENSE README.md "${staging}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: |
+            dist/${{ steps.meta.outputs.name }}.tar.gz
+            dist/${{ steps.meta.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    # Only a tag push publishes; a manual run stops after `build`.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write # required to create the GitHub Release
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected files
+        run: ls -lR dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: cust ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
