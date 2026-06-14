@@ -1444,7 +1444,8 @@ Roadmap bullets here are deliberately short:
     form (`tests/` integration tests themselves shipped in
     v0.4.3). Also picks up the v0.4.5 deferred test-path
     generation migration (RQ-V45-3: `internal test-sidecar`
-    + `internal test-runner` custom commands).
+    + `internal test-runner` custom commands; designed in
+    [v0.4.6-test-codegen.md](v0.4.6-test-codegen.md)).
   - **v0.4.7** — dependency resolver + registry. Initial
     registry wire protocol (`Index` trait, `file://` first
     per V3D-1's deferral), `cust add`, semver version
