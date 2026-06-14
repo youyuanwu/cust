@@ -76,6 +76,11 @@ pub enum InternalCmd {
     /// header (V45D-5).
     #[command(hide = true)]
     CrateHeader(CrateHeaderArgs),
+    /// Surface-compile a `[[cust::pub_repr]]` import cycle (an SCC
+    /// of size > 1) via the fixed-point loop, producing every
+    /// fragment in the cycle (V45D-6).
+    #[command(hide = true)]
+    SurfaceCycle(SurfaceCycleArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -159,6 +164,48 @@ pub struct CrateHeaderArgs {
     /// Fragment header paths in topological order. Repeated.
     #[arg(long = "frag")]
     pub frags: Vec<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SurfaceCycleArgs {
+    /// The crate the cycle belongs to (diagnostics only).
+    #[arg(long)]
+    pub crate_name: String,
+    /// Qualified names of the cycle's modules. Zipped by position
+    /// with `--source`. Repeated.
+    #[arg(long = "module")]
+    pub modules: Vec<String>,
+    /// Source `.c` of each cycle module, positionally matched to
+    /// `--module`. Repeated.
+    #[arg(long = "source")]
+    pub sources: Vec<PathBuf>,
+    /// `target/<profile>/.h-fragments/<crate>/` — each module's
+    /// fragment is written to `<frags-dir>/<module>.cust.h`.
+    #[arg(long)]
+    pub frags_dir: PathBuf,
+    /// Scratch dir for the per-module `<module>.surface.c` TUs
+    /// (`build/<crate>/`).
+    #[arg(long)]
+    pub scratch_dir: PathBuf,
+    /// `target/<profile>/deps/`.
+    #[arg(long)]
+    pub deps_root: PathBuf,
+    /// Dep crate names the cycle's modules may `#cust use <dep>;`.
+    #[arg(long = "dep")]
+    pub deps: Vec<String>,
+    /// `-std=<value>` for the surface compiles.
+    #[arg(long)]
+    pub std: String,
+    /// Mid cflags (profile cflags + `[clang] extra-cflags`).
+    /// Repeated.
+    #[arg(long = "cflag", allow_hyphen_values = true)]
+    pub cflags: Vec<String>,
+    /// The materialised prelude header (`-include`d).
+    #[arg(long)]
+    pub prelude: PathBuf,
+    /// The cust clang plugin `.so`. Omitted ⇒ no plugin.
+    #[arg(long)]
+    pub plugin: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -587,7 +634,70 @@ fn run_internal(cmd: InternalCmd) -> Result<()> {
                 .collect();
             crate::generate::write_crate_header_concat(&a.crate_name, &a.out, &frags)
         }
+        InternalCmd::SurfaceCycle(a) => run_surface_cycle(a),
     }
+}
+
+/// v0.4.5 V45D-6: the `surface-cycle` leaf. Builds a
+/// [`SurfaceUnit`](crate::generate::SurfaceUnit) per cycle module
+/// from the serialised args, then runs the shared fixed-point loop
+/// (`generate::surface_fixed_point`) over them — the same loop the
+/// in-process `cust check` / `cust test` path uses. Each module's
+/// fragment-out is `<frags-dir>/<module>.cust.h`, its surface
+/// scratch is `<scratch-dir>/<module>.surface.c`, and its sole
+/// include dir is its own source dir (matching the in-process
+/// surface pass).
+fn run_surface_cycle(a: SurfaceCycleArgs) -> Result<()> {
+    for frag in &a.modules {
+        trace_internal("surface-cycle", &a.frags_dir.join(format!("{frag}.cust.h")));
+    }
+    if a.modules.len() != a.sources.len() {
+        anyhow::bail!(
+            "internal surface-cycle: {} --module vs {} --source (must pair up)",
+            a.modules.len(),
+            a.sources.len()
+        );
+    }
+    let clang = Clang::discover()?;
+    let plugin = a.plugin.map(|path| crate::plugin::Plugin { path });
+
+    let mut units: Vec<crate::generate::SurfaceUnit> = Vec::with_capacity(a.modules.len());
+    for (qname, source) in a.modules.iter().zip(&a.sources) {
+        let surface_out = a.scratch_dir.join(format!("{qname}.surface.c"));
+        let fragment_out = a.frags_dir.join(format!("{qname}.cust.h"));
+        let src_dir = source
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let dummy_obj = surface_out.with_extension("surface.o");
+        let base_cflags = crate::build::build_cflags_raw(
+            &a.std,
+            &a.cflags,
+            false,
+            plugin.as_ref(),
+            &a.prelude,
+            &surface_out,
+            &dummy_obj,
+            &[src_dir.as_path()],
+            crate::build::PluginOutputs {
+                fragment: Some(&fragment_out),
+                test_sidecar: None,
+                module: None,
+            },
+        );
+        units.push(crate::generate::SurfaceUnit {
+            qname: qname.clone(),
+            source: source.clone(),
+            surface_out,
+            fragment_out,
+            frags_dir: a.frags_dir.clone(),
+            deps_root: a.deps_root.clone(),
+            deps: a.deps.clone(),
+            base_cflags,
+        });
+    }
+
+    let cap = crate::generate::fixed_point_cap();
+    crate::generate::surface_fixed_point(&units, &clang, cap)
 }
 
 /// v0.4.5 V45D-12: when `CUST_TRACE_INTERNAL=<path>` is set,

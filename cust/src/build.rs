@@ -531,17 +531,23 @@ fn surface_pass_integration(
 /// fragments arrive on iter 2). V40D-11 wraps this in a fixed-
 /// point loop; `surface_pass_fixed_point` is the entry point
 /// callers should use.
-fn surface_pass(
+/// Build the per-module [`SurfaceUnit`](crate::generate::SurfaceUnit)
+/// list for one crate's lib modules — the owned inputs the shared
+/// fixed-point loop ([`generate::surface_fixed_point`]) iterates.
+/// In test-build mode each unit's cflags additionally request the
+/// per-module test-discovery sidecar (V40D-6 / RQ-V40-2).
+fn build_surface_units(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
     prelude: &Path,
     crate_build_dir: &Path,
     layout: &TargetLayout,
     modules: &[Module],
-) -> Result<()> {
+) -> Result<Vec<crate::generate::SurfaceUnit>> {
     let crate_name = plan.manifest.package_name();
     let frags_dir = layout.fragments_dir(crate_name);
     let deps_root = layout.profile_root.join("deps");
+    let mut units = Vec::with_capacity(modules.len());
     for m in modules {
         let surface_path = crate_build_dir.join(format!("{}.surface.c", m.qualified_name));
         let fragment_path = layout.fragment_path(crate_name, &m.qualified_name);
@@ -585,27 +591,26 @@ fn surface_pass(
             },
         );
 
-        // V40D-11 fixed-point caller: blank a missing imported
-        // fragment (the loop is the recovery mechanism), so
-        // `require_upstream` is `false`.
-        let ctx = crate::generate::SurfaceCtx {
-            source_path: &m.source_path,
-            surface_out: &surface_path,
-            fragment_out: &fragment_path,
-            frags_dir: &frags_dir,
-            deps_root: &deps_root,
-            deps: plan.deps,
-            require_upstream: false,
-        };
-        crate::generate::surface_one_module(&ctx, plan.clang, &base_cflags)?;
+        units.push(crate::generate::SurfaceUnit {
+            qname: m.qualified_name.clone(),
+            source: m.source_path.clone(),
+            surface_out: surface_path,
+            fragment_out: fragment_path,
+            frags_dir: frags_dir.clone(),
+            deps_root: deps_root.clone(),
+            deps: plan.deps.iter().map(|s| (*s).to_string()).collect(),
+            base_cflags,
+        });
     }
-    Ok(())
+    Ok(units)
 }
 
-/// V40D-11 fixed-point loop wrapping `surface_pass`. Iterates
-/// the surface pass until the per-module fragment header bytes
-/// stop changing, or until the cap (default 3, overridable via
-/// `CUST_FIXED_POINT_CAP=<n>` env var) is exceeded.
+/// V40D-11 fixed-point loop over the crate's lib modules. Builds
+/// the [`SurfaceUnit`](crate::generate::SurfaceUnit) list once and
+/// delegates the convergence iteration to the shared
+/// [`generate::surface_fixed_point`] (the same routine the
+/// `cust internal surface-cycle` leaf runs over a cyclic SCC —
+/// V45D-6, no logic fork V45D-8).
 ///
 /// Empirically: acyclic crates (every cust crate today) converge
 /// in 1 iteration; a 2-cycle of `[[cust::pub_repr]]` types needs
@@ -614,16 +619,6 @@ fn surface_pass(
 /// error). Plugin-side `writeFragmentIfChanged` already skips
 /// identical bytes, so the per-iteration cost when nothing has
 /// changed is one stat + one read + memcmp per module — cheap.
-///
-/// Implementation note: the design doc V40D-11 specifies scratch
-/// `.iter-N/` subdirs with atomic rename on convergence. That's
-/// equivalent to the in-memory snapshot used here: both detect
-/// "no module's fragment bytes changed between iter N-1 and N."
-/// The in-memory variant avoids any directory churn at all,
-/// which matches what `writeFragmentIfChanged`'s skip already
-/// gives us. If the eventual fixed-point invariant ever needs
-/// stronger guarantees (e.g. cross-process visibility) we can
-/// revisit; for v0.4.0 the simpler shape is correct.
 fn surface_pass_fixed_point(
     plan: &BuildPlan<'_>,
     profile: &ResolvedProfile,
@@ -632,68 +627,9 @@ fn surface_pass_fixed_point(
     layout: &TargetLayout,
     modules: &[Module],
 ) -> Result<()> {
-    use std::collections::HashMap;
-
-    let cap: usize = std::env::var("CUST_FIXED_POINT_CAP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let crate_name = plan.manifest.package_name();
-
-    // Snapshot of "fragment bytes after iteration N" keyed by
-    // qualified module name. None on iter 0 (no prior bytes).
-    let mut prev: Option<HashMap<String, Vec<u8>>> = None;
-
-    for iter in 1..=cap {
-        surface_pass(plan, profile, prelude, crate_build_dir, layout, modules)?;
-
-        // Snapshot the fragments. Missing files become an empty
-        // byte vec (a module with no [[cust::pub*]] decls still
-        // gets a "header + banner" fragment via the plugin's
-        // writer; the only path to a literally-missing file is
-        // a clang crash before HandleTranslationUnit, which
-        // would have errored above).
-        let mut curr: HashMap<String, Vec<u8>> = HashMap::with_capacity(modules.len());
-        for m in modules {
-            let path = layout.fragment_path(crate_name, &m.qualified_name);
-            let bytes = fs::read(&path).unwrap_or_default();
-            curr.insert(m.qualified_name.clone(), bytes);
-        }
-
-        if let Some(prev_snap) = &prev {
-            // Identify still-wobbling modules: fragment bytes
-            // differ from previous iteration.
-            let wobbling: Vec<&str> = modules
-                .iter()
-                .filter(|m| {
-                    prev_snap.get(&m.qualified_name).map(Vec::as_slice)
-                        != curr.get(&m.qualified_name).map(Vec::as_slice)
-                })
-                .map(|m| m.qualified_name.as_str())
-                .collect();
-
-            if wobbling.is_empty() {
-                // Converged.
-                return Ok(());
-            }
-
-            // Cap exceeded — emit the §4 verbatim error.
-            if iter == cap {
-                bail!(
-                    "circular `[[cust::pub_repr]]` dependency did not converge\n  \
-                     in {cap} iterations between modules: {}\n  \
-                     hint: break the cycle by exporting one side as `[[cust::pub]]`\n        \
-                     (opaque) instead of `[[cust::pub_repr]]`",
-                    wobbling.join(", ")
-                );
-            }
-        }
-        prev = Some(curr);
-    }
-
-    // Single-iteration case (cap == 1): we ran once and never
-    // had a "previous" to compare against, so we're done.
-    Ok(())
+    let cap = crate::generate::fixed_point_cap();
+    let units = build_surface_units(plan, profile, prelude, crate_build_dir, layout, modules)?;
+    crate::generate::surface_fixed_point(&units, plan.clang, cap)
 }
 
 /// Per-TU plugin output paths threaded through `build_cflags`.
@@ -973,6 +909,103 @@ pub fn topo_order_modules(modules: &[Module]) -> Vec<&Module> {
     out
 }
 
+/// v0.4.5 V45D-6: strongly-connected components of the intra-crate
+/// `#cust use crate::<m>;` import graph, by Tarjan's algorithm.
+/// Returns one `Vec<usize>` of module indices per SCC. A singleton
+/// SCC is an acyclic module (the common case → fine-grained
+/// `surface-module` command); an SCC of size > 1 is a
+/// `[[cust::pub_repr]]` import cycle that must be surfaced as one
+/// coarse `surface-cycle` command (a `DEPENDS` cycle is a hard
+/// `CMake` error, so the cycle cannot be a fine-grained DAG).
+///
+/// Within each returned SCC the indices are sorted ascending, and
+/// the SCC list is sorted by each SCC's smallest member index, so
+/// the output is deterministic (V45D-15) and — for an all-acyclic
+/// crate — preserves discovery order (each singleton `[i]`).
+#[must_use]
+pub fn module_sccs(modules: &[Module]) -> Vec<Vec<usize>> {
+    // Iterative Tarjan over the import graph (avoids deep recursion
+    // on large module sets).
+    const UNVISITED: i64 = -1;
+    let n = modules.len();
+    let name_to_idx: std::collections::BTreeMap<&str, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.qualified_name.as_str(), i))
+        .collect();
+    // Adjacency: edge i -> j when module i `#cust use crate::j`.
+    let adj: Vec<Vec<usize>> = modules
+        .iter()
+        .map(|m| {
+            let mut succ: Vec<usize> = m
+                .imports
+                .iter()
+                .filter_map(|imp| name_to_idx.get(imp.as_str()).copied())
+                .collect();
+            succ.sort_unstable();
+            succ.dedup();
+            succ
+        })
+        .collect();
+
+    let mut index: Vec<i64> = vec![UNVISITED; n];
+    let mut lowlink: Vec<i64> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next_index: i64 = 0;
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    // Explicit DFS stack of (node, next-successor-cursor).
+    for start in 0..n {
+        if index[start] != UNVISITED {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&(v, ci)) = work.last() {
+            if ci == 0 {
+                index[v] = next_index;
+                lowlink[v] = next_index;
+                next_index += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if ci < adj[v].len() {
+                // Advance this frame's cursor and recurse / relax.
+                work.last_mut().unwrap().1 += 1;
+                let w = adj[v][ci];
+                if index[w] == UNVISITED {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(index[w]);
+                }
+            } else {
+                // Done with v: if it's an SCC root, pop the SCC.
+                if lowlink[v] == index[v] {
+                    let mut comp: Vec<usize> = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on_stack[w] = false;
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    comp.sort_unstable();
+                    sccs.push(comp);
+                }
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    lowlink[parent] = lowlink[parent].min(lowlink[v]);
+                }
+            }
+        }
+    }
+
+    // Deterministic order: by smallest member index.
+    sccs.sort_by_key(|c| c[0]);
+    sccs
+}
+
 /// Derive an include-guard macro name from a crate name. Mirrors
 /// cargo's `name = "my-crate"` → C-identifier sanitisation: `-`
 /// and any other non-alphanumeric becomes `_`, upper-case the
@@ -1101,5 +1134,60 @@ mod tests {
             .map(|m| m.qualified_name.as_str())
             .collect();
         assert_eq!(out, ["lib", "real"]);
+    }
+
+    #[test]
+    fn module_sccs_all_singletons_in_discovery_order() {
+        // Acyclic graph: every module is its own SCC; the SCC list
+        // is in discovery (index) order so the fine-grained surface
+        // command order is unchanged from V45D-4.
+        use super::module_sccs;
+        let mods = vec![
+            mk_mod("lib", &["types"]),
+            mk_mod("types", &[]),
+            mk_mod("math", &["types"]),
+        ];
+        let sccs = module_sccs(&mods);
+        assert_eq!(sccs, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn module_sccs_detects_two_cycle() {
+        // `a` and `b` import each other → one SCC of size 2; `lib`
+        // is a singleton. The cycle members are sorted ascending
+        // within the SCC, and the SCC list is sorted by smallest
+        // member index.
+        use super::module_sccs;
+        let mods = vec![mk_mod("lib", &[]), mk_mod("a", &["b"]), mk_mod("b", &["a"])];
+        let sccs = module_sccs(&mods);
+        assert_eq!(sccs, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn module_sccs_detects_three_cycle() {
+        // a -> b -> c -> a is one SCC of all three.
+        use super::module_sccs;
+        let mods = vec![
+            mk_mod("a", &["b"]),
+            mk_mod("b", &["c"]),
+            mk_mod("c", &["a"]),
+        ];
+        let sccs = module_sccs(&mods);
+        assert_eq!(sccs, vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn non_convergence_error_is_verbatim() {
+        // V45D-6 verification item 7: the §4 message is byte-stable
+        // (shared by the in-process fixed-point and surface-cycle).
+        let err = crate::generate::non_convergence_error(3, &["a", "b"]);
+        let msg = format!("{err}");
+        assert_eq!(
+            msg,
+            "circular `[[cust::pub_repr]]` dependency did not converge\n  \
+             in 3 iterations between modules: a, b\n  \
+             hint: break the cycle by exporting one side as `[[cust::pub]]`\n        \
+             (opaque) instead of `[[cust::pub_repr]]`"
+        );
     }
 }

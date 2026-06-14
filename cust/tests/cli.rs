@@ -2351,3 +2351,83 @@ fn extra_cflag_change_refires_surface() {
         "extra-cflags change did not re-fire any surface-module command:\n{traced}"
     );
 }
+
+// ─── v0.4.5: slice D — cyclic-SCC fallback (V45D-6) ──────────────
+
+#[test]
+fn pub_repr_cycle_builds_via_surface_cycle() {
+    // V45D-6 (verification item 7): a `[[cust::pub_repr]]` import
+    // cycle (modules `a` ↔ `b`) cannot be a fine-grained DAG (a
+    // DEPENDS cycle is a hard CMake error), so the emitter coarsens
+    // it into a single `internal surface-cycle` command. The crate
+    // builds (the cycle converges via the fixed-point loop), and
+    // both pub_repr structs reach the published header.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("pub_repr_cycle");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+
+    // The generated graph carries one coarse cycle command whose
+    // OUTPUT is *both* cycle fragments, and no fine-grained
+    // surface-module command for `a` or `b` (only `lib`, the
+    // acyclic singleton, stays fine-grained).
+    let cmakelists = dir.join("target/debug/cmake/CMakeLists.txt");
+    let cml = fs::read_to_string(&cmakelists).expect("read generated CMakeLists");
+    assert!(
+        cml.contains("internal surface-cycle"),
+        "no surface-cycle command emitted for the 2-cycle:\n{cml}"
+    );
+    assert!(
+        cml.contains("--module a --source") && cml.contains("--module b --source"),
+        "surface-cycle command does not cover both cycle modules:\n{cml}"
+    );
+    // `a` / `b` must NOT each have their own surface-module command
+    // (they are produced by the coarse cycle command instead); only
+    // `lib` is fine-grained.
+    let surface_module_sources: Vec<&str> = cml
+        .lines()
+        .filter(|l| l.contains("--source") && l.trim_start().starts_with("--source"))
+        .collect();
+    assert!(
+        surface_module_sources.iter().all(|l| l.contains("lib.c")),
+        "a fine-grained surface-module command leaked for a cycle member:\n{surface_module_sources:?}"
+    );
+
+    // Both pub_repr structs reach the published crate header.
+    let header = dir.join("target/debug/build/pub_repr_cycle/include/pub_repr_cycle.h");
+    let h = fs::read_to_string(&header).expect("read published header");
+    assert!(
+        h.contains("struct ca {"),
+        "ca struct missing from header:\n{h}"
+    );
+    assert!(
+        h.contains("struct cb {"),
+        "cb struct missing from header:\n{h}"
+    );
+}
+
+#[test]
+fn pub_repr_cycle_noop_build_is_incremental() {
+    // The coarse cycle command participates in restat like any
+    // other: a second build with no edits re-fires nothing
+    // (V45D-12 holds for the cyclic path too).
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("pub_repr_cycle");
+    assert_success(&cust(&dir, ["build"]));
+
+    let trace = dir.join("target/debug/noop-cycle-trace.txt");
+    let _ = fs::remove_file(&trace);
+    let out = cust_env(&dir, ["build"], &[("CUST_TRACE_INTERNAL", &trace)]);
+    assert_success(&out);
+    assert!(
+        !trace.is_file(),
+        "no-op build of the cyclic crate spawned internal leaves:\n{}",
+        fs::read_to_string(&trace).unwrap_or_default()
+    );
+}

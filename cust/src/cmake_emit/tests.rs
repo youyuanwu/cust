@@ -204,6 +204,7 @@ fn cwork_view() -> WorkspaceView {
                         PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"),
                     ],
                 }),
+                surface_cycles: vec![],
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -243,6 +244,7 @@ fn cwork_view() -> WorkspaceView {
                 }],
                 surface_commands: vec![],
                 crate_header: None,
+                surface_cycles: vec![],
             },
         ],
     }
@@ -385,6 +387,7 @@ fn lib_and_bin_member_emits_both_targets() {
                     "/ws/target/debug/.h-fragments/app/app__lib.cust.h",
                 )],
             }),
+            surface_cycles: vec![],
         }],
     };
     let out = generate(&view);

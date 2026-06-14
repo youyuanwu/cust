@@ -249,6 +249,131 @@ fn lower_surface(
     Ok(rewritten)
 }
 
+/// One module's fully-resolved surface-pass inputs, owned so a
+/// caller can build a `Vec` once and run the fixed-point loop
+/// ([`surface_fixed_point`]) over it without lifetime gymnastics.
+/// Both the in-process fixed-point (`build::surface_pass_fixed_point`,
+/// for `cust check` / `cust test`) and the `cust internal
+/// surface-cycle` leaf (V45D-6) build these and share the same
+/// convergence algorithm — no logic fork (V45D-8).
+pub struct SurfaceUnit {
+    /// Qualified module name (for the non-convergence diagnostic).
+    pub qname: String,
+    /// Absolute path to the module's source `.c`.
+    pub source: PathBuf,
+    /// Scratch surface-TU path (`<build>/<qname>.surface.c`).
+    pub surface_out: PathBuf,
+    /// The fragment header the plugin writes for this module.
+    pub fragment_out: PathBuf,
+    /// `.h-fragments/<crate>/` (sibling-fragment existence probe).
+    pub frags_dir: PathBuf,
+    /// `deps/` (cross-crate `#cust use <dep>` lowering root).
+    pub deps_root: PathBuf,
+    /// Declared dep names this module may `#cust use <dep>;`.
+    pub deps: Vec<String>,
+    /// The full `build_cflags` argv (ending `-c -o <obj> <src>`);
+    /// `surface_one_module` truncates the trailing four and
+    /// substitutes the `-fsyntax-only` demotions.
+    pub base_cflags: Vec<String>,
+}
+
+/// The fixed-point iteration cap (default 3, overridable via
+/// `CUST_FIXED_POINT_CAP`). Shared so the in-process fixed-point
+/// and the `surface-cycle` leaf read the same env var (V40D-11).
+#[must_use]
+pub fn fixed_point_cap() -> usize {
+    std::env::var("CUST_FIXED_POINT_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+}
+
+/// Run the surface pass over `units` repeatedly until every
+/// module's fragment bytes stop changing, or until `cap`
+/// iterations elapse (then the §4 non-convergence error). Shared
+/// by the in-process fixed-point (`cust check` / `cust test`) and
+/// the `cust internal surface-cycle` leaf (V40D-11 / V45D-6). Each
+/// module is surfaced with `require_upstream = false` (the loop is
+/// the recovery mechanism for an as-yet-unresolved cross-module
+/// reference).
+///
+/// Empirically: an acyclic set converges in 1 iteration; a 2-cycle
+/// of `[[cust::pub_repr]]` types needs 2; longer cycles converge by
+/// 3 or diverge (the cap catches divergence and raises the §4
+/// error). Plugin-side `writeFragmentIfChanged` skips identical
+/// bytes, so a no-change iteration costs one stat + read + memcmp
+/// per module.
+pub fn surface_fixed_point(units: &[SurfaceUnit], clang: &Clang, cap: usize) -> Result<()> {
+    // Pre-borrow each unit's owned deps as `&[&str]` for `SurfaceCtx`.
+    let dep_refs: Vec<Vec<&str>> = units
+        .iter()
+        .map(|u| u.deps.iter().map(String::as_str).collect())
+        .collect();
+
+    // Snapshot of "fragment bytes after iteration N", indexed
+    // parallel to `units`. `None` before the first iteration.
+    let mut prev: Option<Vec<Vec<u8>>> = None;
+
+    for iter in 1..=cap {
+        for (u, deps) in units.iter().zip(&dep_refs) {
+            let ctx = SurfaceCtx {
+                source_path: &u.source,
+                surface_out: &u.surface_out,
+                fragment_out: &u.fragment_out,
+                frags_dir: &u.frags_dir,
+                deps_root: &u.deps_root,
+                deps,
+                require_upstream: false,
+            };
+            surface_one_module(&ctx, clang, &u.base_cflags)?;
+        }
+
+        // Snapshot fragments (a missing file → empty vec; the only
+        // path to a literally-missing fragment is a clang crash
+        // before `HandleTranslationUnit`, which errors above).
+        let curr: Vec<Vec<u8>> = units
+            .iter()
+            .map(|u| std::fs::read(&u.fragment_out).unwrap_or_default())
+            .collect();
+
+        if let Some(prev) = &prev {
+            let wobbling: Vec<&str> = units
+                .iter()
+                .zip(prev)
+                .zip(&curr)
+                .filter(|((_, p), c)| p != c)
+                .map(|((u, _), _)| u.qname.as_str())
+                .collect();
+
+            if wobbling.is_empty() {
+                return Ok(());
+            }
+            if iter == cap {
+                return Err(non_convergence_error(cap, &wobbling));
+            }
+        }
+        prev = Some(curr);
+    }
+
+    // Single-iteration case (cap == 1): ran once, no prior to
+    // compare against — done.
+    Ok(())
+}
+
+/// The §4 verbatim non-convergence diagnostic (V40D-11). Factored
+/// out so the in-process fixed-point and the `surface-cycle` leaf
+/// raise a byte-identical message (verification item 7).
+#[must_use]
+pub fn non_convergence_error(cap: usize, wobbling: &[&str]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "circular `[[cust::pub_repr]]` dependency did not converge\n  \
+         in {cap} iterations between modules: {}\n  \
+         hint: break the cycle by exporting one side as `[[cust::pub]]`\n        \
+         (opaque) instead of `[[cust::pub_repr]]`",
+        wobbling.join(", ")
+    )
+}
+
 /// Concatenate the per-module fragment headers `frags` (each an
 /// `(qualified_name, fragment_path)` pair, **already in topological
 /// order**) into the single published crate header at `out_path`

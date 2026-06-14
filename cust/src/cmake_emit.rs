@@ -187,6 +187,13 @@ pub struct MemberView {
     /// Empty for bin-only members and for unit-test fixtures that
     /// don't exercise the surface path.
     pub surface_commands: Vec<SurfaceCommand>,
+    /// v0.4.5 V45D-6: one `cust internal surface-cycle` command per
+    /// `[[cust::pub_repr]]` import cycle (an SCC of size > 1). Each
+    /// surfaces every module in the cycle together via the
+    /// fixed-point loop. Empty for the common acyclic case (every
+    /// cust crate today) — then every lib module is a singleton SCC
+    /// with its own fine-grained `surface_commands` entry instead.
+    pub surface_cycles: Vec<SurfaceCycleCommand>,
     /// v0.4.5 V45D-5: the `cust internal crate-header` custom
     /// command that concatenates this member's fragments into its
     /// published `<crate>.h`. `Some` for every lib-bearing member,
@@ -266,6 +273,51 @@ pub struct SurfaceCommand {
     /// producing path, **not** the `deps/<dep>/…` symlink, so Ninja
     /// connects the upstream crate-header command (V45D-14).
     pub dep_headers: Vec<PathBuf>,
+}
+
+/// v0.4.5 V45D-6: one `cust internal surface-cycle` invocation for
+/// a `[[cust::pub_repr]]` import cycle (an SCC of size > 1). A
+/// `DEPENDS` cycle is a hard `CMake` error, so the cycle cannot be a
+/// fine-grained per-module DAG; instead a **single** custom command
+/// surfaces every module in the cycle together (the leaf runs the
+/// fixed-point loop over just these modules). The emitter lowers it
+/// to one `add_custom_command` whose `OUTPUT` is *all* the cycle's
+/// fragments.
+#[derive(Debug, Clone)]
+pub struct SurfaceCycleCommand {
+    /// `--crate-name` (diagnostics only).
+    pub crate_name: String,
+    /// `(qname, source)` per cycle member, sorted by qname
+    /// (V45D-15). Emitted as paired `--module <q> --source <src>`.
+    pub modules: Vec<(String, PathBuf)>,
+    /// The command's `OUTPUT`: every cycle member's fragment,
+    /// sorted (parallels `modules`, derived by the leaf from
+    /// `--frags-dir`).
+    pub fragment_outs: Vec<PathBuf>,
+    /// `--frags-dir`: `.h-fragments/<crate>/` — fragment outputs
+    /// and the sibling-existence probe both key off it.
+    pub frags_dir: PathBuf,
+    /// `--scratch-dir`: where each module's `<q>.surface.c` is
+    /// written (`build/<crate>/`).
+    pub scratch_dir: PathBuf,
+    /// `--deps-root`: `deps/`.
+    pub deps_root: PathBuf,
+    /// `--dep <d>` per declared dependency (sorted, V45D-15).
+    pub deps: Vec<String>,
+    /// `--std <value>`.
+    pub std: String,
+    /// `--cflag <f>`: mid cflags (profile + `[clang] extra-cflags`).
+    pub cflags: Vec<String>,
+    /// `--prelude`.
+    pub prelude: PathBuf,
+    /// `--plugin` (also a `DEPENDS`). `None` only in plugin-less
+    /// test environments.
+    pub plugin: Option<PathBuf>,
+    /// `DEPENDS`: fragments the cycle imports from **outside** the
+    /// SCC + cross-crate dep headers, sorted (V45D-15). Intra-cycle
+    /// imports are deliberately excluded — they are *produced* by
+    /// this command, so depending on them would be a self-cycle.
+    pub external_deps: Vec<PathBuf>,
 }
 
 /// v0.4.5 V45D-5: one `cust internal crate-header` invocation.
@@ -449,6 +501,7 @@ pub fn generate(view: &WorkspaceView) -> String {
     for m in &view.members {
         emit_rewrite_commands(&mut out, &view.cust_exe, m);
         emit_surface_commands(&mut out, &view.cust_exe, m);
+        emit_surface_cycle_commands(&mut out, &view.cust_exe, m);
         if m.kind.has_lib() {
             emit_library(&mut out, m);
         }
@@ -585,6 +638,86 @@ fn emit_surface_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
         }
         for hdr in &sc.dep_headers {
             let _ = writeln!(out, "            \"{}\"", hdr.display());
+        }
+        out.push_str("    VERBATIM)\n");
+    }
+}
+
+/// v0.4.5 V45D-6: emit one `add_custom_command` per cyclic SCC.
+/// The single command's `OUTPUT` is *every* fragment in the cycle;
+/// the leaf runs the fixed-point loop over just these modules. Its
+/// `DEPENDS` are the cycle members' sources + the plugin `.so` +
+/// fragments imported from *outside* the SCC + cross-crate dep
+/// headers — intra-cycle imports are excluded (the command produces
+/// them, so depending on them would be a self-cycle). Dormant for
+/// acyclic crates (no cust crate has a cycle today).
+fn emit_surface_cycle_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    if m.surface_cycles.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# ---- crate: {} (surface fragment cycles) ----",
+        m.name
+    );
+    for cy in &m.surface_cycles {
+        out.push_str("add_custom_command(\n");
+        out.push_str("    OUTPUT");
+        for frag in &cy.fragment_outs {
+            let _ = write!(out, " \"{}\"", frag.display());
+        }
+        out.push('\n');
+        let _ = writeln!(
+            out,
+            "    COMMAND \"{}\" internal surface-cycle",
+            cust_exe.display()
+        );
+        let _ = writeln!(out, "            --crate-name {}", cy.crate_name);
+        for (qname, source) in &cy.modules {
+            let _ = writeln!(
+                out,
+                "            --module {qname} --source \"{}\"",
+                source.display()
+            );
+        }
+        let _ = writeln!(
+            out,
+            "            --frags-dir \"{}\"",
+            cy.frags_dir.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --scratch-dir \"{}\"",
+            cy.scratch_dir.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --deps-root \"{}\"",
+            cy.deps_root.display()
+        );
+        let _ = writeln!(out, "            --std {}", cy.std);
+        for cflag in &cy.cflags {
+            let _ = writeln!(out, "            --cflag \"{cflag}\"");
+        }
+        for dep in &cy.deps {
+            let _ = writeln!(out, "            --dep {dep}");
+        }
+        let _ = writeln!(out, "            --prelude \"{}\"", cy.prelude.display());
+        if let Some(plugin) = &cy.plugin {
+            let _ = writeln!(out, "            --plugin \"{}\"", plugin.display());
+        }
+        // DEPENDS: every cycle member's source first…
+        out.push_str("    DEPENDS");
+        for (_, source) in &cy.modules {
+            let _ = write!(out, " \"{}\"", source.display());
+        }
+        out.push('\n');
+        if let Some(plugin) = &cy.plugin {
+            let _ = writeln!(out, "            \"{}\"", plugin.display());
+        }
+        for dep in &cy.external_deps {
+            let _ = writeln!(out, "            \"{}\"", dep.display());
         }
         out.push_str("    VERBATIM)\n");
     }
@@ -1172,6 +1305,7 @@ struct LibArtifacts {
     sources: Vec<SourceFile>,
     rewrites: Vec<RewriteCommand>,
     surface_commands: Vec<SurfaceCommand>,
+    surface_cycles: Vec<SurfaceCycleCommand>,
     crate_header: Option<CrateHeaderCommand>,
 }
 
@@ -1191,6 +1325,7 @@ fn collect_lib_artifacts(
             sources: Vec::new(),
             rewrites: Vec::new(),
             surface_commands: Vec::new(),
+            surface_cycles: Vec::new(),
             crate_header: None,
         });
     };
@@ -1215,6 +1350,7 @@ fn collect_lib_artifacts(
         sources: c.sources,
         rewrites: c.rewrites,
         surface_commands: c.surface_commands,
+        surface_cycles: c.surface_cycles,
         crate_header: Some(header),
     })
 }
@@ -1307,6 +1443,7 @@ pub fn collect_view(
         let lib_sources = lib.sources;
         let mut rewrites = lib.rewrites;
         let surface_commands = lib.surface_commands;
+        let surface_cycles = lib.surface_cycles;
         let crate_header = lib.crate_header;
         // v0.4.4 V44D-5/V44D-8: one `BinView` per `BinTarget`.
         let (bins, bin_rewrites) = collect_bin_views(m, kind, &rewrite_root, &layout, &gen_ctx)?;
@@ -1385,6 +1522,7 @@ pub fn collect_view(
             integration_tests,
             rewrites,
             surface_commands,
+            surface_cycles,
             crate_header,
         });
     }
@@ -1559,13 +1697,16 @@ const fn map_kind(k: &CrateKind) -> MemberKind {
 }
 
 /// Output of [`collect_sources`] for one entry source (lib half or
-/// one bin). `surface_commands` and `header_frags` are populated
-/// only for the lib half (`is_lib_half = true`); they are empty
-/// for bins.
+/// one bin). `surface_commands` / `surface_cycles` / `header_frags`
+/// are populated only for the lib half (`is_lib_half = true`); they
+/// are empty for bins.
 struct CollectedSources {
     sources: Vec<SourceFile>,
     rewrites: Vec<RewriteCommand>,
     surface_commands: Vec<SurfaceCommand>,
+    /// v0.4.5 V45D-6: one entry per `[[cust::pub_repr]]` import
+    /// cycle (SCC of size > 1). Empty for the acyclic common case.
+    surface_cycles: Vec<SurfaceCycleCommand>,
     /// Topo-ordered fragment paths for the member's `crate-header`
     /// command (V45D-5). Empty for bins.
     header_frags: Vec<PathBuf>,
@@ -1650,7 +1791,6 @@ fn collect_sources(
         .with_context(|| format!("discovering module graph for `{crate_name}`"))?;
     let mut out: Vec<SourceFile> = Vec::with_capacity(modules.len());
     let mut rewrites: Vec<RewriteCommand> = Vec::with_capacity(modules.len());
-    let mut surface_commands: Vec<SurfaceCommand> = Vec::new();
     for m in &modules {
         // Post-rewrite path: target/<profile>/.rewrite/<crate>/<rel>.
         // <rel> is the source's path relative to the crate root,
@@ -1700,17 +1840,42 @@ fn collect_sources(
             has_lib: rw_ctx.has_lib,
         });
 
-        // V45D-4: one surface command per **lib** module (bins are
-        // never surface-passed — nothing downstream consumes a
-        // bin's surface).
-        if is_lib_half {
-            surface_commands.push(surface_command_for(m, crate_name, layout, rw_ctx));
-        }
+        // V45D-4/V45D-6: surface commands are emitted per SCC
+        // *after* this loop (a cyclic SCC becomes one coarse
+        // command), not per source here.
 
         out.push(SourceFile {
             path: rewrite_path,
             object_depends,
         });
+    }
+
+    // V45D-4/V45D-6: surface generation, grouped by strongly-
+    // connected component of the intra-crate import graph (lib half
+    // only — bins are never surface-passed). A singleton SCC is an
+    // acyclic module → one fine-grained `surface-module` command; an
+    // SCC of size > 1 is a `[[cust::pub_repr]]` cycle → one coarse
+    // `surface-cycle` command covering all its modules. For an
+    // all-acyclic crate `module_sccs` returns singletons in
+    // discovery order, so the fine-grained command order is
+    // unchanged from V45D-4.
+    let mut surface_commands: Vec<SurfaceCommand> = Vec::new();
+    let mut surface_cycles: Vec<SurfaceCycleCommand> = Vec::new();
+    if is_lib_half {
+        for scc in crate::build::module_sccs(&modules) {
+            if scc.len() == 1 {
+                surface_commands.push(surface_command_for(
+                    &modules[scc[0]],
+                    crate_name,
+                    layout,
+                    rw_ctx,
+                ));
+            } else {
+                surface_cycles.push(surface_cycle_for(
+                    &modules, &scc, crate_name, layout, rw_ctx,
+                ));
+            }
+        }
     }
 
     // V45D-5: the crate-header command's `--frag` list, in
@@ -1730,6 +1895,7 @@ fn collect_sources(
         sources: out,
         rewrites,
         surface_commands,
+        surface_cycles,
         header_frags,
     })
 }
@@ -1798,6 +1964,74 @@ fn surface_command_for(
         plugin: rw_ctx.plugin.clone(),
         import_fragments,
         dep_headers,
+    }
+}
+
+/// v0.4.5 V45D-6: build the single `SurfaceCycleCommand` for one
+/// cyclic SCC. `scc` holds the indices (into `modules`) of every
+/// member of the cycle. The command's `OUTPUT` is all their
+/// fragments; `external_deps` are the fragments the cycle imports
+/// from *outside* the SCC plus cross-crate dep headers (intra-cycle
+/// imports are excluded — the command produces them). All repeated
+/// lists are sorted for byte-stable output (V45D-15).
+fn surface_cycle_for(
+    modules: &[modules::Module],
+    scc: &[usize],
+    crate_name: &str,
+    layout: &TargetLayout,
+    rw_ctx: &MemberGenCtx,
+) -> SurfaceCycleCommand {
+    use std::collections::BTreeSet;
+
+    // Set of qnames in this SCC, for the intra-cycle membership test.
+    let in_cycle: BTreeSet<&str> = scc
+        .iter()
+        .map(|&i| modules[i].qualified_name.as_str())
+        .collect();
+
+    // Cycle members, sorted by qualified name (V45D-15).
+    let mut members: Vec<&modules::Module> = scc.iter().map(|&i| &modules[i]).collect();
+    members.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+
+    let module_pairs: Vec<(String, PathBuf)> = members
+        .iter()
+        .map(|m| (m.qualified_name.clone(), m.source_path.clone()))
+        .collect();
+    let mut fragment_outs: Vec<PathBuf> = members
+        .iter()
+        .map(|m| layout.fragment_path(crate_name, &m.qualified_name))
+        .collect();
+    fragment_outs.sort();
+
+    // External `DEPENDS`: imports that point outside the SCC, plus
+    // valid cross-crate dep headers. Intra-cycle imports excluded.
+    let mut external: BTreeSet<PathBuf> = BTreeSet::new();
+    for m in &members {
+        for importee in &m.imports {
+            if !in_cycle.contains(importee.as_str()) {
+                external.insert(layout.fragment_path(crate_name, importee));
+            }
+        }
+        for dep in &m.dep_imports {
+            if dep_edge_is_valid(dep, crate_name, rw_ctx, false) {
+                external.insert(layout.crate_header_path(dep));
+            }
+        }
+    }
+
+    SurfaceCycleCommand {
+        crate_name: crate_name.to_string(),
+        modules: module_pairs,
+        fragment_outs,
+        frags_dir: rw_ctx.frags_dir.clone(),
+        scratch_dir: layout.build_dir(crate_name),
+        deps_root: rw_ctx.deps_root.clone(),
+        deps: rw_ctx.deps.clone(),
+        std: rw_ctx.std.clone(),
+        cflags: rw_ctx.mid_cflags.clone(),
+        prelude: rw_ctx.prelude.clone(),
+        plugin: rw_ctx.plugin.clone(),
+        external_deps: external.into_iter().collect(),
     }
 }
 
