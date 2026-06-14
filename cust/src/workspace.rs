@@ -783,12 +783,10 @@ fn run_check_path(
             per_member.push((
                 name.clone(),
                 BuildOutputs {
-                    objects: Vec::new(),
                     archive: None,
                     executables: Vec::new(),
                     test_executable: None,
                     integration_tests: Vec::new(),
-                    compile_commands: layout.target_root.join("compile_commands.json"),
                 },
             ));
         }
@@ -892,12 +890,19 @@ fn run_test_build_path(
             // Only report `per_member` for members the caller
             // asked about — siblings outside `-p` scope are
             // built but stay silent (matches `cust build`
-            // shape).
+            // shape). `cust test` reads only the test halves
+            // (`test_executable` / `integration_tests`), so the
+            // build-mode `archive` / `executables` stay empty here.
             if to_build.iter().any(|n| n == name) {
-                let mut outputs = build::cmake_outputs_for(plan, layout);
-                outputs.test_executable = test_exe;
-                outputs.integration_tests = itests;
-                per_member.push((name.clone(), outputs));
+                per_member.push((
+                    name.clone(),
+                    BuildOutputs {
+                        archive: None,
+                        executables: Vec::new(),
+                        test_executable: test_exe,
+                        integration_tests: itests,
+                    },
+                ));
             }
             Ok(())
         })?;

@@ -196,6 +196,175 @@ fn resolve_child(search_dir: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
     }
 }
 
+/// Order `modules` so any module appears after every module it
+/// `#cust use crate::<…>;`-imports. Stable: ties (modules with
+/// the same in-degree) preserve discovery order, so the existing
+/// DFS-preorder behaviour is preserved for any crate that
+/// doesn't have intra-crate type dependencies.
+///
+/// Kahn's algorithm. `imports` lists *predecessors* (this module
+/// uses them); we count in-degrees as "how many modules I depend
+/// on", then repeatedly emit zero-in-degree modules in discovery
+/// order. Modules whose imports name non-existent siblings (which
+/// shouldn't happen — `discover` validates this — but we guard
+/// against it for defence in depth) are treated as if the missing
+/// edge weren't there.
+pub fn topo_order_modules(modules: &[Module]) -> Vec<&Module> {
+    use std::collections::{BTreeSet, VecDeque};
+
+    // Name → discovery index.
+    let name_to_idx: std::collections::BTreeMap<&str, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.qualified_name.as_str(), i))
+        .collect();
+
+    // In-degree per module (count of imports that resolve to a
+    // sibling in this same crate). Outbound edges from i: for
+    // each name in modules[i].imports, edge name → i.
+    let mut in_deg: Vec<usize> = vec![0; modules.len()];
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); modules.len()];
+    for (i, m) in modules.iter().enumerate() {
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        for imp in &m.imports {
+            if let Some(&j) = name_to_idx.get(imp.as_str()) {
+                if seen.insert(j) {
+                    successors[j].push(i);
+                    in_deg[i] += 1;
+                }
+            }
+        }
+    }
+
+    // Initial queue: every module with zero in-degree, in
+    // discovery order — keeps ties stable.
+    let mut queue: VecDeque<usize> = (0..modules.len()).filter(|&i| in_deg[i] == 0).collect();
+    let mut out: Vec<&Module> = Vec::with_capacity(modules.len());
+
+    while let Some(i) = queue.pop_front() {
+        out.push(&modules[i]);
+        for &succ in &successors[i] {
+            in_deg[succ] -= 1;
+            if in_deg[succ] == 0 {
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    // Cycle defence: if we couldn't drain the whole graph fall
+    // back to discovery order for the leftover. `discover` already
+    // rejects #cust mod cycles, and intra-crate fragment includes
+    // are forward-decl-only, so this branch shouldn't be reachable
+    // in practice.
+    if out.len() != modules.len() {
+        for (i, m) in modules.iter().enumerate() {
+            if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
+                let _ = i;
+                out.push(m);
+            }
+        }
+    }
+
+    out
+}
+
+/// v0.4.5 V45D-6: strongly-connected components of the intra-crate
+/// `#cust use crate::<m>;` import graph, by Tarjan's algorithm.
+/// Returns one `Vec<usize>` of module indices per SCC. A singleton
+/// SCC is an acyclic module (the common case → fine-grained
+/// `surface-module` command); an SCC of size > 1 is a
+/// `[[cust::pub_repr]]` import cycle that must be surfaced as one
+/// coarse `surface-cycle` command (a `DEPENDS` cycle is a hard
+/// `CMake` error, so the cycle cannot be a fine-grained DAG).
+///
+/// Within each returned SCC the indices are sorted ascending, and
+/// the SCC list is sorted by each SCC's smallest member index, so
+/// the output is deterministic (V45D-15) and — for an all-acyclic
+/// crate — preserves discovery order (each singleton `[i]`).
+#[must_use]
+pub fn module_sccs(modules: &[Module]) -> Vec<Vec<usize>> {
+    // Iterative Tarjan over the import graph (avoids deep recursion
+    // on large module sets).
+    const UNVISITED: i64 = -1;
+    let n = modules.len();
+    let name_to_idx: std::collections::BTreeMap<&str, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.qualified_name.as_str(), i))
+        .collect();
+    // Adjacency: edge i -> j when module i `#cust use crate::j`.
+    let adj: Vec<Vec<usize>> = modules
+        .iter()
+        .map(|m| {
+            let mut succ: Vec<usize> = m
+                .imports
+                .iter()
+                .filter_map(|imp| name_to_idx.get(imp.as_str()).copied())
+                .collect();
+            succ.sort_unstable();
+            succ.dedup();
+            succ
+        })
+        .collect();
+
+    let mut index: Vec<i64> = vec![UNVISITED; n];
+    let mut lowlink: Vec<i64> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next_index: i64 = 0;
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    // Explicit DFS stack of (node, next-successor-cursor).
+    for start in 0..n {
+        if index[start] != UNVISITED {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&(v, ci)) = work.last() {
+            if ci == 0 {
+                index[v] = next_index;
+                lowlink[v] = next_index;
+                next_index += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if ci < adj[v].len() {
+                // Advance this frame's cursor and recurse / relax.
+                work.last_mut().unwrap().1 += 1;
+                let w = adj[v][ci];
+                if index[w] == UNVISITED {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(index[w]);
+                }
+            } else {
+                // Done with v: if it's an SCC root, pop the SCC.
+                if lowlink[v] == index[v] {
+                    let mut comp: Vec<usize> = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on_stack[w] = false;
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    comp.sort_unstable();
+                    sccs.push(comp);
+                }
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    lowlink[parent] = lowlink[parent].min(lowlink[v]);
+                }
+            }
+        }
+    }
+
+    // Deterministic order: by smallest member index.
+    sccs.sort_by_key(|c| c[0]);
+    sccs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +505,104 @@ mod tests {
 
         let e = format!("{:#}", discover(crate_root, &root).unwrap_err());
         assert!(e.contains("module cycle"), "{e}");
+    }
+
+    // ─── graph algorithms (topo_order_modules / module_sccs) ────
+
+    fn mk_mod(name: &str, imports: &[&str]) -> Module {
+        Module {
+            qualified_name: name.to_string(),
+            source_path: std::path::PathBuf::from(format!("/x/{name}.c")),
+            imports: imports.iter().map(|s| (*s).to_string()).collect(),
+            dep_imports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn topo_order_modules_preserves_discovery_order_with_no_edges() {
+        // No intra-crate imports → discovery order preserved.
+        let mods = vec![mk_mod("lib", &[]), mk_mod("a", &[]), mk_mod("b", &[])];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["lib", "a", "b"]);
+    }
+
+    #[test]
+    fn topo_order_modules_pulls_imported_module_to_front() {
+        // lib uses types; types must appear before lib in the
+        // concatenated header.
+        let mods = vec![
+            mk_mod("lib", &["types"]),
+            mk_mod("types", &[]),
+            mk_mod("math", &["types"]),
+        ];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["types", "lib", "math"]);
+    }
+
+    #[test]
+    fn topo_order_modules_keeps_ties_in_discovery_order() {
+        // Two roots-of-the-DAG: order between them follows
+        // discovery order.
+        let mods = vec![mk_mod("a", &[]), mk_mod("b", &[]), mk_mod("c", &["a", "b"])];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn topo_order_modules_ignores_unresolved_imports() {
+        // An import naming a non-sibling (shouldn't happen — discovery
+        // rejects this — but the orderer must be robust).
+        let mods = vec![mk_mod("lib", &["ghost"]), mk_mod("real", &[])];
+        let out: Vec<&str> = topo_order_modules(&mods)
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(out, ["lib", "real"]);
+    }
+
+    #[test]
+    fn module_sccs_all_singletons_in_discovery_order() {
+        // Acyclic graph: every module is its own SCC; the SCC list
+        // is in discovery (index) order so the fine-grained surface
+        // command order is unchanged from V45D-4.
+        let mods = vec![
+            mk_mod("lib", &["types"]),
+            mk_mod("types", &[]),
+            mk_mod("math", &["types"]),
+        ];
+        let sccs = module_sccs(&mods);
+        assert_eq!(sccs, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn module_sccs_detects_two_cycle() {
+        // `a` and `b` import each other → one SCC of size 2; `lib`
+        // is a singleton. The cycle members are sorted ascending
+        // within the SCC, and the SCC list is sorted by smallest
+        // member index.
+        let mods = vec![mk_mod("lib", &[]), mk_mod("a", &["b"]), mk_mod("b", &["a"])];
+        let sccs = module_sccs(&mods);
+        assert_eq!(sccs, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn module_sccs_detects_three_cycle() {
+        // a -> b -> c -> a is one SCC of all three.
+        let mods = vec![
+            mk_mod("a", &["b"]),
+            mk_mod("b", &["c"]),
+            mk_mod("c", &["a"]),
+        ];
+        let sccs = module_sccs(&mods);
+        assert_eq!(sccs, vec![vec![0, 1, 2]]);
     }
 }

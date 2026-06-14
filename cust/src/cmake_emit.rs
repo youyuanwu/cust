@@ -2567,7 +2567,7 @@ fn collect_sources(
     let mut surface_commands: Vec<SurfaceCommand> = Vec::new();
     let mut surface_cycles: Vec<SurfaceCycleCommand> = Vec::new();
     if is_lib_half {
-        for scc in crate::build::module_sccs(&modules) {
+        for scc in crate::modules::module_sccs(&modules) {
             if scc.len() == 1 {
                 surface_commands.push(surface_command_for(
                     &modules[scc[0]],
@@ -2596,10 +2596,10 @@ fn collect_sources(
 
     // V45D-5: the crate-header command's `--frag` list, in
     // topological order over the intra-crate import edges (same
-    // order `build::write_crate_header` concatenates). Lib half
-    // only.
+    // order `generate::write_crate_header_concat` concatenates).
+    // Lib half only.
     let header_frags = if is_lib_half {
-        crate::build::topo_order_modules(&modules)
+        crate::modules::topo_order_modules(&modules)
             .iter()
             .map(|m| layout.fragment_path(crate_name, &m.qualified_name))
             .collect()
