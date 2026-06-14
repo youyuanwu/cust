@@ -211,6 +211,7 @@ fn cwork_view() -> WorkspaceView {
                 test_runner: None,
                 integration_test_sidecars: vec![],
                 integration_test_runners: vec![],
+                check_commands: vec![],
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -256,6 +257,7 @@ fn cwork_view() -> WorkspaceView {
                 test_runner: None,
                 integration_test_sidecars: vec![],
                 integration_test_runners: vec![],
+                check_commands: vec![],
             },
         ],
     }
@@ -405,6 +407,7 @@ fn lib_and_bin_member_emits_both_targets() {
             test_runner: None,
             integration_test_sidecars: vec![],
             integration_test_runners: vec![],
+            check_commands: vec![],
         }],
     };
     let out = generate(&view);
@@ -504,6 +507,7 @@ fn unit_test_sidecar_and_runner_commands_emitted() {
             }),
             integration_test_sidecars: vec![],
             integration_test_runners: vec![],
+            check_commands: vec![],
         }],
     };
     let out = generate(&view);
@@ -629,6 +633,7 @@ fn integration_test_sidecar_runner_and_rewrite_commands_emitted() {
                     "/ws/target/debug/.test-discovery/app/tests/basic.cust.tests",
                 )],
             }],
+            check_commands: vec![],
         }],
     };
     let out = generate(&view);
@@ -840,4 +845,181 @@ fn parse_ninja_version_line() {
 fn parse_version_rejects_garbage() {
     assert!(parse_version("hello world").is_err());
     assert!(parse_version("").is_err());
+}
+
+// ─── incremental-check: check-command argv (CHK-D-2/CHK-D-3) ────
+
+/// A `MemberGenCtx` shaped like a cwork lib member, for the
+/// check-argv unit tests. `plugin` is the only knob the tests vary
+/// (CHK-D-10).
+fn check_gen_ctx(plugin: Option<PathBuf>) -> MemberGenCtx {
+    MemberGenCtx {
+        frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/cstd"),
+        deps_root: PathBuf::from("/ws/target/debug/deps"),
+        own_lib_header: PathBuf::from("/ws/target/debug/build/cstd/include/cstd.h"),
+        deps: vec![],
+        has_lib: true,
+        std: "c23".to_string(),
+        mid_cflags: vec!["-O0".to_string(), "-g".to_string()],
+        prelude: PathBuf::from("/ws/target/debug/prelude.h"),
+        plugin,
+    }
+}
+
+#[test]
+fn check_argv_bakes_explicit_std_and_syntax_only() {
+    let plugin = PathBuf::from("/ws/target/debug/libcust_plugin.so");
+    let rewrite_tu = PathBuf::from("/ws/target/debug/.rewrite/cstd/src/lib.c");
+    let ctx = check_gen_ctx(Some(plugin.clone()));
+    let argv = build_check_argv(&ctx, &plugin, &rewrite_tu);
+
+    // CHK-D-2 regression guard: explicit -std prepended (a custom
+    // command does NOT inherit CMAKE_C_STANDARD).
+    assert_eq!(argv.first().unwrap(), "-std=c23", "explicit -std prepended");
+
+    // CHK-D-1: -fsyntax-only check of the .rewrite TU, which is the
+    // final argv token.
+    assert_eq!(
+        argv.last().unwrap(),
+        &rewrite_tu.display().to_string(),
+        "the .rewrite TU is the last argv token"
+    );
+    let syntax_idx = argv.iter().position(|a| a == "-fsyntax-only").unwrap();
+    assert_eq!(
+        syntax_idx,
+        argv.len() - 2,
+        "-fsyntax-only immediately precedes the source"
+    );
+
+    // Bare -fplugin (no SHELL: wrapper — add_custom_command splits
+    // its own argv).
+    assert!(
+        argv.iter()
+            .any(|a| a == &format!("-fplugin={}", plugin.display())),
+        "bare -fplugin present"
+    );
+    assert!(
+        !argv.iter().any(|a| a.starts_with("SHELL:")),
+        "no SHELL: wrapper in a custom-command argv"
+    );
+
+    // -Wno-unknown-attributes present — mirrors the build
+    // (build_member_compile_options emits it unconditionally, CHK-D-3).
+    assert!(
+        argv.iter().any(|a| a == "-Wno-unknown-attributes"),
+        "-Wno-unknown-attributes mirrors the lib compile"
+    );
+
+    // No codegen, no fragment-out, no tolerance flags (CHK-D-1/CHK-D-5).
+    assert!(
+        !argv.iter().any(|a| a.contains("fragment-out")),
+        "no -fplugin-arg-cust-fragment-out"
+    );
+    assert!(!argv.iter().any(|a| a == "-Wno-error"), "no -Wno-error");
+    assert!(
+        !argv.iter().any(|a| a == "-c" || a == "-o"),
+        "no codegen -c / -o"
+    );
+
+    // Prelude force-included.
+    let inc = argv.iter().position(|a| a == "-include").unwrap();
+    assert_eq!(
+        argv[inc + 1],
+        ctx.prelude.display().to_string(),
+        "prelude is force-included"
+    );
+}
+
+#[test]
+fn check_argv_mirrors_lib_compile_options_no_drift() {
+    // Drift guard (CHK-D-2): the check argv's middle equals the lib
+    // target's compile_options verbatim, modulo the -std prefix, the
+    // SHELL: wrapper on -fplugin, and the -fsyntax-only + source
+    // suffix. Reuses the real build_member_compile_options so the
+    // two flag paths cannot silently diverge.
+    let profile =
+        crate::profile::ResolvedProfile::resolve(crate::profile::ProfileKind::Dev, None).unwrap();
+    let manifest: crate::manifest::Manifest = toml::from_str("").unwrap();
+    let prelude = PathBuf::from("/ws/target/debug/prelude.h");
+    let plugin_path = PathBuf::from("/ws/target/debug/libcust_plugin.so");
+    let plugin = crate::plugin::Plugin {
+        path: plugin_path.clone(),
+    };
+
+    let opts = build_member_compile_options(&profile, &manifest, &prelude, Some(&plugin));
+
+    let mut mid_cflags = profile.cflags();
+    mid_cflags.extend(manifest.clang.extra_cflags.iter().cloned());
+    let ctx = MemberGenCtx {
+        frags_dir: PathBuf::from("/x"),
+        deps_root: PathBuf::from("/x"),
+        own_lib_header: PathBuf::from("/x"),
+        deps: vec![],
+        has_lib: true,
+        std: "c23".to_string(),
+        mid_cflags,
+        prelude,
+        plugin: Some(plugin_path.clone()),
+    };
+    let rewrite_tu = PathBuf::from("/ws/target/debug/.rewrite/cstd/src/lib.c");
+    let argv = build_check_argv(&ctx, &plugin_path, &rewrite_tu);
+
+    // Recover compile_options from the check argv: drop -std (front)
+    // + -fsyntax-only + source (back), and re-wrap -fplugin in SHELL:.
+    let middle: Vec<String> = argv[1..argv.len() - 2]
+        .iter()
+        .map(|a| {
+            a.strip_prefix("-fplugin=")
+                .map_or_else(|| a.clone(), |rest| format!("SHELL:-fplugin={rest}"))
+        })
+        .collect();
+    assert_eq!(
+        middle, opts,
+        "check argv must mirror the lib target compile_options (no drift)"
+    );
+}
+
+#[test]
+fn check_command_omitted_without_plugin() {
+    // CHK-D-10 emitter-layer rule: a plugin-less view yields NO
+    // check command for the module (never a plugin-less
+    // -fsyntax-only), while a plugin-bearing view yields one whose
+    // OUTPUT is the module's .checked stamp.
+    let layout = TargetLayout::for_workspace(std::path::Path::new("/ws"), ProfileKind::Dev);
+    let rewrite_tu = PathBuf::from("/ws/target/debug/.rewrite/cstd/src/lib.c");
+    let frag_depends = vec![PathBuf::from(
+        "/ws/target/debug/.h-fragments/cstd/mem.cust.h",
+    )];
+
+    let none = check_command_for(
+        &check_gen_ctx(None),
+        &layout,
+        "cstd",
+        "cstd__lib",
+        &rewrite_tu,
+        &frag_depends,
+    );
+    assert!(none.is_none(), "no plugin ⇒ no check command (CHK-D-10)");
+
+    let plugin = PathBuf::from("/ws/target/debug/libcust_plugin.so");
+    let some = check_command_for(
+        &check_gen_ctx(Some(plugin.clone())),
+        &layout,
+        "cstd",
+        "cstd__lib",
+        &rewrite_tu,
+        &frag_depends,
+    )
+    .expect("plugin present ⇒ a check command");
+    assert_eq!(
+        some.stamp_out,
+        layout.check_stamp_path("cstd", "cstd__lib"),
+        "OUTPUT is the per-module .checked stamp"
+    );
+    assert_eq!(some.rewrite_tu, rewrite_tu, "DEPENDS the .rewrite TU");
+    assert_eq!(some.plugin, plugin, "DEPENDS the plugin");
+    assert_eq!(
+        some.frag_depends, frag_depends,
+        "DEPENDS the build-mode fragments + dep headers (CHK-D-5)"
+    );
 }

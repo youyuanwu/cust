@@ -282,16 +282,34 @@ call inside `add_custom_command` inherits **none** of these — not
 escape. A naive "reuse the target's `compile_options` +
 `-fsyntax-only`" would therefore compile under clang's **default**
 C standard instead of C23, which both masks real diagnostics and
-invents fake ones — directly defeating CHK-D-1. The check command
-must instead bake a **complete standalone argv** in the shape
-[`build::build_cflags_raw`](../../cust/src/build.rs#L405) already
-produces driver-side (explicit `-std=<std>`, profile + extra
-cflags, `-fvisibility=hidden`, `-include <prelude>`, bare
-`-fplugin=<abs>` with no `SHELL:` prefix, **no** fragment-out),
-minus the trailing `-c -o <obj> <src>`, plus `-fsyntax-only`. The
-emitter has no standalone-argv builder today (that logic lives in
-`build_cflags_raw`); slice A ports/shares it (CHK-D-2 work is
-*more* than "reuse what's baked").
+invents fake ones — directly defeating CHK-D-1.
+
+The correct mirror is the lib target's own
+[`compile_options`](../../cust/src/cmake_emit.rs#L2081) (built by
+`build_member_compile_options`, **already in `cmake_emit`** — the
+emitter does *not* need to port `build::build_cflags_raw`). The
+check argv is that exact list, with three deltas: (a) **prepend an
+explicit `-std=<std>`** — the one flag a custom command does *not*
+inherit; (b) **strip the `SHELL:` wrapper** off `-fplugin=<abs>`
+(`add_custom_command` does its own argv splitting, so the escape
+is unwanted); (c) **append `-fsyntax-only` + the `.rewrite`
+source** in place of the target's implicit `-c -o <obj>`. Every
+other token — profile cflags, `-fvisibility=hidden`, `-include
+<prelude>`, **and `-Wno-unknown-attributes`** — carries through
+*verbatim*, because the goal (CHK-D-1) is to validate the bytes
+the build compiles under the flags the build uses. Reusing
+`compile_options` rather than re-deriving an argv makes the two
+**incapable of drifting**: there is no second flag-assembly path.
+
+**Plugin is required for the check command, not optional.** The
+§0 removal made the plugin mandatory at the *driver* layer, but
+the *emitter* still types `plugin_path` as `Option` (test views
+lack a real `.so`). The check command bakes `-fplugin` exactly
+like the lib compile, so the `CheckCommand` builder must treat a
+`None` plugin as "emit no check command for this module" — never
+a pluginless `-fsyntax-only`, which would be the very false green
+§0 deleted, smuggled back into the check path. CHK-D-10 states the
+rule and the slice-A test that pins it.
 
 The baked clang argv carries the **full** `build_cflags` set for
 the V45D-15 reason (a check that omits a user `-D` could see a
@@ -331,6 +349,20 @@ carries no `SHELL:` prefix (`add_custom_command` does its own argv
 splitting), and there is **no** `-fplugin-arg-cust-fragment-out`
 (CHK-D-5) and **no** `-Wno-error` /
 `-Wno-implicit-function-declaration` (CHK-D-1).
+
+**`-Wno-unknown-attributes` *is* present — it mirrors the build.**
+[`build_member_compile_options`](../../cust/src/cmake_emit.rs#L2081)
+emits `-Wno-unknown-attributes` **unconditionally** (even with the
+plugin loaded — a V42D-5 defensive default), so the real lib
+target compile carries it. Since the check argv is that compile's
+`compile_options` verbatim (CHK-D-2), it carries it too. Keeping
+it is the *correct* choice: dropping it would make check stricter
+than the build (surfacing unknown-attribute warnings the build
+suppresses), forking the "check passes ⇔ build passes" contract.
+This is the lib *target*'s flag builder, distinct from the
+driver-side [`build::build_cflags_raw`](../../cust/src/build.rs#L437)
+(which gates the same flag behind its plugin-less `else` branch) —
+the check mirrors the target, not the driver path.
 
 Two `COMMAND`s, ordered: the clang check, then the stamp `touch`.
 Ninja runs the second only if the first **succeeds** — a non-zero
@@ -494,6 +526,27 @@ The plugin flag is always emitted: the plugin is mandatory for
 emit and `build_member_compile_options` always carries the
 `-fplugin` token.
 
+**Emitter-layer rule (the one subtlety the §0 removal leaves
+open).** The removal made the plugin mandatory at the *driver*
+layer — [`resolve_plugin`](../../cust/src/cli.rs#L505) now returns
+a non-optional `Plugin` and every caller passes `plugin:
+Some(&plugin)`. But the *emitter* layer still models the plugin as
+optional ([`WorkspaceView.plugin_path:
+Option<PathBuf>`](../../cust/src/cmake_emit.rs#L67), `SurfaceCmd.plugin:
+Option<PathBuf>`), because the emitter's own unit tests construct
+views without a real `.so`. The new `CheckCommand` builder (slice
+A) lives in that emitter layer, so it must **treat the plugin path
+as required at construction**: when `plugin_path` is `None` it
+emits *no* check command for the module (never a plugin-less
+`-fsyntax-only` command). This keeps the false-green §0 deleted
+from silently reappearing inside the check path via an
+`Option`-shaped builder — the production driver always supplies
+`Some`, and a `None` (test-only) view simply produces no check
+commands rather than a tolerance-free-but-pluginless one. Slice
+A's argv-shape test asserts a `Some(plugin)` view bakes the
+`-fplugin` token, and that a `None` view emits zero check
+commands.
+
 ---
 
 ## 5. Open questions (RQ-CHK-N) — resolved
@@ -610,7 +663,7 @@ Same A→E cadence as v0.4.2 … v0.4.6:
 
 | Slice | Scope |
 | --- | --- |
-| **A** | Layout helper + standalone-argv builder + emitter scaffolding (no behaviour change). Add `check_stamp_path(crate, qname)` to `TargetLayout` and the `target/<profile>/.check/` tree to `ensure_dirs`. **Port/share the standalone clang argv builder** ([`build_cflags_raw`](../../cust/src/build.rs#L405) shape) into the emitter so it produces an explicit `-std=`, profile + extra cflags, `-fvisibility`, `-include <prelude>`, bare `-fplugin` (no `SHELL:`), **no** fragment-out, **no** `-Wno-error` (CHK-D-2 hazard). Add a `CheckCommand` struct + `MemberView.check_commands` to `cmake_emit` (populated, but `emit_*` not yet wired into `generate`). Tests: argv-shape unit test asserting a `CheckCommand` for a cwork module bakes an explicit `-std=` (the **`-std` regression guard**, CHK-D-2), `-fsyntax-only`, the plugin flag with no `SHELL:` and no fragment-out, no `-Wno-error`, and the `.rewrite` source. No driver / golden change. |
+| **A** | Layout helper + check-argv builder + emitter scaffolding (no behaviour change). Add `check_stamp_path(crate, qname)` (and a `check_dir(crate)` helper) to `TargetLayout`; the `.check/<crate>/` dir is created by the driver before `cmake --build` (slice C) since a `cmake -E touch` does **not** create parent dirs and check has no leaf to self-create it. **Reuse the lib target's `compile_options`** ([`build_member_compile_options`](../../cust/src/cmake_emit.rs#L2081), already in `cmake_emit` — no port from `build.rs`) to build the check argv: that list verbatim, with an explicit `-std=` prepended, the `SHELL:` wrapper stripped off `-fplugin`, and `-fsyntax-only` + the `.rewrite` source appended (CHK-D-2). So the argv keeps profile + extra cflags, `-fvisibility`, `-include <prelude>`, bare `-fplugin`, **and** `-Wno-unknown-attributes` (mirrors the build), with **no** fragment-out and **no** `-Wno-error`. Add a `CheckCommand` struct + `MemberView.check_commands` to `cmake_emit` (populated, but `emit_*` not yet wired into `generate`). Tests: argv-shape unit test asserting a `CheckCommand` for a cwork module bakes an explicit `-std=` (the **`-std` regression guard**, CHK-D-2), `-fsyntax-only`, the plugin flag with no `SHELL:` and no fragment-out, no `-Wno-error`, `-Wno-unknown-attributes` present (CHK-D-3), and the `.rewrite` source; a drift-guard asserting the argv's middle equals `build_member_compile_options` (modulo the `-std`/`SHELL:`/`-fsyntax-only` deltas); plus a `None`-plugin view emits **zero** check commands (CHK-D-10 emitter-layer rule). No driver / golden change. |
 | **B** | Emit the check commands + targets. Wire `emit_check_commands` into `generate` (per lib module: direct clang check `COMMAND` + `touch` `COMMAND`; OUTPUT = `.checked`; DEPENDS = `.rewrite` TU + plugin + imported build-mode fragments + dep crate-headers, CHK-D-3/CHK-D-5) + the per-member `cust_check_<member>` targets and the umbrella `cust_check`, all `EXCLUDE_FROM_ALL` (CHK-D-4/CHK-D-10). Golden `cwork.cmake` gains the check block + targets (pure addition, CHK-D-6). No driver change yet — emitted but not driven. |
 | **C** | Drive check through CMake. `run_check_path` collapses to emit + configure + `cmake --build --target cust_check` (or `cust_check_<m>` for `-p`, CHK-D-4/CHK-D-10); delete the per-member `run_phase1` call from the check path. Cross-module/cross-crate resolution verified through the `.rewrite` + fragment + dep crate-header `DEPENDS`. cwork `cust check` green end-to-end, and **fails** on an injected type error (CHK-D-1). |
 | **D** | Incrementality + isolation properties. No-op check = 0 spawns (CHK-D-7, via the chosen Ninja "no work" / clang-spawn probe), single-module incrementality (CHK-D-8), `cust build` fires zero check work (CHK-D-4 / verification item 5), the injected-error regression hardened (CHK-D-1 / verification item 1). |
@@ -627,13 +680,14 @@ ship, in the "Shipped deltas" shape v0.4.3 … v0.4.6 use.
   The single highest-risk detail: a `${CMAKE_C_COMPILER}` call in
   an `add_custom_command` does **not** pick up `CMAKE_C_STANDARD`,
   `target_compile_options`, or the `SHELL:` escape that the lib
-  *target* relies on. The check command must bake a complete
-  standalone argv (the `build_cflags_raw` shape) with an **explicit
-  `-std=`**, or it silently checks under the wrong C standard \u2014
-  masking real errors and inventing fake ones, defeating CHK-D-1.
-  Slice A's argv-shape test pins the explicit `-std=` as a
-  regression guard; the standalone-argv builder is shared with the
-  driver so the two cannot drift.
+  *target* relies on. The check command reuses the lib target's
+  `compile_options` (`build_member_compile_options`) verbatim and
+  prepends an **explicit `-std=`**, or it silently checks under the
+  wrong C standard — masking real errors and inventing fake ones,
+  defeating CHK-D-1. Slice A's argv-shape test pins the explicit
+  `-std=` as a regression guard; reusing `compile_options` (rather
+  than re-deriving an argv) means there is no second flag-assembly
+  path, so check and the real lib compile cannot drift.
 * **Behaviour change blast radius (CHK-D-1).** Making check fail
   on errors it previously swallowed could surprise existing
   workflows / CI that ran `cust check` expecting it to always pass.
@@ -659,6 +713,6 @@ ship, in the "Shipped deltas" shape v0.4.3 … v0.4.6 use.
   check compile is a direct `${CMAKE_C_COMPILER}` command. This
   asymmetry is deliberate (check adds no logic clang lacks once
   the `.rewrite` TU exists) but is worth flagging for anyone
-  scanning the emitter expecting uniformity. The baked clang argv
-  must stay in lockstep with the real lib compile's flags — slice
-  A factors the shared assembly so they cannot drift.
+  scanning the emitter expecting uniformity. The check argv reuses
+  the real lib compile's `compile_options` directly — slice A does
+  not factor a second assembly, so they cannot drift.

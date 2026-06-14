@@ -107,6 +107,25 @@ impl TargetLayout {
         }
     }
 
+    /// Incremental-check (CHK-D-3): root directory for the
+    /// per-module `.checked` stamps of `crate_name`.
+    /// `target/<profile>/.check/<crate>/`. A check stamp is only a
+    /// Ninja restat token (its bytes are irrelevant), so the
+    /// directory must exist before `cmake -E touch` runs — the
+    /// driver creates it (check has no leaf to self-create it).
+    #[allow(dead_code)] // created by the check driver (slice C); helper landed in slice A
+    pub fn check_dir(&self, crate_name: &str) -> PathBuf {
+        self.profile_root.join(".check").join(crate_name)
+    }
+
+    /// Incremental-check (CHK-D-3): per-module check stamp path —
+    /// `target/<profile>/.check/<crate>/<qualified_name>.checked`.
+    /// The custom command's `OUTPUT` (also its `touch` target).
+    pub fn check_stamp_path(&self, crate_name: &str, qualified_name: &str) -> PathBuf {
+        self.check_dir(crate_name)
+            .join(format!("{qualified_name}.checked"))
+    }
+
     /// v0.4.3 V43D-5/V43D-11: per-stem build + run directory for
     /// one integration test exe —
     /// `target/<profile>/test/<crate>/<stem>/`. The exe lands

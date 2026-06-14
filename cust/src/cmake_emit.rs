@@ -228,6 +228,17 @@ pub struct MemberView {
     /// integration sidecar. Empty for members without integration
     /// tests.
     pub integration_test_runners: Vec<TestRunnerCommand>,
+    /// incremental-check (CHK-D-3): one direct-clang check command
+    /// per **lib** module, producing the module's
+    /// `.check/<crate>/<q>.checked` stamp. Empty for bin-only
+    /// members, for unit-test fixtures that don't exercise the lib
+    /// path, and for plugin-less views (CHK-D-10: the plugin is
+    /// mandatory for `cust check`, so a `None` plugin yields no
+    /// check commands rather than a plugin-less one). Wired into
+    /// `generate` + anchored by `cust_check_<member>` in slice B;
+    /// populated-but-not-emitted in slice A.
+    #[allow(dead_code)] // consumed by `emit_check_commands` (slice B)
+    pub check_commands: Vec<CheckCommand>,
 }
 
 /// v0.4.5 V45D-3: one `cust internal rewrite-file` invocation,
@@ -609,6 +620,45 @@ pub struct SourceFile {
     /// `set_source_files_properties(... OBJECT_DEPENDS ...)`
     /// block per V42D-6.
     pub object_depends: Vec<PathBuf>,
+}
+
+/// incremental-check (CHK-D-2/CHK-D-3): one per-lib-module check
+/// command. The emitter lowers it to a two-`COMMAND`
+/// `add_custom_command` — a direct `${CMAKE_C_COMPILER}`
+/// `-fsyntax-only` compile of the module's `.rewrite` TU, then a
+/// `${CMAKE_COMMAND} -E touch` of the `.checked` stamp — whose
+/// `OUTPUT` is the stamp and whose `DEPENDS` are the TU, the
+/// plugin, and the module's imported build-mode fragments +
+/// cross-crate dep headers.
+///
+/// Unlike every other generation step this is **not** a `cust
+/// internal` leaf (RQ-CHK-6): its only cust-specific input —
+/// `#cust use` lowering — is already supplied by the `rewrite-file`
+/// command it depends on, so it invokes clang directly the same way
+/// the real lib target does.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read by `emit_check_commands` (slice B); populated in slice A
+pub struct CheckCommand {
+    /// The command's sole `OUTPUT` and its `touch` target:
+    /// `target/<profile>/.check/<crate>/<qname>.checked`.
+    pub stamp_out: PathBuf,
+    /// The clang argv after the `${CMAKE_C_COMPILER}` executable:
+    /// the lib target's `compile_options` verbatim, with an
+    /// explicit `-std=` prepended, the `SHELL:` wrapper stripped
+    /// off `-fplugin`, and `-fsyntax-only` + the `.rewrite` source
+    /// appended (CHK-D-2). One `String` per `CMake` list element.
+    pub argv: Vec<String>,
+    /// `DEPENDS` + the final `argv` token: the module's `.rewrite`
+    /// TU (a `rewrite-file` `OUTPUT`).
+    pub rewrite_tu: PathBuf,
+    /// `DEPENDS`: the cust clang plugin `.so` (a plugin rebuild
+    /// re-checks every module). Always present — a `None`-plugin
+    /// view produces no `CheckCommand` at all (CHK-D-10).
+    pub plugin: PathBuf,
+    /// `DEPENDS`: the module's imported build-mode fragments +
+    /// cross-crate dep headers (the same set as the lib TU's
+    /// `OBJECT_DEPENDS`, CHK-D-5).
+    pub frag_depends: Vec<PathBuf>,
 }
 
 // ─── Emitter ────────────────────────────────────────────────────
@@ -1649,6 +1699,7 @@ struct LibArtifacts {
     crate_header: Option<CrateHeaderCommand>,
     test_sidecars: Vec<TestSidecarCommand>,
     test_runner: Option<TestRunnerCommand>,
+    check_commands: Vec<CheckCommand>,
 }
 
 /// v0.4.5 V45D-3/V45D-4/V45D-5: collect the lib half's sources,
@@ -1671,6 +1722,7 @@ fn collect_lib_artifacts(
             crate_header: None,
             test_sidecars: Vec::new(),
             test_runner: None,
+            check_commands: Vec::new(),
         });
     };
     let c = collect_sources(
@@ -1698,6 +1750,7 @@ fn collect_lib_artifacts(
         crate_header: Some(header),
         test_sidecars: c.test_sidecars,
         test_runner: c.test_runner,
+        check_commands: c.check_commands,
     })
 }
 
@@ -1793,6 +1846,7 @@ pub fn collect_view(
         let crate_header = lib.crate_header;
         let test_sidecars = lib.test_sidecars;
         let test_runner = lib.test_runner;
+        let check_commands = lib.check_commands;
         // v0.4.4 V44D-5/V44D-8: one `BinView` per `BinTarget`.
         let (bins, bin_rewrites) = collect_bin_views(m, kind, &rewrite_root, &layout, &gen_ctx)?;
         rewrites.extend(bin_rewrites);
@@ -1887,6 +1941,7 @@ pub fn collect_view(
             test_runner,
             integration_test_sidecars,
             integration_test_runners,
+            check_commands,
         });
     }
 
@@ -2119,6 +2174,94 @@ fn build_member_compile_options(
     opts
 }
 
+/// incremental-check (CHK-D-2): the clang argv (after the
+/// `${CMAKE_C_COMPILER}` executable) for a per-module check
+/// command. By construction it equals the lib target's
+/// `compile_options` ([`build_member_compile_options`] with a
+/// plugin), with three deltas: an explicit `-std=` is **prepended**
+/// (a custom command does not inherit `CMAKE_C_STANDARD`), the
+/// `-fplugin` flag is **bare** (no `SHELL:` wrapper — an
+/// `add_custom_command` splits its own argv), and `-fsyntax-only` +
+/// the `.rewrite` TU are **appended** in place of the target's
+/// implicit `-c -o <obj>`. Every other token — profile + extra
+/// cflags (`rw_ctx.mid_cflags` = `profile.cflags()` + extra),
+/// `-fvisibility=hidden`, `-include <prelude>`, and
+/// `-Wno-unknown-attributes` — matches the build verbatim, so check
+/// validates the bytes the build compiles under the build's flags
+/// (CHK-D-1). The drift guard in tests asserts this equivalence.
+fn build_check_argv(rw_ctx: &MemberGenCtx, plugin: &Path, rewrite_tu: &Path) -> Vec<String> {
+    let mut argv = Vec::new();
+    // Explicit -std (the one flag a custom command does not inherit).
+    argv.push(format!("-std={}", rw_ctx.std));
+    // Profile + extra cflags (mirror build_member_compile_options).
+    argv.extend(rw_ctx.mid_cflags.iter().cloned());
+    argv.push("-fvisibility=hidden".to_string());
+    argv.push("-include".to_string());
+    argv.push(rw_ctx.prelude.display().to_string());
+    // Bare -fplugin (no SHELL: — custom command does its own split).
+    argv.push(format!("-fplugin={}", plugin.display()));
+    argv.push("-Wno-unknown-attributes".to_string());
+    // Syntax-only check of the lowered TU (no codegen, no
+    // fragment-out, no -Wno-error — CHK-D-1).
+    argv.push("-fsyntax-only".to_string());
+    argv.push(rewrite_tu.display().to_string());
+    argv
+}
+
+/// incremental-check (CHK-D-3/CHK-D-10): build the check command
+/// for one lib module, or `None` when the view has no plugin. The
+/// plugin is mandatory for `cust check` (§0), so a plugin-less view
+/// yields **no** check command for the module rather than a
+/// plugin-less `-fsyntax-only` (which would skip exactly the
+/// phase-1 AST checks and could pass code the real check rejects).
+/// `frag_depends` is the lib TU's `OBJECT_DEPENDS` set (imported
+/// build-mode fragments + cross-crate dep headers, CHK-D-5).
+fn check_command_for(
+    rw_ctx: &MemberGenCtx,
+    layout: &TargetLayout,
+    crate_name: &str,
+    qualified_name: &str,
+    rewrite_tu: &Path,
+    frag_depends: &[PathBuf],
+) -> Option<CheckCommand> {
+    let plugin = rw_ctx.plugin.as_ref()?;
+    Some(CheckCommand {
+        stamp_out: layout.check_stamp_path(crate_name, qualified_name),
+        argv: build_check_argv(rw_ctx, plugin, rewrite_tu),
+        rewrite_tu: rewrite_tu.to_path_buf(),
+        plugin: plugin.clone(),
+        frag_depends: frag_depends.to_vec(),
+    })
+}
+
+/// incremental-check (CHK-D-3): build the per-lib-module check
+/// commands, pairing each discovered `Module` with its emitted
+/// `SourceFile` (the `.rewrite` TU + its `OBJECT_DEPENDS`). Yields
+/// nothing for a plugin-less view (CHK-D-10) — `check_command_for`
+/// returns `None` per module. The caller guards `is_lib_half`.
+fn collect_check_commands(
+    modules: &[modules::Module],
+    sources: &[SourceFile],
+    crate_name: &str,
+    layout: &TargetLayout,
+    rw_ctx: &MemberGenCtx,
+) -> Vec<CheckCommand> {
+    modules
+        .iter()
+        .zip(sources)
+        .filter_map(|(m, sf)| {
+            check_command_for(
+                rw_ctx,
+                layout,
+                crate_name,
+                &m.qualified_name,
+                &sf.path,
+                &sf.object_depends,
+            )
+        })
+        .collect()
+}
+
 const fn map_kind(k: &CrateKind) -> MemberKind {
     match k {
         CrateKind::Lib { .. } => MemberKind::LibOnly,
@@ -2147,6 +2290,9 @@ struct CollectedSources {
     /// v0.4.6 V46D-2: the per-crate `test-runner` command. `Some`
     /// for the lib half, `None` for bins.
     test_runner: Option<TestRunnerCommand>,
+    /// incremental-check (CHK-D-3): one check command per lib
+    /// module. Empty for bins and for plugin-less views (CHK-D-10).
+    check_commands: Vec<CheckCommand>,
 }
 
 /// v0.4.5 V45D-3/V45D-4: per-member context for building the
@@ -2280,7 +2426,8 @@ fn collect_sources(
 
         // V45D-4/V45D-6: surface commands are emitted per SCC
         // *after* this loop (a cyclic SCC becomes one coarse
-        // command), not per source here.
+        // command), not per source here. Check commands (CHK-D-3)
+        // are likewise built after the loop, paired with `out`.
 
         out.push(SourceFile {
             path: rewrite_path,
@@ -2315,6 +2462,17 @@ fn collect_sources(
             }
         }
     }
+
+    // incremental-check (CHK-D-3): one direct-clang check command
+    // per lib module, paired with its `.rewrite` TU + build-mode
+    // fragment/dep-header DEPENDS (the `SourceFile.object_depends`
+    // set, CHK-D-5). Lib half only (RQ-CHK-3 defers bins); empty
+    // for a plugin-less view (CHK-D-10).
+    let check_commands = if is_lib_half {
+        collect_check_commands(&modules, &out, crate_name, layout, rw_ctx)
+    } else {
+        Vec::new()
+    };
 
     // V45D-5: the crate-header command's `--frag` list, in
     // topological order over the intra-crate import edges (same
@@ -2363,6 +2521,7 @@ fn collect_sources(
         header_frags,
         test_sidecars,
         test_runner,
+        check_commands,
     })
 }
 
