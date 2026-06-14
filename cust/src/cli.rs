@@ -20,17 +20,6 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(name = "cust", version, about, long_about = None)]
 pub struct Cli {
-    /// V40D-10: skip loading `libcust_plugin.so`. Compatible only
-    /// with `cust check`; rejected by `build` and `test` (both
-    /// hard-require the plugin per V40D-12). With this flag set,
-    /// `cust check` adds `-Wno-unknown-attributes` so the
-    /// unrecognised `[[cust::*]]` attribute spellings don't trip
-    /// `-Wunknown-attributes`. Fragment headers are NOT emitted,
-    /// test discovery is NOT performed, and `cust check` becomes
-    /// a syntax-only escape hatch with no link promise.
-    #[arg(long, global = true)]
-    pub no_plugin: bool,
-
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -163,7 +152,7 @@ pub struct SurfaceModuleArgs {
     #[arg(long)]
     pub prelude: PathBuf,
     /// The cust clang plugin `.so`. Omitted ⇒ no plugin (no
-    /// fragment emitted — only meaningful for `--no-plugin`).
+    /// fragment emitted).
     #[arg(long)]
     pub plugin: Option<PathBuf>,
 }
@@ -427,27 +416,20 @@ pub struct NewArgs {
 
 impl Cli {
     pub fn dispatch(self) -> Result<()> {
-        let no_plugin = self.no_plugin;
         match self.command {
             Cmd::Build(args) => run_build(
                 profile_kind(args.release),
                 args.package.as_deref(),
                 args.bin.as_deref(),
                 resolve_jobs(args.jobs)?,
-                no_plugin,
             ),
-            Cmd::Check(args) => run_check(
-                profile_kind(args.release),
-                args.package.as_deref(),
-                no_plugin,
-            ),
+            Cmd::Check(args) => run_check(profile_kind(args.release), args.package.as_deref()),
             Cmd::Run(args) => run_run(
                 profile_kind(args.release),
                 args.package.as_deref(),
                 args.bin.as_deref(),
                 resolve_jobs(args.jobs)?,
                 &args.forwarded,
-                no_plugin,
             ),
             Cmd::Test(args) => run_test(
                 profile_kind(args.release),
@@ -455,7 +437,6 @@ impl Cli {
                 resolve_jobs(args.jobs)?,
                 args.filter.as_deref(),
                 &args.forwarded,
-                no_plugin,
             ),
             Cmd::Clean => run_clean(),
             Cmd::New(args) => run_new(&args),
@@ -514,64 +495,28 @@ fn locate(cwd: &Path) -> Result<Workspace> {
     Workspace::discover(cwd)
 }
 
-/// V40D-10 + V40D-12 plugin resolution. Subcommand contract:
-///
-///   * `build` / `test` — plugin is mandatory. `--no-plugin`
-///     is rejected with the V40D-10 verbatim error. Plugin
-///     missing on disk is the V40D-12 hard error.
-///   * `check` / `run` — plugin is optional. `--no-plugin`
-///     skips discovery (clean `Ok(None)`). Plugin missing
-///     when not explicitly disabled emits a warning so users
-///     hear about it before it bites them on `cust build`.
-///
-/// `run` reuses this because it always builds first; building
-/// requires the plugin, so `run --no-plugin` is rejected too.
-fn resolve_plugin(no_plugin: bool, subcommand: &str) -> Result<Option<crate::plugin::Plugin>> {
-    let requires_plugin = matches!(subcommand, "build" | "test" | "run");
-
-    if no_plugin && requires_plugin {
-        // V40D-10 rejection wording.
-        anyhow::bail!(
-            "`--no-plugin` is incompatible with `cust {subcommand}` \
-             (fragment headers and/or test discovery require the plugin)\n  \
-             hint: drop `--no-plugin`, or use `cust check --no-plugin` \
-             for a syntax-only pass"
-        );
-    }
-
-    if no_plugin {
-        // `cust check --no-plugin`: caller wants the syntax-only
-        // escape hatch. Skip discovery entirely.
-        return Ok(None);
-    }
-
-    let plugin = crate::plugin::Plugin::discover();
-
-    if requires_plugin && plugin.is_none() {
-        // V40D-12 verbatim wording.
+/// V40D-12: the cust plugin is mandatory for every subcommand
+/// that resolves it (`build` / `check` / `test` / `run`). A
+/// missing plugin is a hard error — there is no plugin-less
+/// fallback. (The `--no-plugin` opt-out and the old `cust check`
+/// warn-and-proceed path were both removed: a check without the
+/// plugin's phase-1 AST checks could silently pass code the real
+/// check rejects.)
+fn resolve_plugin() -> Result<crate::plugin::Plugin> {
+    crate::plugin::Plugin::discover().ok_or_else(|| {
         let env_value = std::env::var("CUST_PLUGIN").unwrap_or_else(|_| "not set".to_string());
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .map_or_else(|| "<unknown>".to_string(), |p| p.display().to_string());
-        anyhow::bail!(
+        anyhow::anyhow!(
             "cust plugin (libcust_plugin.so) not found\n  \
              searched:\n    \
              $CUST_PLUGIN: {env_value}\n    \
              {exe_dir}/libcust_plugin.so: not found\n  \
              hint: build the plugin with `cargo run -p plugin-build`"
-        );
-    }
-
-    if !requires_plugin && plugin.is_none() {
-        eprintln!(
-            "warning: cust plugin (libcust_plugin.so) not found — `cust {subcommand}` \
-             will proceed without it. `cust build` and `cust test` will hard-error \
-             until the plugin is built (`cargo run -p plugin-build`)."
-        );
-    }
-
-    Ok(plugin)
+        )
+    })
 }
 
 fn run_build(
@@ -579,12 +524,11 @@ fn run_build(
     package: Option<&str>,
     bin: Option<&str>,
     jobs: Option<u32>,
-    no_plugin: bool,
 ) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
-    let plugin = resolve_plugin(no_plugin, "build")?;
+    let plugin = resolve_plugin()?;
 
     // v0.4.4 V44D-7: `--bin <name>` resolves to its owning member
     // (scoping the build to that one bin's target).
@@ -597,7 +541,7 @@ fn run_build(
     let opts = WorkspaceBuildOptions {
         profile_kind,
         clang: &clang,
-        plugin: plugin.as_ref(),
+        plugin: Some(&plugin),
         syntax_only: false,
         test_build: false,
         only,
@@ -606,9 +550,7 @@ fn run_build(
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 
-    if let Some(p) = &plugin {
-        eprintln!("  Plugin   {}", p.path.display());
-    }
+    eprintln!("  Plugin   {}", plugin.path.display());
     for (name, out) in &outputs.per_member {
         // v0.3.1: a member may produce an archive, an executable,
         // or both. v0.4.4: a member may produce multiple bins.
@@ -629,16 +571,16 @@ fn run_build(
     Ok(())
 }
 
-fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) -> Result<()> {
+fn run_check(profile_kind: ProfileKind, package: Option<&str>) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
     let clang = Clang::discover()?;
-    let plugin = resolve_plugin(no_plugin, "check")?;
+    let plugin = resolve_plugin()?;
 
     let opts = WorkspaceBuildOptions {
         profile_kind,
         clang: &clang,
-        plugin: plugin.as_ref(),
+        plugin: Some(&plugin),
         syntax_only: true,
         test_build: false,
         only: package,
@@ -1029,7 +971,6 @@ fn run_run(
     bin: Option<&str>,
     jobs: Option<u32>,
     forwarded: &[String],
-    no_plugin: bool,
 ) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
@@ -1039,11 +980,11 @@ fn run_run(
 
     // Build scoped to the resolved bin + its transitive deps.
     let clang = Clang::discover()?;
-    let plugin = resolve_plugin(no_plugin, "run")?;
+    let plugin = resolve_plugin()?;
     let opts = WorkspaceBuildOptions {
         profile_kind,
         clang: &clang,
-        plugin: plugin.as_ref(),
+        plugin: Some(&plugin),
         syntax_only: false,
         test_build: false,
         only: Some(&target_member),
@@ -1052,9 +993,7 @@ fn run_run(
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 
-    if let Some(p) = &plugin {
-        eprintln!("  Plugin   {}", p.path.display());
-    }
+    eprintln!("  Plugin   {}", plugin.path.display());
     for (name, out) in &outputs.per_member {
         let label = profile_kind.manifest_name();
         if let Some(arch) = &out.archive {
@@ -1131,7 +1070,6 @@ fn run_test(
     jobs: Option<u32>,
     filter: Option<&str>,
     forwarded: &[String],
-    no_plugin: bool,
 ) -> Result<()> {
     let cwd = env::current_dir().context("getting current directory")?;
     let ws = locate(&cwd)?;
@@ -1159,11 +1097,11 @@ fn run_test(
     }
 
     let clang = Clang::discover()?;
-    let plugin = resolve_plugin(no_plugin, "test")?;
+    let plugin = resolve_plugin()?;
     let opts = WorkspaceBuildOptions {
         profile_kind,
         clang: &clang,
-        plugin: plugin.as_ref(),
+        plugin: Some(&plugin),
         syntax_only: false,
         test_build: true,
         only: package,
@@ -1172,9 +1110,7 @@ fn run_test(
     };
     let outputs = workspace::build_workspace(&ws, &opts)?;
 
-    if let Some(p) = &plugin {
-        eprintln!("  Plugin   {}", p.path.display());
-    }
+    eprintln!("  Plugin   {}", plugin.path.display());
     for (name, out) in &outputs.per_member {
         if let Some(test_exe) = &out.test_executable {
             println!("  Finished {name} [test] -> {}", test_exe.display());

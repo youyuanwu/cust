@@ -450,7 +450,7 @@ pub fn build_cflags_raw(
         // V40D-10: without the plugin, clang doesn't know about
         // `[[cust::*]]` attributes — suppress
         // `-Wunknown-attributes` so cust-attribute decls don't
-        // drown a `cust check --no-plugin` run in warnings.
+        // drown a plugin-less `cust check` run in warnings.
         // (Compiles without the plugin still get the cust_*
         // prelude macros, which expand to `annotate(...)` —
         // those work without the plugin; only literal C23

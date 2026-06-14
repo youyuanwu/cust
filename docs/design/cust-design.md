@@ -690,30 +690,28 @@ attribute:
 ### Fallback when the plugin is not loaded
 
 v0.4.0 (V40D-10) made the plugin mandatory for `cust build`
-and `cust test` (V40D-12 hard error otherwise). `cust check`
-is the only subcommand that still works without the plugin,
-and even there `--no-plugin` is a **syntax-only escape hatch**
-with no decl-annotation promises:
+and `cust test` (V40D-12 hard error otherwise). Ahead of the
+incremental-`cust check` milestone (see
+[incremental-check.md](incremental-check.md)) the contract was
+**tightened to all subcommands**: the explicit `--no-plugin`
+opt-out flag **and** the implicit "plugin missing → warn and
+run syntax-only" fallback on `cust check` were both removed.
+The reason is the same in both cases — a plugin-less pass skips
+the cust-specific phase-1 AST checks, so it offers a strict
+subset of the real check and can produce a false green. **There
+is now no plugin-less path:** `cust build` / `cust check` /
+`cust test` / `cust run` all hard-error (V40D-12) when the
+plugin cannot be discovered.
 
-* `clang`‑native attributes (e.g. `must_use` →
-  `warn_unused_result`) still enforce their portion of the
-  contract — those are plain clang attributes that don't
-  need the plugin.
-* `[[cust::pub]]` / `[[cust::pub_crate]]` /
-  `[[cust::pub_repr]]` / `[[cust::test]]` /
-  `[[cust::test_ignore]]` are silently inert. Visibility
-  is not lifted, fragment headers are not emitted, test
-  symbols still appear in the artifact, etc. `cust check
-  --no-plugin` adds `-Wno-unknown-attributes` so the
-  unrecognised attribute names don't drown the output in
-  warnings; everything else is on the user to handle.
-* `cust build --no-plugin` and `cust test --no-plugin` are
-  hard-rejected by the driver with the V40D-10 wording.
-* Driver pre‑pass attributes (`cfg`, `feature`) work either
-  way — they're processed before clang is invoked at all.
+The historical fallback semantics (clang-native attributes still
+enforced; `[[cust::*]]` attributes inert; `-Wno-unknown-attributes`
+to silence the unrecognised spellings) only ever applied to the
+plugin-less pass that no longer exists, and are retained in the
+codebase solely for the `internal` leaves' defensive
+`-Wno-unknown-attributes` (V42D-5).
 
 The pre-v0.4.0 "both spellings, with-plugin / without-plugin
-/ fallback_behavior" test matrix is moot under the V40D-10
+/ fallback_behavior" test matrix is moot under the V40D-10/V40D-12/V40D-12
 contract. The v0.4.0 plugin-test suite
 (`plugin/test/CMakeLists.txt`) is the single source of truth
 for per-attribute behaviour; `docs/ATTRIBUTE-SEMANTICS.md`
@@ -926,7 +924,8 @@ What ships today (v0.4.0, completed in slice F):
   process" model and survives a test‑side `SIGSEGV` /
   `abort()`.
 * V40D-12 hard error if the plugin is missing for
-  `cust test`; V40D-10 rejects `cust test --no-plugin`.
+  `cust test` (the removed `--no-plugin` flag no longer
+  offers an opt-out).
 * No `[profile.test]`, no per‑test timeout, no
   `--nocapture`, no `--exact`, no multi‑filter, no
     parallel test execution, no `[[cust::test(inline)]]` —
@@ -983,7 +982,9 @@ described in the previous subsection and deleted
 the pre-pass would stay in tree as the
 `cust check --no-plugin` discovery path was explicitly
 revoked when V40D-10 redefined `--no-plugin` as a
-syntax-only escape hatch with no discovery promises.
+syntax-only escape hatch with no discovery promises (and the
+flag itself was later removed entirely — see §10 and
+[incremental-check.md](incremental-check.md)).
 v0.3.2.md preserves the historical V32D-N record.
 
 ---
@@ -1356,12 +1357,16 @@ Roadmap bullets here are deliberately short:
     `CUST_FIXED_POINT_CAP`). Acyclic crates converge in 1
     iteration; the loop is in place for the moment a
     `pub_repr` cycle appears.
-  - **V40D-10 `--no-plugin` flag** — global flag accepted
-    only on `cust check` (syntax-only escape hatch with
-    `-Wno-unknown-attributes`); `cust build --no-plugin` /
-    `cust test --no-plugin` rejected with the verbatim
-    V40D-10 wording. **V40D-12 hard error** if the plugin
-    is missing for `build` / `test` / `run`.
+  - **V40D-10 `--no-plugin` flag** — ~~global flag accepted
+    only on `cust check`~~ **REMOVED** ahead of the
+    incremental-`cust check` milestone, along with the
+    implicit "plugin missing → warn + syntax-only" fallback
+    on `cust check` (both offered a strict subset of the
+    real check, risking false greens; see
+    [incremental-check.md](incremental-check.md)). The
+    plugin is now mandatory for **all** of `build` / `check`
+    / `test` / `run` — a missing plugin is the **V40D-12
+    hard error** uniformly.
   - Cwork rewrite as part of slice E — cstd + hello-cstd
     version bumps to 0.4.0; 10 unit tests pass (was 7 at
     v0.3.2 close, +3 from the new geom module).
@@ -1451,6 +1456,19 @@ Roadmap bullets here are deliberately short:
     emit + configure + build like `cust build`. See
     [v0.4.6-test-codegen.md](v0.4.6-test-codegen.md). The
     remaining `cust test` features above are still pending.
+  - **candidate (unscheduled)** — CMake-owned incremental
+    `cust check`. Reverses V42D-15 (check stays out of
+    CMake): wires `cust check` into the emitted
+    `CMakeLists` as a `cust_check` `EXCLUDE_FROM_ALL`
+    target driven by per-module check commands (direct
+    `${CMAKE_C_COMPILER} -fsyntax-only` on the existing
+    `rewrite-file` output, no new `internal` leaf) with
+    `.checked` stamp `OUTPUT`s, so a no-op check spawns
+    zero codegen processes and edits re-check only the
+    affected modules. Also makes check *error-reporting*
+    (today it silently swallows type errors). Natural slot
+    is v0.4.8+ after the resolver; 📝 draft. See
+    [incremental-check.md](incremental-check.md).
   - **v0.4.7** — dependency resolver + registry. Initial
     registry wire protocol (`Index` trait, `file://` first
     per V3D-1's deferral), `cust add`, semver version
