@@ -153,6 +153,57 @@ fn cwork_view() -> WorkspaceView {
                         has_lib: true,
                     },
                 ],
+                // v0.4.5 V45D-4: one surface command per lib
+                // module. `types` has no imports; `lib` imports
+                // `types` (its fragment is a DEPENDS edge).
+                surface_commands: vec![
+                    SurfaceCommand {
+                        source: PathBuf::from("/ws/cstd/src/types.c"),
+                        surface_out: PathBuf::from("/ws/target/debug/build/cstd/types.surface.c"),
+                        fragment_out: PathBuf::from(
+                            "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h",
+                        ),
+                        frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/cstd"),
+                        deps_root: PathBuf::from("/ws/target/debug/deps"),
+                        deps: vec![],
+                        std: "c23".to_string(),
+                        cflags: vec!["-O0".to_string(), "-g3".to_string()],
+                        includes: vec![PathBuf::from("/ws/cstd/src")],
+                        prelude: PathBuf::from("/ws/target/debug/prelude.h"),
+                        plugin: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+                        import_fragments: vec![],
+                        dep_headers: vec![],
+                    },
+                    SurfaceCommand {
+                        source: PathBuf::from("/ws/cstd/src/lib.c"),
+                        surface_out: PathBuf::from("/ws/target/debug/build/cstd/lib.surface.c"),
+                        fragment_out: PathBuf::from(
+                            "/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h",
+                        ),
+                        frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/cstd"),
+                        deps_root: PathBuf::from("/ws/target/debug/deps"),
+                        deps: vec![],
+                        std: "c23".to_string(),
+                        cflags: vec!["-O0".to_string(), "-g3".to_string()],
+                        includes: vec![PathBuf::from("/ws/cstd/src")],
+                        prelude: PathBuf::from("/ws/target/debug/prelude.h"),
+                        plugin: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+                        import_fragments: vec![PathBuf::from(
+                            "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h",
+                        )],
+                        dep_headers: vec![],
+                    },
+                ],
+                // V45D-5: the published header concatenates both
+                // fragments in topological order (types before lib).
+                crate_header: Some(CrateHeaderCommand {
+                    crate_name: "cstd".to_string(),
+                    out: PathBuf::from("/ws/target/debug/build/cstd/include/cstd.h"),
+                    frags: vec![
+                        PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"),
+                        PathBuf::from("/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"),
+                    ],
+                }),
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -190,6 +241,8 @@ fn cwork_view() -> WorkspaceView {
                     is_bin_half: false,
                     has_lib: false,
                 }],
+                surface_commands: vec![],
+                crate_header: None,
             },
         ],
     }
@@ -308,6 +361,30 @@ fn lib_and_bin_member_emits_both_targets() {
                     has_lib: true,
                 },
             ],
+            // V45D-4: the lib half's single module surfaces; the
+            // bin half (main.c) is never surface-passed.
+            surface_commands: vec![SurfaceCommand {
+                source: PathBuf::from("/ws/app/src/lib.c"),
+                surface_out: PathBuf::from("/ws/target/debug/build/app/lib.surface.c"),
+                fragment_out: PathBuf::from("/ws/target/debug/.h-fragments/app/app__lib.cust.h"),
+                frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/app"),
+                deps_root: PathBuf::from("/ws/target/debug/deps"),
+                deps: vec![],
+                std: "c23".to_string(),
+                cflags: vec!["-O0".to_string()],
+                includes: vec![PathBuf::from("/ws/app/src")],
+                prelude: PathBuf::from("/ws/target/debug/prelude.h"),
+                plugin: None,
+                import_fragments: vec![],
+                dep_headers: vec![],
+            }],
+            crate_header: Some(CrateHeaderCommand {
+                crate_name: "app".to_string(),
+                out: PathBuf::from("/ws/target/debug/build/app/include/app.h"),
+                frags: vec![PathBuf::from(
+                    "/ws/target/debug/.h-fragments/app/app__lib.cust.h",
+                )],
+            }),
         }],
     };
     let out = generate(&view);

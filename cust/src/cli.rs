@@ -513,6 +513,7 @@ fn run_check(profile_kind: ProfileKind, package: Option<&str>, no_plugin: bool) 
 fn run_internal(cmd: InternalCmd) -> Result<()> {
     match cmd {
         InternalCmd::RewriteFile(a) => {
+            trace_internal("rewrite-file", &a.out);
             let deps: Vec<&str> = a.deps.iter().map(String::as_str).collect();
             let ctx = crate::generate::RewriteCtx {
                 crate_name: &a.crate_name,
@@ -528,6 +529,7 @@ fn run_internal(cmd: InternalCmd) -> Result<()> {
             crate::generate::rewrite_one(&ctx)
         }
         InternalCmd::SurfaceModule(a) => {
+            trace_internal("surface-module", &a.fragment_out);
             let clang = Clang::discover()?;
             let plugin = a.plugin.map(|path| crate::plugin::Plugin { path });
             let includes: Vec<&Path> = a.includes.iter().map(PathBuf::as_path).collect();
@@ -566,6 +568,7 @@ fn run_internal(cmd: InternalCmd) -> Result<()> {
             crate::generate::surface_one_module(&ctx, &clang, &base_cflags)
         }
         InternalCmd::CrateHeader(a) => {
+            trace_internal("crate-header", &a.out);
             // Derive each fragment's qualified name from its file
             // stem (`<qname>.cust.h`), preserving the emitter's
             // topological `--frag` order.
@@ -584,6 +587,27 @@ fn run_internal(cmd: InternalCmd) -> Result<()> {
                 .collect();
             crate::generate::write_crate_header_concat(&a.crate_name, &a.out, &frags)
         }
+    }
+}
+
+/// v0.4.5 V45D-12: when `CUST_TRACE_INTERNAL=<path>` is set,
+/// append one `<leaf> <output>` line per `internal` leaf
+/// invocation. The no-op-build regression test points the env var
+/// at a scratch file, builds cwork twice, and asserts the file is
+/// untouched by the second build (zero codegen spawns). A no-op in
+/// normal runs (the env var is unset). Best-effort: a trace I/O
+/// error never fails the generation it is observing.
+fn trace_internal(leaf: &str, output: &Path) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("CUST_TRACE_INTERNAL") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{leaf} {}", output.display());
     }
 }
 

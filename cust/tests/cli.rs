@@ -2262,3 +2262,92 @@ fn internal_surface_module_requires_upstream_fragment() {
     );
     assert_failure_with(&out, "does not exist on disk");
 }
+
+// ─── v0.4.5: slice C — incremental generation properties ─────────
+
+/// Like `cust` but with extra environment variables applied. Used
+/// to point `CUST_TRACE_INTERNAL` at a scratch trace file so a test
+/// can observe which `internal` leaves a build spawned (V45D-12).
+fn cust_env<I, S>(crate_dir: &Path, args: I, envs: &[(&str, &Path)]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new(CUST_BIN);
+    cmd.args(args).current_dir(crate_dir).stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn cust")
+}
+
+#[test]
+fn noop_build_spawns_zero_internal_leaves() {
+    // V45D-12 (verification item 2): a second `cust build` with no
+    // source change must spawn zero `internal` codegen leaves. The
+    // trace file named by `CUST_TRACE_INTERNAL` stays untouched
+    // (never created) because no rewrite-file / surface-module /
+    // crate-header command re-fires.
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    let trace = dir.join("target/debug/noop-trace.txt");
+    let _ = fs::remove_file(&trace);
+    let out = cust_env(&dir, ["build"], &[("CUST_TRACE_INTERNAL", &trace)]);
+    assert_success(&out);
+    assert!(
+        !trace.is_file(),
+        "no-op build spawned internal leaves (trace file was written):\n{}",
+        fs::read_to_string(&trace).unwrap_or_default()
+    );
+}
+
+#[test]
+fn crate_header_republishes_via_all_anchor() {
+    // V45D-14 (verification item 11): the published `<crate>.h` is
+    // anchored by `add_custom_target(<crate>_header ALL)`, not by
+    // any compile target consuming it as a tracked CMake input.
+    // Deleting it and rebuilding must regenerate it — proving the
+    // ALL anchor keeps the header in the default build graph.
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    let header = dir.join("target/debug/build/cross_module_typedef/include/cross_module_typedef.h");
+    assert!(header.is_file(), "crate header should exist after build");
+    fs::remove_file(&header).expect("remove published header");
+    let out = cust(&dir, ["build"]);
+    assert_success(&out);
+    assert!(
+        header.is_file(),
+        "crate header was not republished by the ALL anchor after deletion"
+    );
+}
+
+#[test]
+fn extra_cflag_change_refires_surface() {
+    // V45D-15 (verification item 13): editing `[clang] extra-cflags`
+    // changes the `surface-module` command line, so the next build
+    // re-fires every surface command (no stale fragment). Observed
+    // via the trace file — a `surface-module` leaf must appear.
+    let Some((_tmp, dir)) = build_cmt_fixture() else {
+        eprintln!("plugin not built — skipping");
+        return;
+    };
+    // Append an `[clang] extra-cflags` entry to the manifest.
+    let manifest = dir.join("Cust.toml");
+    let mut toml = fs::read_to_string(&manifest).expect("read Cust.toml");
+    toml.push_str("\n[clang]\nextra-cflags = [\"-DEXTRA_V045=1\"]\n");
+    fs::write(&manifest, &toml).expect("write Cust.toml");
+
+    let trace = dir.join("target/debug/cflag-trace.txt");
+    let _ = fs::remove_file(&trace);
+    let out = cust_env(&dir, ["build"], &[("CUST_TRACE_INTERNAL", &trace)]);
+    assert_success(&out);
+    let traced = fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        traced.contains("surface-module"),
+        "extra-cflags change did not re-fire any surface-module command:\n{traced}"
+    );
+}

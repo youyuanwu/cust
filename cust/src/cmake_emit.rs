@@ -177,6 +177,23 @@ pub struct MemberView {
     /// path. Integration-test rewrites are NOT here (V45D-11 keeps
     /// them driver-side this milestone).
     pub rewrites: Vec<RewriteCommand>,
+    /// v0.4.5 V45D-4: one `cust internal surface-module` custom
+    /// command per **lib** module (bins are never surface-passed).
+    /// Each produces this member's `.h-fragments/<crate>/<q>.cust.h`
+    /// fragment; its `DEPENDS` carry the module's source, the
+    /// plugin `.so`, the fragments of its intra-crate imports, and
+    /// the real crate-header `OUTPUT` of every cross-crate dep it
+    /// uses (V45D-14 — the producing path, not the `deps/` symlink).
+    /// Empty for bin-only members and for unit-test fixtures that
+    /// don't exercise the surface path.
+    pub surface_commands: Vec<SurfaceCommand>,
+    /// v0.4.5 V45D-5: the `cust internal crate-header` custom
+    /// command that concatenates this member's fragments into its
+    /// published `<crate>.h`. `Some` for every lib-bearing member,
+    /// `None` for bin-only members. Anchored by an
+    /// `add_custom_target(<crate>_header ALL)` (V45D-14) since
+    /// nothing in `CMake` consumes `<crate>.h` as a tracked input.
+    pub crate_header: Option<CrateHeaderCommand>,
 }
 
 /// v0.4.5 V45D-3: one `cust internal rewrite-file` invocation,
@@ -204,6 +221,67 @@ pub struct RewriteCommand {
     pub is_bin_half: bool,
     /// `--has-lib`: the member has a library half.
     pub has_lib: bool,
+}
+
+/// v0.4.5 V45D-4: one `cust internal surface-module` invocation,
+/// fully resolved at `collect_view` time. The emitter lowers it to
+/// an `add_custom_command(OUTPUT <fragment_out> … DEPENDS …)`.
+/// Emitted for lib modules only.
+#[derive(Debug, Clone)]
+pub struct SurfaceCommand {
+    /// `--source`: the module's `src/<…>.c`.
+    pub source: PathBuf,
+    /// `--surface-out`: scratch `#cust use`-lowered surface TU
+    /// (`build/<crate>/<qname>.surface.c`).
+    pub surface_out: PathBuf,
+    /// `--fragment-out`: the produced fragment header — also the
+    /// command's sole `OUTPUT`.
+    pub fragment_out: PathBuf,
+    /// `--frags-dir`: `target/<profile>/.h-fragments/<crate>/`.
+    pub frags_dir: PathBuf,
+    /// `--deps-root`: `target/<profile>/deps/`.
+    pub deps_root: PathBuf,
+    /// `--dep <d>` for each declared dependency (sorted, V45D-15).
+    pub deps: Vec<String>,
+    /// `--std <value>` for the surface compile.
+    pub std: String,
+    /// `--cflag <f>`: mid cflags (profile cflags + `[clang]
+    /// extra-cflags`), in order (V45D-15).
+    pub cflags: Vec<String>,
+    /// `--include <dir>`: extra include dirs (the module's own
+    /// source dir).
+    pub includes: Vec<PathBuf>,
+    /// `--prelude`: the materialised prelude header.
+    pub prelude: PathBuf,
+    /// `--plugin`: the cust clang plugin `.so` (also a `DEPENDS`
+    /// so a plugin rebuild re-fires every surface command). `None`
+    /// only in plugin-less test environments.
+    pub plugin: Option<PathBuf>,
+    /// `DEPENDS`: fragments of intra-crate imports (`Module::
+    /// imports`), in sorted order (V45D-15).
+    pub import_fragments: Vec<PathBuf>,
+    /// `DEPENDS`: the real crate-header `OUTPUT` path
+    /// `build/<dep>/include/<dep>.h` of every cross-crate dep this
+    /// module uses (`Module::dep_imports`), sorted (V45D-15). The
+    /// producing path, **not** the `deps/<dep>/…` symlink, so Ninja
+    /// connects the upstream crate-header command (V45D-14).
+    pub dep_headers: Vec<PathBuf>,
+}
+
+/// v0.4.5 V45D-5: one `cust internal crate-header` invocation.
+/// The emitter lowers it to an `add_custom_command` plus the
+/// `add_custom_target(<crate>_header ALL)` anchor (V45D-14).
+#[derive(Debug, Clone)]
+pub struct CrateHeaderCommand {
+    /// `--crate-name`.
+    pub crate_name: String,
+    /// `--out`: the published `build/<crate>/include/<crate>.h` —
+    /// also the command's sole `OUTPUT`.
+    pub out: PathBuf,
+    /// `--frag <p>` for every fragment, in topological order —
+    /// also the command's `DEPENDS` (a surface change in any
+    /// module republishes the header).
+    pub frags: Vec<PathBuf>,
 }
 
 /// v0.4.4 V44D-5: one binary target. A member emits one
@@ -370,9 +448,11 @@ pub fn generate(view: &WorkspaceView) -> String {
     // Per-member blocks.
     for m in &view.members {
         emit_rewrite_commands(&mut out, &view.cust_exe, m);
+        emit_surface_commands(&mut out, &view.cust_exe, m);
         if m.kind.has_lib() {
             emit_library(&mut out, m);
         }
+        emit_crate_header_command(&mut out, &view.cust_exe, m);
         if m.kind.has_bin() {
             emit_executable(&mut out, m);
         }
@@ -438,6 +518,115 @@ fn emit_rewrite_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
         let _ = writeln!(out, "    DEPENDS \"{}\"", rw.origin.display());
         out.push_str("    VERBATIM)\n");
     }
+}
+
+/// v0.4.5 V45D-4: emit one `add_custom_command` per lib module so
+/// Ninja produces each `.h-fragments/<crate>/<q>.cust.h` fragment
+/// lazily, ordered by the import DAG. The `DEPENDS` set
+/// (source + plugin `.so` + intra-crate import fragments + cross-
+/// crate dep headers) makes Ninja surface each module only after
+/// its upstream fragments already exist, so a single non-fixed-
+/// point pass produces the correct fragment (V45D-4).
+fn emit_surface_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    if m.surface_commands.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(out, "# ---- crate: {} (surface fragments) ----", m.name);
+    for sc in &m.surface_commands {
+        out.push_str("add_custom_command(\n");
+        let _ = writeln!(out, "    OUTPUT \"{}\"", sc.fragment_out.display());
+        let _ = writeln!(
+            out,
+            "    COMMAND \"{}\" internal surface-module",
+            cust_exe.display()
+        );
+        let _ = writeln!(out, "            --source \"{}\"", sc.source.display());
+        let _ = writeln!(
+            out,
+            "            --surface-out \"{}\"",
+            sc.surface_out.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --fragment-out \"{}\"",
+            sc.fragment_out.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --frags-dir \"{}\"",
+            sc.frags_dir.display()
+        );
+        let _ = writeln!(
+            out,
+            "            --deps-root \"{}\"",
+            sc.deps_root.display()
+        );
+        let _ = writeln!(out, "            --std {}", sc.std);
+        for cflag in &sc.cflags {
+            let _ = writeln!(out, "            --cflag \"{cflag}\"");
+        }
+        for inc in &sc.includes {
+            let _ = writeln!(out, "            --include \"{}\"", inc.display());
+        }
+        for dep in &sc.deps {
+            let _ = writeln!(out, "            --dep {dep}");
+        }
+        let _ = writeln!(out, "            --prelude \"{}\"", sc.prelude.display());
+        if let Some(plugin) = &sc.plugin {
+            let _ = writeln!(out, "            --plugin \"{}\"", plugin.display());
+        }
+        let _ = writeln!(out, "    DEPENDS \"{}\"", sc.source.display());
+        if let Some(plugin) = &sc.plugin {
+            let _ = writeln!(out, "            \"{}\"", plugin.display());
+        }
+        for frag in &sc.import_fragments {
+            let _ = writeln!(out, "            \"{}\"", frag.display());
+        }
+        for hdr in &sc.dep_headers {
+            let _ = writeln!(out, "            \"{}\"", hdr.display());
+        }
+        out.push_str("    VERBATIM)\n");
+    }
+}
+
+/// v0.4.5 V45D-5: emit the `crate-header` custom command plus its
+/// `add_custom_target(<crate>_header ALL)` anchor + an
+/// `add_dependencies(<crate> <crate>_header)` edge. Nothing in
+/// `CMake` consumes `<crate>.h` as a tracked input (consumers
+/// `#include` it by an absolute path baked into rewrites), so the
+/// `ALL` all-target is what forces the header to (re)publish even
+/// on a header-only change (V45D-14). No-op for bin-only members.
+fn emit_crate_header_command(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    let Some(ch) = &m.crate_header else {
+        return;
+    };
+    out.push('\n');
+    let _ = writeln!(out, "# ---- crate: {} (published header) ----", m.name);
+    out.push_str("add_custom_command(\n");
+    let _ = writeln!(out, "    OUTPUT \"{}\"", ch.out.display());
+    let _ = writeln!(
+        out,
+        "    COMMAND \"{}\" internal crate-header",
+        cust_exe.display()
+    );
+    let _ = writeln!(out, "            --crate-name {}", ch.crate_name);
+    let _ = writeln!(out, "            --out \"{}\"", ch.out.display());
+    for frag in &ch.frags {
+        let _ = writeln!(out, "            --frag \"{}\"", frag.display());
+    }
+    if ch.frags.is_empty() {
+        let _ = writeln!(out, "    DEPENDS");
+    } else {
+        let _ = writeln!(out, "    DEPENDS \"{}\"", ch.frags[0].display());
+        for frag in &ch.frags[1..] {
+            let _ = writeln!(out, "            \"{}\"", frag.display());
+        }
+    }
+    out.push_str("    VERBATIM)\n");
+    let _ = writeln!(out, "add_custom_target({}_header ALL", m.name);
+    let _ = writeln!(out, "    DEPENDS \"{}\")", ch.out.display());
+    let _ = writeln!(out, "add_dependencies({0} {0}_header)", m.name);
 }
 
 fn emit_library(out: &mut String, m: &MemberView) {
@@ -977,6 +1166,59 @@ use crate::{
 /// flips, and `CMake` doesn't reconfigure when toggling between
 /// build and test in the same workspace.
 ///
+/// v0.4.5 V45D-3/V45D-4/V45D-5: the lib half's contribution to a
+/// member's `MemberView`, returned by [`collect_lib_artifacts`].
+struct LibArtifacts {
+    sources: Vec<SourceFile>,
+    rewrites: Vec<RewriteCommand>,
+    surface_commands: Vec<SurfaceCommand>,
+    crate_header: Option<CrateHeaderCommand>,
+}
+
+/// v0.4.5 V45D-3/V45D-4/V45D-5: collect the lib half's sources,
+/// rewrite commands, surface commands, and crate-header command
+/// for one member. Returns empty vecs + `None` for a bin-only
+/// member (no lib source). Extracted from `collect_view` to keep
+/// it under the line cap.
+fn collect_lib_artifacts(
+    m: &crate::workspace::Member,
+    rewrite_root: &Path,
+    layout: &TargetLayout,
+    gen_ctx: &MemberGenCtx,
+) -> Result<LibArtifacts> {
+    let Some(src) = m.kind.lib_source() else {
+        return Ok(LibArtifacts {
+            sources: Vec::new(),
+            rewrites: Vec::new(),
+            surface_commands: Vec::new(),
+            crate_header: None,
+        });
+    };
+    let c = collect_sources(
+        &m.root,
+        src,
+        &m.name,
+        rewrite_root,
+        layout,
+        gen_ctx,
+        false,
+        true,
+    )?;
+    // V45D-5: every lib-bearing member publishes a crate header
+    // concatenating its fragments (in topological order).
+    let header = CrateHeaderCommand {
+        crate_name: m.name.clone(),
+        out: layout.crate_header_path(&m.name),
+        frags: c.header_frags,
+    };
+    Ok(LibArtifacts {
+        sources: c.sources,
+        rewrites: c.rewrites,
+        surface_commands: c.surface_commands,
+        crate_header: Some(header),
+    })
+}
+
 /// v0.4.4 V44D-5/V44D-8: build one `BinView` per `BinTarget` of a
 /// member. The package bin (name == member name) keeps the v0.3.1
 /// target name (`<crate>` pure-bin / `<crate>-bin` lib+bin); extra
@@ -988,7 +1230,7 @@ fn collect_bin_views(
     kind: MemberKind,
     rewrite_root: &Path,
     layout: &TargetLayout,
-    rw_ctx: &MemberRewriteCtx,
+    rw_ctx: &MemberGenCtx,
 ) -> Result<(Vec<BinView>, Vec<RewriteCommand>)> {
     let mut bins: Vec<BinView> = Vec::with_capacity(m.kind.bins().len());
     let mut rewrites: Vec<RewriteCommand> = Vec::new();
@@ -996,7 +1238,7 @@ fn collect_bin_views(
     // (enables the `#cust use <crate>;` own-lib carve-out).
     let is_bin_half = kind == MemberKind::LibAndBin;
     for bt in m.kind.bins() {
-        let (sources, bin_rewrites) = collect_sources(
+        let collected = collect_sources(
             &m.root,
             &bt.source,
             &m.name,
@@ -1004,8 +1246,9 @@ fn collect_bin_views(
             layout,
             rw_ctx,
             is_bin_half,
+            false,
         )?;
-        rewrites.extend(bin_rewrites);
+        rewrites.extend(collected.rewrites);
         let target_name = if bt.name == m.name {
             if kind == MemberKind::LibAndBin {
                 format!("{}-bin", m.name)
@@ -1018,7 +1261,7 @@ fn collect_bin_views(
         bins.push(BinView {
             target_name,
             output_name: bt.name.clone(),
-            sources,
+            sources: collected.sources,
         });
     }
     Ok((bins, rewrites))
@@ -1028,6 +1271,7 @@ pub fn collect_view(
     ws: &Workspace,
     profile_kind: ProfileKind,
     plugin: Option<&Plugin>,
+    default_std: &str,
 ) -> Result<WorkspaceView> {
     let layout = TargetLayout::for_workspace(&ws.root, profile_kind);
     let rewrite_root = layout.profile_root.join(".rewrite");
@@ -1040,23 +1284,32 @@ pub fn collect_view(
     let mut members: Vec<MemberView> = Vec::with_capacity(ws.members.len());
     for m in &ws.members {
         let kind = map_kind(&m.kind);
-        // V45D-3: per-member rewrite-command context (shared by
-        // the lib + every bin source).
-        let rw_ctx = member_rewrite_ctx(m, kind, &layout);
-        let (lib_sources, mut rewrites) = match m.kind.lib_source() {
-            Some(src) => collect_sources(
-                &m.root,
-                src,
-                &m.name,
-                &rewrite_root,
-                &layout,
-                &rw_ctx,
-                false,
-            )?,
-            None => (Vec::new(), Vec::new()),
+        // Per-target compile options + the surface command's
+        // cflags both derive from the resolved profile, so resolve
+        // it once up front (V45D-15).
+        let profile_override = match profile_kind {
+            ProfileKind::Dev => m.manifest.profile.dev.as_ref(),
+            ProfileKind::Release => m.manifest.profile.release.as_ref(),
         };
+        let profile = ResolvedProfile::resolve(profile_kind, profile_override)?;
+        // V45D-3/V45D-4: per-member generation context (shared by
+        // the lib + every bin source, and the surface commands).
+        let gen_ctx = member_gen_ctx(
+            m,
+            kind,
+            &layout,
+            &profile,
+            &prelude_path,
+            plugin,
+            default_std,
+        );
+        let lib = collect_lib_artifacts(m, &rewrite_root, &layout, &gen_ctx)?;
+        let lib_sources = lib.sources;
+        let mut rewrites = lib.rewrites;
+        let surface_commands = lib.surface_commands;
+        let crate_header = lib.crate_header;
         // v0.4.4 V44D-5/V44D-8: one `BinView` per `BinTarget`.
-        let (bins, bin_rewrites) = collect_bin_views(m, kind, &rewrite_root, &layout, &rw_ctx)?;
+        let (bins, bin_rewrites) = collect_bin_views(m, kind, &rewrite_root, &layout, &gen_ctx)?;
         rewrites.extend(bin_rewrites);
 
         // Bin half include dirs: for a lib+bin member, the bin
@@ -1091,11 +1344,6 @@ pub fn collect_view(
         // Per-target compile options. Mirror what `build::build_cflags`
         // would produce for a non-test, non-syntax-only TU minus the
         // trailing `-c -o <obj> <src>` (CMake supplies those).
-        let profile_override = match profile_kind {
-            ProfileKind::Dev => m.manifest.profile.dev.as_ref(),
-            ProfileKind::Release => m.manifest.profile.release.as_ref(),
-        };
-        let profile = ResolvedProfile::resolve(profile_kind, profile_override)?;
         let compile_options =
             build_member_compile_options(&profile, &m.manifest, &prelude_path, plugin);
 
@@ -1104,41 +1352,8 @@ pub fn collect_view(
         // identical between `cust build` and `cust test`;
         // `EXCLUDE_FROM_ALL` on the target keeps it out of the
         // default build graph.
-        let test_target = if kind.has_lib() {
-            // Lib-half sources (same as the lib target) plus the
-            // driver-generated runner TU. The runner path is the
-            // contract V42D-14 pins: cmake_dir/cust_test_main_<crate>.c.
-            let mut sources = lib_sources.clone();
-            sources.push(SourceFile {
-                path: cmake_dir.join(format!("cust_test_main_{}.c", m.name)),
-                object_depends: Vec::new(),
-            });
-            let mut test_opts = compile_options.clone();
-            // The CUST_TEST_BUILD=1 macro is the existing v0.3.2
-            // signal that activates the prelude's test branch +
-            // makes the plugin attach normal external linkage to
-            // [[cust::test]] decls (so the runner TU's extern
-            // forward declarations can reach them).
-            test_opts.push("-DCUST_TEST_BUILD=1".to_string());
-            let include_dirs = vec![layout
-                .crate_header_path(&m.name)
-                .parent()
-                .unwrap()
-                .to_path_buf()];
-            Some(TestTargetView {
-                target_name: format!("{}__test", m.name),
-                sources,
-                include_dirs,
-                // Test exes link against the same lib deps as the
-                // member's bin half — workspace deps in topo
-                // order.
-                link_deps: m.deps.clone(),
-                compile_options: test_opts,
-                runtime_output_dir: layout.test_build_dir(&m.name),
-            })
-        } else {
-            None
-        };
+        let test_target =
+            collect_test_target(m, kind, &lib_sources, &compile_options, &cmake_dir, &layout);
 
         // v0.4.3 V43D-5: one integration-test target per
         // `tests/<stem>.c`. Only members with a lib half get
@@ -1169,6 +1384,8 @@ pub fn collect_view(
             test_target,
             integration_tests,
             rewrites,
+            surface_commands,
+            crate_header,
         });
     }
 
@@ -1178,6 +1395,53 @@ pub fn collect_view(
         plugin_path: plugin.map(|p| p.path.clone()),
         cust_exe: std::env::current_exe().context("resolving cust binary path")?,
         members,
+    })
+}
+
+/// V42D-14: build the per-member unit-test target (whenever the
+/// member has a lib half). Recompiles the lib-half sources into
+/// the test exe plus the driver-generated runner TU, tagged with
+/// `-DCUST_TEST_BUILD=1`. `None` for bin-only members. Extracted
+/// from `collect_view` to keep it under the line cap.
+fn collect_test_target(
+    m: &Member,
+    kind: MemberKind,
+    lib_sources: &[SourceFile],
+    compile_options: &[String],
+    cmake_dir: &Path,
+    layout: &TargetLayout,
+) -> Option<TestTargetView> {
+    if !kind.has_lib() {
+        return None;
+    }
+    // Lib-half sources (same as the lib target) plus the
+    // driver-generated runner TU. The runner path is the contract
+    // V42D-14 pins: cmake_dir/cust_test_main_<crate>.c.
+    let mut sources = lib_sources.to_vec();
+    sources.push(SourceFile {
+        path: cmake_dir.join(format!("cust_test_main_{}.c", m.name)),
+        object_depends: Vec::new(),
+    });
+    let mut test_opts = compile_options.to_vec();
+    // The CUST_TEST_BUILD=1 macro is the existing v0.3.2 signal
+    // that activates the prelude's test branch + makes the plugin
+    // attach normal external linkage to [[cust::test]] decls (so
+    // the runner TU's extern forward declarations can reach them).
+    test_opts.push("-DCUST_TEST_BUILD=1".to_string());
+    let include_dirs = vec![layout
+        .crate_header_path(&m.name)
+        .parent()
+        .unwrap()
+        .to_path_buf()];
+    Some(TestTargetView {
+        target_name: format!("{}__test", m.name),
+        sources,
+        include_dirs,
+        // Test exes link against the same lib deps as the member's
+        // bin half — workspace deps in topo order.
+        link_deps: m.deps.clone(),
+        compile_options: test_opts,
+        runtime_output_dir: layout.test_build_dir(&m.name),
     })
 }
 
@@ -1294,11 +1558,26 @@ const fn map_kind(k: &CrateKind) -> MemberKind {
     }
 }
 
-/// v0.4.5 V45D-3: per-member context for building `RewriteCommand`s
-/// alongside the `SourceFile` list. Shared by the lib + every bin
-/// of a member; the only per-source difference is `is_bin_half`,
-/// passed separately.
-struct MemberRewriteCtx {
+/// Output of [`collect_sources`] for one entry source (lib half or
+/// one bin). `surface_commands` and `header_frags` are populated
+/// only for the lib half (`is_lib_half = true`); they are empty
+/// for bins.
+struct CollectedSources {
+    sources: Vec<SourceFile>,
+    rewrites: Vec<RewriteCommand>,
+    surface_commands: Vec<SurfaceCommand>,
+    /// Topo-ordered fragment paths for the member's `crate-header`
+    /// command (V45D-5). Empty for bins.
+    header_frags: Vec<PathBuf>,
+}
+
+/// v0.4.5 V45D-3/V45D-4: per-member context for building the
+/// `RewriteCommand`s **and** `SurfaceCommand`s alongside the
+/// `SourceFile` list. Shared by the lib + every bin of a member;
+/// the only per-source difference is `is_bin_half`, passed
+/// separately. The surface-only fields (`std` / `mid_cflags` /
+/// `prelude` / `plugin`) are unused when building bin sources.
+struct MemberGenCtx {
     /// `target/<profile>/.h-fragments/<crate>/`.
     frags_dir: PathBuf,
     /// `target/<profile>/deps/`.
@@ -1309,34 +1588,69 @@ struct MemberRewriteCtx {
     deps: Vec<String>,
     /// Whether the member has a library half (carve-out gate).
     has_lib: bool,
+    /// `-std=<value>` for surface compiles (V45D-15).
+    std: String,
+    /// Mid cflags (profile cflags + `[clang] extra-cflags`), in
+    /// order (V45D-15).
+    mid_cflags: Vec<String>,
+    /// The materialised prelude header (`-include`d during the
+    /// surface compile).
+    prelude: PathBuf,
+    /// The cust clang plugin `.so`, if any (also a surface
+    /// `DEPENDS`).
+    plugin: Option<PathBuf>,
 }
 
-/// Build the shared rewrite context for one member (V45D-3).
-fn member_rewrite_ctx(m: &Member, kind: MemberKind, layout: &TargetLayout) -> MemberRewriteCtx {
+/// Build the shared generation context for one member
+/// (V45D-3/V45D-4).
+fn member_gen_ctx(
+    m: &Member,
+    kind: MemberKind,
+    layout: &TargetLayout,
+    profile: &ResolvedProfile,
+    prelude: &Path,
+    plugin: Option<&Plugin>,
+    default_std: &str,
+) -> MemberGenCtx {
     let mut sorted_deps = m.deps.clone();
     sorted_deps.sort();
-    MemberRewriteCtx {
+    let std = m
+        .manifest
+        .clang
+        .std
+        .clone()
+        .unwrap_or_else(|| default_std.to_string());
+    let mut mid_cflags = profile.cflags();
+    mid_cflags.extend(m.manifest.clang.extra_cflags.iter().cloned());
+    MemberGenCtx {
         frags_dir: layout.fragments_dir(&m.name),
         deps_root: layout.profile_root.join("deps"),
         own_lib_header: layout.crate_header_path(&m.name),
         deps: sorted_deps,
         has_lib: kind.has_lib(),
+        std,
+        mid_cflags,
+        prelude: prelude.to_path_buf(),
+        plugin: plugin.map(|p| p.path.clone()),
     }
 }
 
+#[allow(clippy::too_many_arguments)] // explicit-path collector; bundling these into a struct would just move the noise
 fn collect_sources(
     crate_root: &Path,
     entry_source: &Path,
     crate_name: &str,
     rewrite_root: &Path,
     layout: &TargetLayout,
-    rw_ctx: &MemberRewriteCtx,
+    rw_ctx: &MemberGenCtx,
     is_bin_half: bool,
-) -> Result<(Vec<SourceFile>, Vec<RewriteCommand>)> {
+    is_lib_half: bool,
+) -> Result<CollectedSources> {
     let modules = modules::discover(crate_root, entry_source)
         .with_context(|| format!("discovering module graph for `{crate_name}`"))?;
     let mut out: Vec<SourceFile> = Vec::with_capacity(modules.len());
     let mut rewrites: Vec<RewriteCommand> = Vec::with_capacity(modules.len());
+    let mut surface_commands: Vec<SurfaceCommand> = Vec::new();
     for m in &modules {
         // Post-rewrite path: target/<profile>/.rewrite/<crate>/<rel>.
         // <rel> is the source's path relative to the crate root,
@@ -1349,16 +1663,29 @@ fn collect_sources(
         let rewrite_path = rewrite_root.join(crate_name).join(rel);
 
         // OBJECT_DEPENDS: every `#cust use crate::<importee>`
-        // edge resolves to the importee's fragment header.
-        // V42D-4 wants topological order; slice A uses source-
-        // declaration order from the scanner (matches topo in
-        // practice for non-cyclic graphs, which V40D-11 already
-        // requires for fragment convergence).
-        let object_depends = m
+        // edge resolves to the importee's fragment header
+        // (V42D-6); every *declared* `#cust use <dep>;` additionally
+        // depends on the dep's published crate header's PRODUCING
+        // path (V45D-14 — `build/<dep>/include/<dep>.h`, not the
+        // `deps/` symlink, so Ninja connects the upstream
+        // crate-header command and a downstream TU never compiles
+        // before its dep header exists). An *undeclared* `#cust use
+        // <x>;` (or a lib-half self-import) gets **no** edge: it is
+        // a validation error the `rewrite-file` command surfaces
+        // cleanly, and emitting an edge to a non-existent producer
+        // would instead fail as an opaque Ninja "missing build
+        // input" / dependency-cycle error (the bin-half own-crate
+        // carve-out is the one self-reference that is valid).
+        let mut object_depends: Vec<PathBuf> = m
             .imports
             .iter()
             .map(|importee| layout.fragment_path(crate_name, importee))
             .collect();
+        for dep in &m.dep_imports {
+            if dep_edge_is_valid(dep, crate_name, rw_ctx, is_bin_half) {
+                object_depends.push(layout.crate_header_path(dep));
+            }
+        }
 
         // V45D-3: one rewrite custom command per source.
         rewrites.push(RewriteCommand {
@@ -1373,12 +1700,105 @@ fn collect_sources(
             has_lib: rw_ctx.has_lib,
         });
 
+        // V45D-4: one surface command per **lib** module (bins are
+        // never surface-passed — nothing downstream consumes a
+        // bin's surface).
+        if is_lib_half {
+            surface_commands.push(surface_command_for(m, crate_name, layout, rw_ctx));
+        }
+
         out.push(SourceFile {
             path: rewrite_path,
             object_depends,
         });
     }
-    Ok((out, rewrites))
+
+    // V45D-5: the crate-header command's `--frag` list, in
+    // topological order over the intra-crate import edges (same
+    // order `build::write_crate_header` concatenates). Lib half
+    // only.
+    let header_frags = if is_lib_half {
+        crate::build::topo_order_modules(&modules)
+            .iter()
+            .map(|m| layout.fragment_path(crate_name, &m.qualified_name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(CollectedSources {
+        sources: out,
+        rewrites,
+        surface_commands,
+        header_frags,
+    })
+}
+
+/// v0.4.5 V45D-4: whether a `#cust use <dep>;` should produce a
+/// build-graph edge to `build/<dep>/include/<dep>.h`. Mirrors the
+/// `rewrite_one` validation carve-out exactly: a declared
+/// dependency always resolves; the bin half of a lib+bin crate may
+/// additionally self-reference its own crate (lowered to the own
+/// lib header). Anything else (an undeclared dep, or a lib-half
+/// self-import) is a validation error the `rewrite-file` command
+/// surfaces — emitting a graph edge for it would instead fail as
+/// an opaque Ninja "missing build input" or dependency cycle.
+fn dep_edge_is_valid(
+    dep: &str,
+    crate_name: &str,
+    rw_ctx: &MemberGenCtx,
+    is_bin_half: bool,
+) -> bool {
+    rw_ctx.deps.iter().any(|d| d == dep) || (is_bin_half && rw_ctx.has_lib && dep == crate_name)
+}
+
+/// v0.4.5 V45D-4: build the `SurfaceCommand` for one lib module.
+/// `import_fragments` / `dep_headers` (the `DEPENDS` edges) are
+/// emitted sorted for byte-stable output (V45D-15).
+fn surface_command_for(
+    m: &modules::Module,
+    crate_name: &str,
+    layout: &TargetLayout,
+    rw_ctx: &MemberGenCtx,
+) -> SurfaceCommand {
+    let surface_out = layout
+        .build_dir(crate_name)
+        .join(format!("{}.surface.c", m.qualified_name));
+    let src_dir = m
+        .source_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+
+    let mut import_fragments: Vec<PathBuf> = m
+        .imports
+        .iter()
+        .map(|importee| layout.fragment_path(crate_name, importee))
+        .collect();
+    import_fragments.sort();
+
+    let mut dep_headers: Vec<PathBuf> = m
+        .dep_imports
+        .iter()
+        .filter(|dep| dep_edge_is_valid(dep, crate_name, rw_ctx, false))
+        .map(|dep| layout.crate_header_path(dep))
+        .collect();
+    dep_headers.sort();
+
+    SurfaceCommand {
+        source: m.source_path.clone(),
+        surface_out,
+        fragment_out: layout.fragment_path(crate_name, &m.qualified_name),
+        frags_dir: rw_ctx.frags_dir.clone(),
+        deps_root: rw_ctx.deps_root.clone(),
+        deps: rw_ctx.deps.clone(),
+        std: rw_ctx.std.clone(),
+        cflags: rw_ctx.mid_cflags.clone(),
+        includes: vec![src_dir],
+        prelude: rw_ctx.prelude.clone(),
+        plugin: rw_ctx.plugin.clone(),
+        import_fragments,
+        dep_headers,
+    }
 }
 
 /// Write the workspace's `CMakeLists` into the build tree
@@ -1393,7 +1813,11 @@ pub fn emit_workspace_cmakelists(
     profile_kind: ProfileKind,
     plugin: Option<&Plugin>,
 ) -> Result<WriteOutcome> {
-    let view = collect_view(ws, profile_kind, plugin)?;
+    // No `Clang` handle on this (test/out-of-band) path; discover
+    // one for the surface std fallback (V45D-15). Cheap — a single
+    // `clang --version` probe.
+    let clang = crate::clang::Clang::discover()?;
+    let view = collect_view(ws, profile_kind, plugin, clang.default_std())?;
     let bytes = generate(&view).into_bytes();
     let layout = TargetLayout::for_workspace(&ws.root, profile_kind);
     let cmake_dir = layout.profile_root.join("cmake");
@@ -1469,7 +1893,7 @@ pub fn emit_and_drive_cmake(
     let cmakelists = cmake_dir.join("CMakeLists.txt");
     let stamp = cmake_dir.join("stamp").join("cmakelists.sha256");
 
-    let view = collect_view(ws, profile_kind, plugin)?;
+    let view = collect_view(ws, profile_kind, plugin, clang.default_std())?;
     let bytes = generate(&view).into_bytes();
     let outcome = write_if_changed(&cmakelists, &bytes, &stamp, view.plugin_path.as_deref())?;
 

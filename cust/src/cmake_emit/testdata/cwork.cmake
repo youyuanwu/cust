@@ -33,6 +33,43 @@ add_custom_command(
     DEPENDS "/ws/cstd/src/lib.c"
     VERBATIM)
 
+# ---- crate: cstd (surface fragments) ----
+add_custom_command(
+    OUTPUT "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
+    COMMAND "/ws/bin/cust" internal surface-module
+            --source "/ws/cstd/src/types.c"
+            --surface-out "/ws/target/debug/build/cstd/types.surface.c"
+            --fragment-out "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
+            --frags-dir "/ws/target/debug/.h-fragments/cstd"
+            --deps-root "/ws/target/debug/deps"
+            --std c23
+            --cflag "-O0"
+            --cflag "-g3"
+            --include "/ws/cstd/src"
+            --prelude "/ws/target/debug/prelude.h"
+            --plugin "/ws/target/debug/libcust_plugin.so"
+    DEPENDS "/ws/cstd/src/types.c"
+            "/ws/target/debug/libcust_plugin.so"
+    VERBATIM)
+add_custom_command(
+    OUTPUT "/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"
+    COMMAND "/ws/bin/cust" internal surface-module
+            --source "/ws/cstd/src/lib.c"
+            --surface-out "/ws/target/debug/build/cstd/lib.surface.c"
+            --fragment-out "/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"
+            --frags-dir "/ws/target/debug/.h-fragments/cstd"
+            --deps-root "/ws/target/debug/deps"
+            --std c23
+            --cflag "-O0"
+            --cflag "-g3"
+            --include "/ws/cstd/src"
+            --prelude "/ws/target/debug/prelude.h"
+            --plugin "/ws/target/debug/libcust_plugin.so"
+    DEPENDS "/ws/cstd/src/lib.c"
+            "/ws/target/debug/libcust_plugin.so"
+            "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
+    VERBATIM)
+
 # ---- crate: cstd (library) ----
 add_library(cstd STATIC
     "/ws/target/debug/.rewrite/cstd/src/types.c"
@@ -56,6 +93,21 @@ target_compile_options(cstd PRIVATE
     "SHELL:-fplugin=/ws/target/debug/libcust_plugin.so"
     "-Wno-unknown-attributes"
 )
+
+# ---- crate: cstd (published header) ----
+add_custom_command(
+    OUTPUT "/ws/target/debug/build/cstd/include/cstd.h"
+    COMMAND "/ws/bin/cust" internal crate-header
+            --crate-name cstd
+            --out "/ws/target/debug/build/cstd/include/cstd.h"
+            --frag "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
+            --frag "/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"
+    DEPENDS "/ws/target/debug/.h-fragments/cstd/cstd__types.cust.h"
+            "/ws/target/debug/.h-fragments/cstd/cstd__lib.cust.h"
+    VERBATIM)
+add_custom_target(cstd_header ALL
+    DEPENDS "/ws/target/debug/build/cstd/include/cstd.h")
+add_dependencies(cstd cstd_header)
 
 # ---- crate: cstd (integration test: alloc_pressure) ----
 add_executable(cstd__itest__alloc_pressure EXCLUDE_FROM_ALL

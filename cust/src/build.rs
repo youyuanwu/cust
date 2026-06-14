@@ -840,6 +840,16 @@ fn materialise_prelude(dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// v0.4.5 V45D-14(b): materialise the prelude header into the
+/// profile root so the `surface-module` custom commands can
+/// `-include` it. Dropping `run_phase1` from the build/run path
+/// (V45D-10) also drops the prelude write it used to perform, so
+/// the driver does it once, here, right before driving `CMake`.
+/// Idempotent + content-skipped (mtime-stable when unchanged).
+pub fn ensure_prelude(layout: &TargetLayout) -> Result<()> {
+    materialise_prelude(&layout.prelude_path())
+}
+
 /// toolchain. Idempotent — overwrites unconditionally.
 pub fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
     let contents = format!(
@@ -904,7 +914,7 @@ fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module
 /// shouldn't happen — `modules::discover` validates this — but
 /// we guard against it for defence in depth) are treated as if
 /// the missing edge weren't there.
-fn topo_order_modules(modules: &[Module]) -> Vec<&Module> {
+pub fn topo_order_modules(modules: &[Module]) -> Vec<&Module> {
     use std::collections::{BTreeSet, VecDeque};
 
     // Name → discovery index.

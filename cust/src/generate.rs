@@ -161,6 +161,10 @@ pub fn surface_one_module(
 
     let rewritten = lower_surface(ctx, &src_text, &scan)?;
 
+    if let Some(parent) = ctx.surface_out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating `{}`", parent.display()))?;
+    }
     std::fs::write(ctx.surface_out, &rewritten)
         .with_context(|| format!("writing `{}`", ctx.surface_out.display()))?;
 

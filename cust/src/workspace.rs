@@ -675,20 +675,29 @@ pub fn build_workspace(
         return run_check_path(ws, &to_build, opts, &layout);
     }
 
-    // Build mode (V42D-16): driver runs phase 1 + writes the
-    // `.rewrite/` tree for every workspace member (the whole-
-    // workspace CMakeLists references every member's sources;
-    // CMake's configure-time existence check needs the rewrite
-    // tree complete even when `-p <name>` scopes the eventual
-    // `cmake --build` invocation). Per-member work stays cheap
-    // (idempotent reads + content-skip writes); slice D can
-    // narrow this if larger workspaces ever surface real
-    // pressure.
+    // Build mode (V42D-16 + v0.4.5 V45D-10): the driver no longer
+    // runs `run_phase1` (surface pass) or the lib/bin rewrite pass
+    // here — those are now CMake custom commands (V45D-3/V45D-4),
+    // produced lazily by Ninja inside the single `cmake --build`.
+    // The residual per-member driver work (V45D-14(b)) is: write
+    // the integration-test rewrites (still driver-side this
+    // milestone, V45D-11 — their `add_executable` sources must
+    // exist at configure time), refresh the dep-publish symlink,
+    // and synthesise `BuildOutputs`. The prelude is materialised
+    // once up front (the surface commands `-include` it).
+    build::ensure_prelude(&layout).context("materialising prelude")?;
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(ws.members.len());
     for m in &ws.members {
         let name = &m.name;
+        // V45D-14(b): `run_phase1` used to create each member's
+        // `build/<crate>/` dir; now that it's gone from the build
+        // path, create it here so `refresh_dep_symlink` (which
+        // points `deps/<crate>` at it) and the surface commands'
+        // `<crate>.surface.c` scratch writes have a home before
+        // `cmake --build` runs.
+        std::fs::create_dir_all(layout.build_dir(name))
+            .with_context(|| format!("creating build dir for member `{name}`"))?;
         with_plan(ws, m, opts, |plan| {
-            build::run_phase1(plan).with_context(|| format!("phase 1 for member `{name}`"))?;
             build::write_rewrite_tree(plan)
                 .with_context(|| format!("writing rewrite tree for member `{name}`"))?;
             refresh_dep_symlink(&layout, &m.name, &m.root)
