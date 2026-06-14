@@ -140,6 +140,7 @@ fn cwork_view() -> WorkspaceView {
                         deps: vec![],
                         is_bin_half: false,
                         has_lib: true,
+                        integration: false,
                     },
                     RewriteCommand {
                         out: PathBuf::from("/ws/target/debug/.rewrite/cstd/src/lib.c"),
@@ -151,6 +152,7 @@ fn cwork_view() -> WorkspaceView {
                         deps: vec![],
                         is_bin_half: false,
                         has_lib: true,
+                        integration: false,
                     },
                 ],
                 // v0.4.5 V45D-4: one surface command per lib
@@ -207,6 +209,8 @@ fn cwork_view() -> WorkspaceView {
                 surface_cycles: vec![],
                 test_sidecars: vec![],
                 test_runner: None,
+                integration_test_sidecars: vec![],
+                integration_test_runners: vec![],
             },
             MemberView {
                 name: "hello-cstd".to_string(),
@@ -243,12 +247,15 @@ fn cwork_view() -> WorkspaceView {
                     deps: vec!["cstd".to_string()],
                     is_bin_half: false,
                     has_lib: false,
+                    integration: false,
                 }],
                 surface_commands: vec![],
                 crate_header: None,
                 surface_cycles: vec![],
                 test_sidecars: vec![],
                 test_runner: None,
+                integration_test_sidecars: vec![],
+                integration_test_runners: vec![],
             },
         ],
     }
@@ -354,6 +361,7 @@ fn lib_and_bin_member_emits_both_targets() {
                     deps: vec![],
                     is_bin_half: false,
                     has_lib: true,
+                    integration: false,
                 },
                 RewriteCommand {
                     out: PathBuf::from("/ws/target/debug/.rewrite/app/src/main.c"),
@@ -365,6 +373,7 @@ fn lib_and_bin_member_emits_both_targets() {
                     deps: vec![],
                     is_bin_half: true,
                     has_lib: true,
+                    integration: false,
                 },
             ],
             // V45D-4: the lib half's single module surfaces; the
@@ -394,6 +403,8 @@ fn lib_and_bin_member_emits_both_targets() {
             surface_cycles: vec![],
             test_sidecars: vec![],
             test_runner: None,
+            integration_test_sidecars: vec![],
+            integration_test_runners: vec![],
         }],
     };
     let out = generate(&view);
@@ -413,6 +424,7 @@ fn lib_and_bin_member_emits_both_targets() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // verbose fabricated view; readability over splitting
 fn unit_test_sidecar_and_runner_commands_emitted() {
     // v0.4.6 V46D-2: a lib member with unit tests emits one
     // `internal test-sidecar --kind unit` custom command per lib
@@ -490,6 +502,8 @@ fn unit_test_sidecar_and_runner_commands_emitted() {
                     "/ws/target/debug/.test-discovery/app/lib.cust.tests",
                 )],
             }),
+            integration_test_sidecars: vec![],
+            integration_test_runners: vec![],
         }],
     };
     let out = generate(&view);
@@ -522,6 +536,124 @@ fn unit_test_sidecar_and_runner_commands_emitted() {
     assert!(
         out.contains("--sidecar \"/ws/target/debug/.test-discovery/app/lib.cust.tests\""),
         "runner depends on the unit sidecar"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // verbose fabricated view; readability over splitting
+fn integration_test_sidecar_runner_and_rewrite_commands_emitted() {
+    // v0.4.6 V46D-3/RQ-V46-4: a lib member with an integration test
+    // emits an integration `rewrite-file` command (`--integration`),
+    // a per-stem `test-sidecar --kind integration` command, and a
+    // per-stem `test-runner` command whose OUTPUT is the
+    // `cust_itest_main_<crate>__<stem>.c` runner TU.
+    let profile_root = PathBuf::from("/ws/target/debug");
+    let view = WorkspaceView {
+        cust_version: "0.4.6".to_string(),
+        c_standard: "23".to_string(),
+        plugin_path: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+        cust_exe: PathBuf::from("/ws/bin/cust"),
+        members: vec![MemberView {
+            name: "app".to_string(),
+            kind: MemberKind::LibOnly,
+            lib_sources: vec![SourceFile {
+                path: PathBuf::from("/ws/target/debug/.rewrite/app/src/lib.c"),
+                object_depends: vec![],
+            }],
+            bins: vec![],
+            archive_output_dir: PathBuf::from("/ws/target/debug/build/app"),
+            runtime_output_dir: profile_root,
+            bin_include_dirs: vec![],
+            workspace_link_deps: vec![],
+            lib_workspace_deps: vec![],
+            compile_options: vec!["-O0".to_string()],
+            test_target: None,
+            integration_tests: vec![IntegrationTestView {
+                target_name: "app__itest__basic".to_string(),
+                output_name: "basic".to_string(),
+                sources: vec![
+                    SourceFile {
+                        path: PathBuf::from("/ws/target/debug/.rewrite/app/tests/basic.c"),
+                        object_depends: vec![],
+                    },
+                    SourceFile {
+                        path: PathBuf::from("/ws/target/debug/cmake/cust_itest_main_app__basic.c"),
+                        object_depends: vec![],
+                    },
+                ],
+                include_dirs: vec![PathBuf::from("/ws/target/debug/build/app/include")],
+                link_deps: vec!["app".to_string()],
+                compile_options: vec!["-O0".to_string(), "-DCUST_TEST_BUILD=1".to_string()],
+                runtime_output_dir: PathBuf::from("/ws/target/debug/test/app/basic"),
+            }],
+            rewrites: vec![RewriteCommand {
+                out: PathBuf::from("/ws/target/debug/.rewrite/app/tests/basic.c"),
+                origin: PathBuf::from("/ws/app/tests/basic.c"),
+                crate_name: "app".to_string(),
+                frags_dir: PathBuf::from("/ws/target/debug/.h-fragments/app"),
+                deps_root: PathBuf::from("/ws/target/debug/deps"),
+                own_lib_header: PathBuf::from("/ws/target/debug/build/app/include/app.h"),
+                deps: vec![],
+                is_bin_half: false,
+                has_lib: true,
+                integration: true,
+            }],
+            surface_commands: vec![],
+            surface_cycles: vec![],
+            crate_header: Some(CrateHeaderCommand {
+                crate_name: "app".to_string(),
+                out: PathBuf::from("/ws/target/debug/build/app/include/app.h"),
+                frags: vec![PathBuf::from(
+                    "/ws/target/debug/.h-fragments/app/app__lib.cust.h",
+                )],
+            }),
+            test_sidecars: vec![],
+            test_runner: None,
+            integration_test_sidecars: vec![IntegrationTestSidecarCommand {
+                crate_name: "app".to_string(),
+                stem: "basic".to_string(),
+                source: PathBuf::from("/ws/target/debug/.rewrite/app/tests/basic.c"),
+                sidecar_out: PathBuf::from(
+                    "/ws/target/debug/.test-discovery/app/tests/basic.cust.tests",
+                ),
+                std: "c23".to_string(),
+                cflags: vec!["-O0".to_string()],
+                prelude: PathBuf::from("/ws/target/debug/prelude.h"),
+                plugin: Some(PathBuf::from("/ws/target/debug/libcust_plugin.so")),
+                header_deps: vec![PathBuf::from("/ws/target/debug/build/app/include/app.h")],
+            }],
+            integration_test_runners: vec![TestRunnerCommand {
+                crate_name: "app".to_string(),
+                out: PathBuf::from("/ws/target/debug/cmake/cust_itest_main_app__basic.c"),
+                sidecars: vec![PathBuf::from(
+                    "/ws/target/debug/.test-discovery/app/tests/basic.cust.tests",
+                )],
+            }],
+        }],
+    };
+    let out = generate(&view);
+    // V45D-3 completion: the integration rewrite carries --integration.
+    assert!(
+        out.contains("internal rewrite-file") && out.contains("--integration"),
+        "integration rewrite-file command with --integration emitted"
+    );
+    // The integration sidecar (OUTPUT = the per-stem .cust.tests).
+    assert!(out.contains("--kind integration"), "integration kind flag");
+    assert!(out.contains("--stem basic"), "stem flag present");
+    assert!(
+        out.contains("OUTPUT \"/ws/target/debug/.test-discovery/app/tests/basic.cust.tests\""),
+        "integration sidecar OUTPUT is the per-stem .cust.tests path"
+    );
+    // It DEPENDS on the published crate header (V46D-3).
+    assert!(
+        out.contains("\"/ws/target/debug/build/app/include/app.h\""),
+        "integration sidecar depends on the published crate header"
+    );
+    // The per-stem runner (OUTPUT = the itest runner TU, a source
+    // of the `app__itest__basic` target → anchor).
+    assert!(
+        out.contains("OUTPUT \"/ws/target/debug/cmake/cust_itest_main_app__basic.c\""),
+        "integration runner OUTPUT is the per-stem runner TU"
     );
 }
 

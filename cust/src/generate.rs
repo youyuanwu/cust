@@ -53,6 +53,13 @@ pub struct RewriteCtx<'a> {
     pub is_bin_half: bool,
     /// Whether the member has a lib half (gates the carve-out).
     pub has_lib: bool,
+    /// v0.4.6 V46D-3/RQ-V46-4: `true` when lowering an integration
+    /// test (`tests/<stem>.c`). Integration tests see the **public
+    /// surface only** (V43D-3): `#cust use crate::<m>;` is blanked
+    /// (no crate-private fragment access) and `#cust use <crate>;`
+    /// (the CUT itself) always lowers to the published `<crate>.h`
+    /// (own-crate carve-out, regardless of `is_bin_half`).
+    pub integration: bool,
 }
 
 /// Lower every `#cust use` directive in `ctx.source_path` to an
@@ -64,14 +71,26 @@ pub fn rewrite_one(ctx: &RewriteCtx<'_>) -> Result<()> {
         .with_context(|| format!("reading `{}`", ctx.source_path.display()))?;
     let scan = mod_scanner::scan(&src_text, ctx.source_path)?;
 
+    // The own-crate `#cust use <crate>;` carve-out fires for the
+    // bin half of a lib+bin crate (V43D) and for any integration
+    // test (V43D-3).
+    let own_crate_carveout = |name: &str| {
+        name == ctx.crate_name && (ctx.integration || (ctx.is_bin_half && ctx.has_lib))
+    };
+
     let rewritten =
         mod_scanner::rewrite_with(&src_text, ctx.source_path, &scan, |d| match &d.kind {
             DirectiveKind::UseCrate { name } => {
+                // V43D-3: integration tests get no crate-private
+                // module fragments — blank the include.
+                if ctx.integration {
+                    return None;
+                }
                 let frag = ctx.frags_dir.join(format!("{name}.cust.h"));
                 Some(format!("#include \"{}\"", frag.display()))
             }
             DirectiveKind::UseDep { name } => {
-                if ctx.is_bin_half && ctx.has_lib && name == ctx.crate_name {
+                if own_crate_carveout(name) {
                     return Some(format!("#include \"{}\"", ctx.own_lib_header.display()));
                 }
                 let dep_header = ctx
@@ -85,10 +104,11 @@ pub fn rewrite_one(ctx: &RewriteCtx<'_>) -> Result<()> {
         });
 
     // Validate `#cust use <name>;` resolves to a declared dep or
-    // the own-crate carve-out (bin half of lib+bin).
+    // the own-crate carve-out (bin half of lib+bin, or integration
+    // test).
     for d in &scan.directives {
         if let DirectiveKind::UseDep { name } = &d.kind {
-            if ctx.is_bin_half && ctx.has_lib && name == ctx.crate_name {
+            if own_crate_carveout(name) {
                 continue;
             }
             if !ctx.deps.iter().any(|n| n == name) {

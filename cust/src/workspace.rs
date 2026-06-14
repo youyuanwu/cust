@@ -675,16 +675,15 @@ pub fn build_workspace(
         return run_check_path(ws, &to_build, opts, &layout);
     }
 
-    // Build mode (V42D-16 + v0.4.5 V45D-10): the driver no longer
-    // runs `run_phase1` (surface pass) or the lib/bin rewrite pass
-    // here — those are now CMake custom commands (V45D-3/V45D-4),
-    // produced lazily by Ninja inside the single `cmake --build`.
-    // The residual per-member driver work (V45D-14(b)) is: write
-    // the integration-test rewrites (still driver-side this
-    // milestone, V45D-11 — their `add_executable` sources must
-    // exist at configure time), refresh the dep-publish symlink,
-    // and synthesise `BuildOutputs`. The prelude is materialised
-    // once up front (the surface commands `-include` it).
+    // Build mode (V42D-16 + v0.4.5 V45D-10 + v0.4.6 V46D-3): the
+    // driver no longer runs `run_phase1`, the lib/bin rewrite pass,
+    // **or** the integration-test rewrite pass here — all are now
+    // CMake custom commands (V45D-3/V45D-4 + V46D-3), produced
+    // lazily by Ninja inside the single `cmake --build`. The
+    // residual per-member driver work (V45D-14(b)) is: create the
+    // `build/<crate>/` dir, refresh the dep-publish symlink, and
+    // synthesise `BuildOutputs`. The prelude is materialised once
+    // up front (the surface commands `-include` it).
     build::ensure_prelude(&layout).context("materialising prelude")?;
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(ws.members.len());
     for m in &ws.members {
@@ -698,8 +697,6 @@ pub fn build_workspace(
         std::fs::create_dir_all(layout.build_dir(name))
             .with_context(|| format!("creating build dir for member `{name}`"))?;
         with_plan(ws, m, opts, |plan| {
-            build::write_rewrite_tree(plan)
-                .with_context(|| format!("writing rewrite tree for member `{name}`"))?;
             refresh_dep_symlink(&layout, &m.name, &m.root)
                 .with_context(|| format!("publishing dep view for `{name}`"))?;
             // Only report `per_member` entries for the
@@ -796,33 +793,48 @@ fn run_test_build_path(
     opts: &WorkspaceBuildOptions<'_>,
     layout: &TargetLayout,
 ) -> Result<WorkspaceBuildOutputs> {
-    // Phase 1 + rewrite tree + test runner TU for EVERY workspace
-    // member that has a lib half (V42D-13 single CMakeLists
-    // requires every referenced source to exist at configure
-    // time; we narrow which `<crate>__test` targets get BUILT
-    // via `--target` below). Members without a lib half are
-    // silently skipped per V32D-12.
+    // v0.4.6 V46D-3: every generated test artifact (unit + integration
+    // sidecars, runner TUs, integration rewrites) is now a CMake
+    // custom command, so the driver pre-pass collapses to the same
+    // residual work as the build/run path (V45D-14(b)): materialise
+    // the prelude, create each member's `build/<crate>/` dir, and
+    // refresh the dep-publish symlink. `run_phase1` stays for now —
+    // its eager fragments/header are redundant with the CMake
+    // commands but harmless (byte-skipped); slice D drops it and
+    // collapses this fully (V46D-5).
+    build::ensure_prelude(layout).context("materialising prelude")?;
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
     for m in &ws.members {
         let name = &m.name;
+        std::fs::create_dir_all(layout.build_dir(name))
+            .with_context(|| format!("creating build dir for member `{name}`"))?;
         with_plan(ws, m, opts, |plan| {
             build::run_phase1(plan).with_context(|| format!("phase 1 for member `{name}`"))?;
-            build::write_rewrite_tree(plan)
-                .with_context(|| format!("writing rewrite tree for member `{name}`"))?;
-            // v0.4.6 V46D-2: the unit runner TU is now produced by
-            // the `cust internal test-runner` CMake command (its
-            // OUTPUT is a SOURCE of the `<crate>__test` target). The
-            // driver only needs the exe *path* for the runner to
-            // spawn — `None` for bin-only members (V32D-12).
+            refresh_dep_symlink(layout, &m.name, &m.root)
+                .with_context(|| format!("publishing dep view for `{name}`"))?;
+            // v0.4.6 V46D-2/V46D-3: the unit + integration runner
+            // TUs are now produced by `cust internal test-runner`
+            // CMake commands (their OUTPUTs are SOURCEs of the
+            // `<crate>__test` / `<crate>__itest__<stem>` targets).
+            // The driver only needs the exe *paths* for the runner
+            // to spawn — `None`/empty for bin-only members (V32D-12).
+            let crate_name = plan.manifest.package_name();
             let test_exe = plan
                 .kind
                 .has_lib()
-                .then(|| layout.test_executable_path(plan.manifest.package_name()));
-            // v0.4.3 V43D-5: integration runner TUs (surface
-            // pass each `tests/<stem>.c`, render its runner).
-            // Still driver-side this slice (V46D-3 / slice C).
-            let itests = build::write_integration_runner_tus(plan)
-                .with_context(|| format!("writing integration runner TUs for `{name}`"))?;
+                .then(|| layout.test_executable_path(crate_name));
+            let itests: Vec<build::IntegrationTestOutput> = if plan.kind.has_lib() {
+                plan.integration_tests
+                    .iter()
+                    .map(|it| build::IntegrationTestOutput {
+                        stem: it.stem.clone(),
+                        source_label: format!("tests/{}.c", it.stem),
+                        exe: layout.integration_test_executable_path(crate_name, &it.stem),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Only report `per_member` for members the caller
             // asked about — siblings outside `-p` scope are
             // built but stay silent (matches `cust build`

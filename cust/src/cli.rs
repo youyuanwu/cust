@@ -121,6 +121,12 @@ pub struct RewriteFileArgs {
     /// Whether the member has a lib half (gates the carve-out).
     #[arg(long)]
     pub has_lib: bool,
+    /// v0.4.6 V46D-3/RQ-V46-4: lowering an integration test
+    /// (`tests/<stem>.c`). Blanks `#cust use crate::<m>;` and
+    /// always treats `#cust use <crate>;` as the own-crate
+    /// carve-out (V43D-3).
+    #[arg(long)]
+    pub integration: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -242,6 +248,10 @@ pub struct TestSidecarArgs {
     /// arg). Ignored for `--kind integration`.
     #[arg(long)]
     pub module: Option<String>,
+    /// Integration only: the test file stem (diagnostics only —
+    /// the leaf uses `module = lib`). Ignored for `--kind unit`.
+    #[arg(long)]
+    pub stem: Option<String>,
     /// The TU to surface-pass: the original `src/**.c` (unit) or
     /// the rewritten `.rewrite/<crate>/tests/<stem>.c`
     /// (integration).
@@ -254,12 +264,15 @@ pub struct TestSidecarArgs {
     /// created — empty when the plugin finds no tests).
     #[arg(long)]
     pub sidecar_out: PathBuf,
-    /// `target/<profile>/.h-fragments/<crate>/` (unit lowering).
+    /// `target/<profile>/.h-fragments/<crate>/` (unit lowering;
+    /// omitted for `--kind integration`, which is already
+    /// rewritten).
     #[arg(long)]
-    pub frags_dir: PathBuf,
-    /// `target/<profile>/deps/` (unit lowering).
+    pub frags_dir: Option<PathBuf>,
+    /// `target/<profile>/deps/` (unit lowering; omitted for
+    /// `--kind integration`).
     #[arg(long)]
-    pub deps_root: PathBuf,
+    pub deps_root: Option<PathBuf>,
     /// Dep crate names the unit module may `#cust use <dep>;`.
     #[arg(long = "dep")]
     pub deps: Vec<String>,
@@ -660,6 +673,7 @@ fn run_internal(cmd: InternalCmd) -> Result<()> {
                 deps: &deps,
                 is_bin_half: a.bin_half,
                 has_lib: a.has_lib,
+                integration: a.integration,
             };
             crate::generate::rewrite_one(&ctx)
         }
@@ -773,12 +787,17 @@ fn run_test_sidecar(a: TestSidecarArgs) -> Result<()> {
     );
 
     let deps: Vec<&str> = a.deps.iter().map(String::as_str).collect();
+    // Unit lowering needs the fragment + deps roots; integration is
+    // already rewritten (`surface_out` is `None`), so default the
+    // omitted dirs to empty paths — `sidecar_one` ignores them.
+    let frags_dir = a.frags_dir.unwrap_or_default();
+    let deps_root = a.deps_root.unwrap_or_default();
     let ctx = crate::generate::SidecarCtx {
         source_path: &a.source,
         surface_out: a.surface_out.as_deref(),
         sidecar_out: &a.sidecar_out,
-        frags_dir: &a.frags_dir,
-        deps_root: &a.deps_root,
+        frags_dir: &frags_dir,
+        deps_root: &deps_root,
         deps: &deps,
     };
     crate::generate::sidecar_one(&ctx, &clang, &base_cflags)

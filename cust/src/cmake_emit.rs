@@ -216,6 +216,18 @@ pub struct MemberView {
     /// otherwise. Its `OUTPUT` is a SOURCE of the `<crate>__test`
     /// target (the anchor, V46D-4).
     pub test_runner: Option<TestRunnerCommand>,
+    /// v0.4.6 V46D-3: one `cust internal test-sidecar --kind
+    /// integration` command per `tests/<stem>.c`. Empty for members
+    /// without integration tests. Anchored (indirectly) by the
+    /// per-stem integration `test-runner` whose runner-TU `OUTPUT`
+    /// is a SOURCE of `<crate>__itest__<stem>` (V46D-4).
+    pub integration_test_sidecars: Vec<IntegrationTestSidecarCommand>,
+    /// v0.4.6 V46D-3: one `cust internal test-runner` command per
+    /// `tests/<stem>.c`, rendering
+    /// `cust_itest_main_<crate>__<stem>.c` from that stem's single
+    /// integration sidecar. Empty for members without integration
+    /// tests.
+    pub integration_test_runners: Vec<TestRunnerCommand>,
 }
 
 /// v0.4.5 V45D-3: one `cust internal rewrite-file` invocation,
@@ -243,6 +255,10 @@ pub struct RewriteCommand {
     pub is_bin_half: bool,
     /// `--has-lib`: the member has a library half.
     pub has_lib: bool,
+    /// `--integration` (v0.4.6 V46D-3/RQ-V46-4): lowering an
+    /// integration test (`tests/<stem>.c`). `false` for lib/bin
+    /// sources.
+    pub integration: bool,
 }
 
 /// v0.4.5 V45D-4: one `cust internal surface-module` invocation,
@@ -420,6 +436,44 @@ pub struct TestRunnerCommand {
     /// order (matches the in-process `write_test_runner_tu` test
     /// ordering) — also the command's `DEPENDS`.
     pub sidecars: Vec<PathBuf>,
+}
+
+/// v0.4.6 V46D-3: one `cust internal test-sidecar --kind
+/// integration` invocation for one `tests/<stem>.c`. The emitter
+/// lowers it to an `add_custom_command(OUTPUT <sidecar_out> …
+/// DEPENDS …)`. Reached only via the per-stem `test-runner`
+/// command (whose runner-TU `OUTPUT` is a SOURCE of the
+/// `<crate>__itest__<stem>` target — the anchor, V46D-4), so
+/// `cust build` never fires it.
+#[derive(Debug, Clone)]
+pub struct IntegrationTestSidecarCommand {
+    /// `--crate-name`.
+    pub crate_name: String,
+    /// `--stem`: the test file stem (diagnostics only — the leaf
+    /// uses `module = lib` so the runner renders bare test names).
+    pub stem: String,
+    /// `--source`: the **rewritten** `.rewrite/<crate>/tests/<stem>.c`
+    /// (a `rewrite-file` `OUTPUT` — already `#cust use`-lowered).
+    pub source: PathBuf,
+    /// `--sidecar-out`: the produced `.cust.tests` sidecar — also
+    /// the command's sole `OUTPUT`.
+    pub sidecar_out: PathBuf,
+    /// `--std <value>`.
+    pub std: String,
+    /// `--cflag <f>`: mid cflags (profile + `[clang] extra-cflags`);
+    /// the leaf adds `-DCUST_TEST_BUILD=1` (V46D-1).
+    pub cflags: Vec<String>,
+    /// `--prelude`: the materialised prelude header.
+    pub prelude: PathBuf,
+    /// `--plugin`: the cust clang plugin `.so` (also a `DEPENDS`).
+    /// `None` only in plugin-less test environments.
+    pub plugin: Option<PathBuf>,
+    /// `DEPENDS`: the published crate-header `OUTPUT`s the
+    /// integration TU `#include`s — the CUT's own `<crate>.h`
+    /// followed by each declared dep's `<dep>.h` (V46D-3), sorted
+    /// (V45D-15). The rewritten `--source` and `--plugin` are
+    /// `DEPENDS` too (emitted separately).
+    pub header_deps: Vec<PathBuf>,
 }
 
 /// v0.4.4 V44D-5: one binary target. A member emits one
@@ -600,6 +654,8 @@ pub fn generate(view: &WorkspaceView) -> String {
             emit_test_runner_command(&mut out, &view.cust_exe, m);
             emit_test_executable(&mut out, m, t);
         }
+        emit_integration_test_sidecar_commands(&mut out, &view.cust_exe, m);
+        emit_integration_test_runner_commands(&mut out, &view.cust_exe, m);
         for it in &m.integration_tests {
             emit_integration_test_executable(&mut out, m, it);
         }
@@ -655,6 +711,9 @@ fn emit_rewrite_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
         }
         if rw.has_lib {
             out.push_str("            --has-lib\n");
+        }
+        if rw.integration {
+            out.push_str("            --integration\n");
         }
         let _ = writeln!(out, "    DEPENDS \"{}\"", rw.origin.display());
         out.push_str("    VERBATIM)\n");
@@ -941,6 +1000,13 @@ fn emit_test_runner_command(out: &mut String, cust_exe: &Path, m: &MemberView) {
     };
     out.push('\n');
     let _ = writeln!(out, "# ---- crate: {} (test runner TU) ----", m.name);
+    emit_runner_command(out, cust_exe, tr);
+}
+
+/// Shared `internal test-runner` `add_custom_command` body (unit
+/// and integration, V46D-2/V46D-3). `OUTPUT` = the runner TU,
+/// `DEPENDS` = its sidecar(s).
+fn emit_runner_command(out: &mut String, cust_exe: &Path, tr: &TestRunnerCommand) {
     out.push_str("add_custom_command(\n");
     let _ = writeln!(out, "    OUTPUT \"{}\"", tr.out.display());
     let _ = writeln!(
@@ -962,6 +1028,78 @@ fn emit_test_runner_command(out: &mut String, cust_exe: &Path, m: &MemberView) {
         }
     }
     out.push_str("    VERBATIM)\n");
+}
+
+/// v0.4.6 V46D-3: emit one `cust internal test-sidecar --kind
+/// integration` command per `tests/<stem>.c`. `OUTPUT` is the
+/// stem's `.cust.tests` sidecar; `DEPENDS` are the rewritten test
+/// source + plugin + the published crate-header(s) the TU
+/// `#include`s (V46D-7 — the integration TU sees the public
+/// surface, not fragments). Anchored via the integration
+/// `test-runner` → `<crate>__itest__<stem>` chain (V46D-4).
+fn emit_integration_test_sidecar_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    if m.integration_test_sidecars.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# ---- crate: {} (integration test-discovery sidecars) ----",
+        m.name
+    );
+    for sc in &m.integration_test_sidecars {
+        out.push_str("add_custom_command(\n");
+        let _ = writeln!(out, "    OUTPUT \"{}\"", sc.sidecar_out.display());
+        let _ = writeln!(
+            out,
+            "    COMMAND \"{}\" internal test-sidecar",
+            cust_exe.display()
+        );
+        let _ = writeln!(out, "            --crate-name {}", sc.crate_name);
+        out.push_str("            --kind integration\n");
+        let _ = writeln!(out, "            --stem {}", sc.stem);
+        let _ = writeln!(out, "            --source \"{}\"", sc.source.display());
+        let _ = writeln!(
+            out,
+            "            --sidecar-out \"{}\"",
+            sc.sidecar_out.display()
+        );
+        let _ = writeln!(out, "            --std {}", sc.std);
+        for cflag in &sc.cflags {
+            let _ = writeln!(out, "            --cflag \"{cflag}\"");
+        }
+        let _ = writeln!(out, "            --prelude \"{}\"", sc.prelude.display());
+        if let Some(plugin) = &sc.plugin {
+            let _ = writeln!(out, "            --plugin \"{}\"", plugin.display());
+        }
+        let _ = writeln!(out, "    DEPENDS \"{}\"", sc.source.display());
+        if let Some(plugin) = &sc.plugin {
+            let _ = writeln!(out, "            \"{}\"", plugin.display());
+        }
+        for hdr in &sc.header_deps {
+            let _ = writeln!(out, "            \"{}\"", hdr.display());
+        }
+        out.push_str("    VERBATIM)\n");
+    }
+}
+
+/// v0.4.6 V46D-3: emit one per-stem `cust internal test-runner`
+/// command. Each `OUTPUT` (`cust_itest_main_<crate>__<stem>.c`) is
+/// a SOURCE of the `<crate>__itest__<stem>` target (the anchor,
+/// V46D-4).
+fn emit_integration_test_runner_commands(out: &mut String, cust_exe: &Path, m: &MemberView) {
+    if m.integration_test_runners.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# ---- crate: {} (integration test runner TUs) ----",
+        m.name
+    );
+    for tr in &m.integration_test_runners {
+        emit_runner_command(out, cust_exe, tr);
+    }
 }
 
 fn emit_library(out: &mut String, m: &MemberView) {
@@ -1702,16 +1840,27 @@ pub fn collect_view(
         let test_target =
             collect_test_target(m, kind, &lib_sources, &compile_options, &cmake_dir, &layout);
 
-        // v0.4.3 V43D-5: one integration-test target per
-        // `tests/<stem>.c`. Only members with a lib half get
-        // them (V43D-3: integration tests link `lib<crate>.a`);
-        // bin-only members' `integration_tests` are dropped here
-        // the same way `test_target` is `None` for them.
-        let integration_tests = if kind.has_lib() {
-            collect_integration_test_views(m, &compile_options, &rewrite_root, &cmake_dir, &layout)
-        } else {
-            Vec::new()
-        };
+        // v0.4.3 V43D-5 + v0.4.6 V46D-3: integration-test exe
+        // targets + their `rewrite-file` / `test-sidecar` /
+        // `test-runner` commands, one set per `tests/<stem>.c`.
+        // Only members with a lib half get them (V43D-3); bin-only
+        // members' `integration_tests` are dropped here the same
+        // way `test_target` is `None` for them.
+        let (integration_tests, integration_test_sidecars, integration_test_runners) =
+            if kind.has_lib() {
+                let ia = collect_integration_artifacts(
+                    m,
+                    &gen_ctx,
+                    &compile_options,
+                    &rewrite_root,
+                    &cmake_dir,
+                    &layout,
+                );
+                rewrites.extend(ia.rewrites);
+                (ia.views, ia.sidecars, ia.runners)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         members.push(MemberView {
             name: m.name.clone(),
@@ -1736,6 +1885,8 @@ pub fn collect_view(
             crate_header,
             test_sidecars,
             test_runner,
+            integration_test_sidecars,
+            integration_test_runners,
         });
     }
 
@@ -1795,23 +1946,40 @@ fn collect_test_target(
     })
 }
 
-/// v0.4.3 V43D-5: build the `IntegrationTestView`s for one
-/// lib-bearing workspace member. One view per `tests/<stem>.c`,
-/// in the member's already-sorted-by-stem order (V43D-1).
+/// v0.4.6 V46D-3: the integration-test contribution to a member's
+/// `MemberView` — the exe targets plus the `rewrite-file` /
+/// `test-sidecar` / `test-runner` custom commands that feed them.
+/// Returned by [`collect_integration_artifacts`].
+struct IntegrationArtifacts {
+    views: Vec<IntegrationTestView>,
+    rewrites: Vec<RewriteCommand>,
+    sidecars: Vec<IntegrationTestSidecarCommand>,
+    runners: Vec<TestRunnerCommand>,
+}
+
+/// v0.4.3 V43D-5 + v0.4.6 V46D-3/RQ-V46-4: build the integration
+/// test artifacts for one lib-bearing workspace member. One set per
+/// `tests/<stem>.c`, in the member's already-sorted-by-stem order
+/// (V43D-1):
 ///
-/// Each view's sources are the rewritten `tests/<stem>.c` (under
-/// `.rewrite/<crate>/tests/`) plus the runner TU
-/// (`cmake_dir/cust_itest_main_<crate>__<stem>.c`); the CUT's lib
-/// sources are NOT recompiled (V43D-3 — they arrive via the
-/// `lib<crate>.a` link). `compile_options` are the member's plus
-/// `-DCUST_TEST_BUILD=1`.
-fn collect_integration_test_views(
+/// * an `IntegrationTestView` (the `<crate>__itest__<stem>` exe —
+///   sources are the rewritten `tests/<stem>.c` + the runner TU,
+///   both custom-command outputs that anchor the chain);
+/// * a `RewriteCommand` (`--integration`) producing the rewritten
+///   source (completes V45D-3 — integration rewrites were the last
+///   driver-side rewrite);
+/// * an `IntegrationTestSidecarCommand` (surface-passes the
+///   rewritten TU → its `.cust.tests` sidecar);
+/// * a per-stem `TestRunnerCommand` (renders the runner TU from
+///   that sidecar).
+fn collect_integration_artifacts(
     m: &Member,
+    gen_ctx: &MemberGenCtx,
     compile_options: &[String],
     rewrite_root: &Path,
     cmake_dir: &Path,
     layout: &TargetLayout,
-) -> Vec<IntegrationTestView> {
+) -> IntegrationArtifacts {
     let include_dir = layout
         .crate_header_path(&m.name)
         .parent()
@@ -1819,38 +1987,89 @@ fn collect_integration_test_views(
         .to_path_buf();
     let mut itest_opts = compile_options.to_vec();
     itest_opts.push("-DCUST_TEST_BUILD=1".to_string());
-    m.integration_tests
-        .iter()
-        .map(|it| {
-            // Rewritten test source mirrors the lib sources'
-            // `.rewrite/<crate>/<rel>` scheme; <rel> is
-            // `tests/<stem>.c`.
-            let rel = it.source.strip_prefix(&m.root).unwrap_or(&it.source);
-            let rewritten = rewrite_root.join(&m.name).join(rel);
-            let runner_tu = cmake_dir.join(format!("cust_itest_main_{}__{}.c", m.name, it.stem));
-            IntegrationTestView {
-                target_name: format!("{}__itest__{}", m.name, it.stem),
-                output_name: it.stem.clone(),
-                sources: vec![
-                    SourceFile {
-                        path: rewritten,
-                        object_depends: Vec::new(),
-                    },
-                    SourceFile {
-                        path: runner_tu,
-                        object_depends: Vec::new(),
-                    },
-                ],
-                include_dirs: vec![include_dir.clone()],
-                // Link the CUT's own lib target; PUBLIC
-                // propagation pulls in its transitive workspace
-                // dep chain (V43D-3).
-                link_deps: vec![m.name.clone()],
-                compile_options: itest_opts.clone(),
-                runtime_output_dir: layout.integration_test_build_dir(&m.name, &it.stem),
-            }
-        })
-        .collect()
+
+    // V46D-3: the integration TU `#include`s the published surface
+    // — the CUT's own `<crate>.h` plus each declared dep's header.
+    // These are `DEPENDS` so Ninja produces them before surfacing
+    // the TU (V46D-7 — no fragments). Sorted (V45D-15).
+    let mut header_deps: Vec<PathBuf> = std::iter::once(layout.crate_header_path(&m.name))
+        .chain(gen_ctx.deps.iter().map(|d| layout.crate_header_path(d)))
+        .collect();
+    header_deps.sort();
+
+    let mut artifacts = IntegrationArtifacts {
+        views: Vec::with_capacity(m.integration_tests.len()),
+        rewrites: Vec::with_capacity(m.integration_tests.len()),
+        sidecars: Vec::with_capacity(m.integration_tests.len()),
+        runners: Vec::with_capacity(m.integration_tests.len()),
+    };
+
+    for it in &m.integration_tests {
+        // Rewritten test source mirrors the lib sources'
+        // `.rewrite/<crate>/<rel>` scheme; <rel> is `tests/<stem>.c`.
+        let rel = it.source.strip_prefix(&m.root).unwrap_or(&it.source);
+        let rewritten = rewrite_root.join(&m.name).join(rel);
+        let runner_tu = cmake_dir.join(format!("cust_itest_main_{}__{}.c", m.name, it.stem));
+        let sidecar_out =
+            layout.test_sidecar_path(&m.name, TestOrigin::Integration { stem: &it.stem });
+
+        // V45D-3 completion: the integration `rewrite-file` command.
+        artifacts.rewrites.push(RewriteCommand {
+            out: rewritten.clone(),
+            origin: it.source.clone(),
+            crate_name: m.name.clone(),
+            frags_dir: gen_ctx.frags_dir.clone(),
+            deps_root: gen_ctx.deps_root.clone(),
+            own_lib_header: gen_ctx.own_lib_header.clone(),
+            deps: gen_ctx.deps.clone(),
+            is_bin_half: false,
+            has_lib: true,
+            integration: true,
+        });
+
+        // V46D-3: the integration test-sidecar command.
+        artifacts.sidecars.push(IntegrationTestSidecarCommand {
+            crate_name: m.name.clone(),
+            stem: it.stem.clone(),
+            source: rewritten.clone(),
+            sidecar_out: sidecar_out.clone(),
+            std: gen_ctx.std.clone(),
+            cflags: gen_ctx.mid_cflags.clone(),
+            prelude: gen_ctx.prelude.clone(),
+            plugin: gen_ctx.plugin.clone(),
+            header_deps: header_deps.clone(),
+        });
+
+        // V46D-3: the per-stem test-runner command.
+        artifacts.runners.push(TestRunnerCommand {
+            crate_name: m.name.clone(),
+            out: runner_tu.clone(),
+            sidecars: vec![sidecar_out],
+        });
+
+        artifacts.views.push(IntegrationTestView {
+            target_name: format!("{}__itest__{}", m.name, it.stem),
+            output_name: it.stem.clone(),
+            sources: vec![
+                SourceFile {
+                    path: rewritten,
+                    object_depends: Vec::new(),
+                },
+                SourceFile {
+                    path: runner_tu,
+                    object_depends: Vec::new(),
+                },
+            ],
+            include_dirs: vec![include_dir.clone()],
+            // Link the CUT's own lib target; PUBLIC propagation
+            // pulls in its transitive workspace dep chain (V43D-3).
+            link_deps: vec![m.name.clone()],
+            compile_options: itest_opts.clone(),
+            runtime_output_dir: layout.integration_test_build_dir(&m.name, &it.stem),
+        });
+    }
+
+    artifacts
 }
 
 /// Build the per-target compile options for one member matching
@@ -2056,6 +2275,7 @@ fn collect_sources(
             deps: rw_ctx.deps.clone(),
             is_bin_half,
             has_lib: rw_ctx.has_lib,
+            integration: false,
         });
 
         // V45D-4/V45D-6: surface commands are emitted per SCC
@@ -2436,22 +2656,12 @@ pub fn emit_and_drive_cmake(
     let bytes = generate(&view).into_bytes();
     let outcome = write_if_changed(&cmakelists, &bytes, &stamp, view.plugin_path.as_deref())?;
 
-    // V42D-14: ensure every member's integration-test runner TU
-    // exists on disk before configure. CMake validates every
-    // `add_executable` source path at configure time even when the
-    // target is `EXCLUDE_FROM_ALL`, so a missing runner TU during
-    // `cust build` would fail configure. The build path doesn't
-    // need real runner content (the target is never built); a tiny
-    // stub is enough.
-    //
-    // v0.4.6 V46D-2: the *unit* runner TU
-    // (`cust_test_main_<crate>.c`) is now produced by the
-    // `cust internal test-runner` custom command, so CMake treats
-    // it as GENERATED and the stub for it is redundant (harmless —
-    // the command overwrites it). Integration runner TUs are still
-    // driver-generated (V46D-3 / slice C), so they still need the
-    // stub.
-    ensure_runner_tu_stubs(&view, &cmake_dir)?;
+    // v0.4.6 V46D-3: every generated test/runner/rewrite source is
+    // now a `cust internal …` custom-command `OUTPUT` (unit runner
+    // V46D-2; integration rewrite + runner V46D-3), so CMake marks
+    // them GENERATED and skips the configure-time existence check.
+    // The pre-configure runner-TU stubs the test path used to need
+    // (V42D-14) are therefore obsolete and have been removed.
 
     // Configure if the CMakeLists was just written OR there's no
     // existing CMake cache to reuse. Either condition forces a
@@ -2572,68 +2782,6 @@ fn target_names_for<'a>(
     // v0.4.4 V44D-5: every bin of the member.
     out.extend(m.bins.iter().map(|b| b.target_name.as_str()));
     out
-}
-
-/// V42D-14: ensure each member's runner TU exists on disk before
-/// `CMake` configure runs. `CMake` validates every
-/// `add_executable` source path at configure time even for
-/// `EXCLUDE_FROM_ALL` targets, so a missing runner TU would fail
-/// configure during `cust build`.
-///
-/// v0.4.6 V46D-2: the unit runner TU (`cust_test_main_<crate>.c`)
-/// is now a `cust internal test-runner` custom-command OUTPUT, so
-/// `CMake` knows it is GENERATED and won't validate its existence
-/// — the stub written here for it is harmless redundancy (the
-/// command overwrites it on the test build). The integration
-/// runner TUs (`cust_itest_main_<crate>__<stem>.c`) are still
-/// driver-generated (V46D-3 / slice C) and genuinely need the
-/// stub.
-///
-/// Idempotent + cheap: stubs are only written when the runner
-/// TU file is missing, and the stub content is small enough
-/// that any subsequent `write_if_byte_different` from the test
-/// path or the Ninja command always replaces it.
-fn ensure_runner_tu_stubs(view: &WorkspaceView, cmake_dir: &Path) -> Result<()> {
-    const STUB: &[u8] = b"/* @generated by cust \xe2\x80\x94 build-mode stub.\n\
- * The real runner is rendered by the `cust internal test-runner`\n\
- * custom command (unit) or `cust test`'s driver path (integration)\n\
- * before this target is built; see cust/src/test_runner.rs.\n\
- */\n";
-    for m in &view.members {
-        let Some(t) = &m.test_target else { continue };
-        // The runner TU is the only source under `cmake_dir/`
-        // (the lib sources all live under `.rewrite/<crate>/`).
-        for src in &t.sources {
-            if src.path.starts_with(cmake_dir) && !src.path.is_file() {
-                if let Some(parent) = src.path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("creating `{}`", parent.display()))?;
-                }
-                fs::write(&src.path, STUB)
-                    .with_context(|| format!("writing runner stub `{}`", src.path.display()))?;
-            }
-        }
-    }
-    // v0.4.3 V43D-5: same treatment for each integration-test
-    // exe's runner TU (`cust_itest_main_<crate>__<stem>.c`,
-    // under `cmake_dir/`). The rewritten `tests/<stem>.c` source
-    // lives under `.rewrite/<crate>/tests/` and is materialised
-    // by the test path (Slice C), not stubbed here.
-    for m in &view.members {
-        for it in &m.integration_tests {
-            for src in &it.sources {
-                if src.path.starts_with(cmake_dir) && !src.path.is_file() {
-                    if let Some(parent) = src.path.parent() {
-                        fs::create_dir_all(parent)
-                            .with_context(|| format!("creating `{}`", parent.display()))?;
-                    }
-                    fs::write(&src.path, STUB)
-                        .with_context(|| format!("writing runner stub `{}`", src.path.display()))?;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Publish `CMake`'s `compile_commands.json` at both the canonical
