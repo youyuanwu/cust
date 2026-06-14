@@ -696,7 +696,7 @@ pub fn build_workspace(
         // `cmake --build` runs.
         std::fs::create_dir_all(layout.build_dir(name))
             .with_context(|| format!("creating build dir for member `{name}`"))?;
-        with_plan(ws, m, opts, |plan| {
+        with_plan(m, |plan| {
             refresh_dep_symlink(&layout, &m.name, &m.root)
                 .with_context(|| format!("publishing dep view for `{name}`"))?;
             // Only report `per_member` entries for the
@@ -775,27 +775,23 @@ fn run_check_path(
             std::fs::create_dir_all(layout.check_dir(name))
                 .with_context(|| format!("creating check dir for member `{name}`"))?;
         }
-        with_plan(ws, m, opts, |plan| {
-            let _ = plan;
-            refresh_dep_symlink(layout, &m.name, &m.root)
-                .with_context(|| format!("publishing dep view for `{name}`"))?;
-            // Report only the `-p`-scoped subset (matches build/run
-            // shape — siblings outside scope stay silent).
-            if to_build.iter().any(|n| n == name) {
-                per_member.push((
-                    name.clone(),
-                    BuildOutputs {
-                        objects: Vec::new(),
-                        archive: None,
-                        executables: Vec::new(),
-                        test_executable: None,
-                        integration_tests: Vec::new(),
-                        compile_commands: layout.target_root.join("compile_commands.json"),
-                    },
-                ));
-            }
-            Ok(())
-        })?;
+        refresh_dep_symlink(layout, &m.name, &m.root)
+            .with_context(|| format!("publishing dep view for `{name}`"))?;
+        // Report only the `-p`-scoped subset (matches build/run
+        // shape — siblings outside scope stay silent).
+        if to_build.iter().any(|n| n == name) {
+            per_member.push((
+                name.clone(),
+                BuildOutputs {
+                    objects: Vec::new(),
+                    archive: None,
+                    executables: Vec::new(),
+                    test_executable: None,
+                    integration_tests: Vec::new(),
+                    compile_commands: layout.target_root.join("compile_commands.json"),
+                },
+            ));
+        }
     }
 
     // CHK-D-4/CHK-D-10: `-p` on a lib-less member checks nothing —
@@ -867,7 +863,7 @@ fn run_test_build_path(
         let name = &m.name;
         std::fs::create_dir_all(layout.build_dir(name))
             .with_context(|| format!("creating build dir for member `{name}`"))?;
-        with_plan(ws, m, opts, |plan| {
+        with_plan(m, |plan| {
             refresh_dep_symlink(layout, &m.name, &m.root)
                 .with_context(|| format!("publishing dep view for `{name}`"))?;
             // v0.4.6 V46D-2/V46D-3: the unit + integration runner
@@ -928,28 +924,14 @@ fn run_test_build_path(
 }
 
 /// Construct a per-member `BuildPlan` for the duration of `f`.
-/// Owns the dep / transitive-link Vecs locally so the plan's
-/// `&[&str]` slices stay valid; the closure shape avoids leaking
-/// the temporaries past the call site (`BuildPlan` is `&'a`-heavy
-/// and refactoring it to own its slices is a slice-C job).
-fn with_plan<R>(
-    ws: &Workspace,
-    m: &Member,
-    opts: &WorkspaceBuildOptions<'_>,
-    f: impl FnOnce(&BuildPlan<'_>) -> Result<R>,
-) -> Result<R> {
-    let dep_strs: Vec<&str> = m.deps.iter().map(String::as_str).collect();
-
+/// Since the incremental-check milestone the driver runs no
+/// per-member surface/check pass, so `BuildPlan` shrank to the
+/// `manifest` / `kind` / `integration_tests` the residual
+/// `BuildOutputs` synthesis still reads.
+fn with_plan<R>(m: &Member, f: impl FnOnce(&BuildPlan<'_>) -> Result<R>) -> Result<R> {
     let plan = BuildPlan {
         manifest: &m.manifest,
-        crate_root: &m.root,
-        workspace_root: &ws.root,
-        profile_kind: opts.profile_kind,
-        clang: opts.clang,
-        plugin: opts.plugin,
-        deps: &dep_strs,
         kind: m.kind.clone(),
-        test_build: opts.test_build,
         integration_tests: &m.integration_tests,
     };
     f(&plan)

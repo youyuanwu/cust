@@ -1,6 +1,7 @@
 # cust — CMake-owned incremental `cust check` (direct-clang check pass + per-module check stamps)
 
-**Status:** 📝 **draft** (opened 2026-06-14).
+**Status:** ✅ **shipped** (opened 2026-06-14; landed 2026-06-14,
+slices A–E).
 **Parent doc:** [cust-design.md §17 roadmap](cust-design.md).
 **Belongs to milestone:** *unscheduled candidate.* The v0.4.7
 slot is taken by the dependency resolver + registry; this work
@@ -669,8 +670,46 @@ Same A→E cadence as v0.4.2 … v0.4.6:
 | **D** | Incrementality + isolation properties. No-op check = 0 spawns (CHK-D-7, via the chosen Ninja "no work" / clang-spawn probe), single-module incrementality (CHK-D-8), `cust build` fires zero check work (CHK-D-4 / verification item 5), the injected-error regression hardened (CHK-D-1 / verification item 1). |
 | **E** | Cleanup + docs closeout + dogfood (CHK-D-9). Delete `run_phase1` outright once nothing calls it (the test path dropped it in v0.4.6; check is its last caller). Verify §6 scenarios against cwork. Flip this file's status to shipped; patch cust-design.md §17 + §10 (check is no longer tolerant) + the V42D-15 / V44D-9 cross-references. |
 
-Slice-by-slice deltas + commit hashes land here once the slices
-ship, in the "Shipped deltas" shape v0.4.3 … v0.4.6 use.
+### Shipped deltas
+
+* **Slice A** (`aa07fe5`): `TargetLayout::check_dir` /
+  `check_stamp_path` (`target/<profile>/.check/<crate>/`);
+  `CheckCommand` struct + `MemberView.check_commands` populated per
+  lib module in `collect_sources` via `check_command_for`;
+  `build_check_argv` (the lib target's `compile_options` + explicit
+  `-std=` + bare `-fplugin` + `-fsyntax-only` + the `.rewrite` TU).
+  Tests: explicit-`-std` guard, a drift guard recovering
+  `build_member_compile_options` from the argv, and the
+  `None`-plugin → zero-command rule. No emitter / driver change.
+* **Slice B** (`bc53f52`): `emit_check_commands` (two-`COMMAND`
+  `add_custom_command` — direct `${CMAKE_C_COMPILER}`
+  `-fsyntax-only` then `${CMAKE_COMMAND} -E touch`) + per-member
+  `cust_check_<member>` targets + the `cust_check` umbrella, all
+  `EXCLUDE_FROM_ALL`. Golden `cwork.cmake` gained the check block +
+  targets (pure addition). Still emitted-not-driven.
+* **Slice C** (`a0519d1`): `run_check_path` rewritten to emit +
+  configure + `cmake --build --target cust_check` (or
+  `cust_check_<m>` under `-p`); `DriveOptions.check_build`;
+  `emit_check_umbrella` also wires each member's check target to its
+  lib deps' check targets (so `-p` checks the transitive lib
+  closure). `run_phase1`'s last caller removed. Integration test
+  `check_fails_on_type_error` (CHK-D-1). Verified on cwork:
+  cold/no-op/injected-error/revert.
+* **Slice D** (`881553e`): verification tests
+  `check_noop_does_no_work` (CHK-D-7),
+  `check_single_module_incrementality` (CHK-D-8), and
+  `build_fires_no_check_work` (CHK-D-4) over the `multi_module`
+  fixture.
+* **Slice E** (this commit): `run_phase1` deleted outright, with its
+  now-orphaned callees (`surface_pass_fixed_point`,
+  `build_surface_units`, `write_crate_header`) and the dead
+  `build_cflags` `BuildPlan` wrapper. `BuildPlan` shrank to
+  `manifest` / `kind` / `integration_tests`; `with_plan` simplified;
+  the check path no longer threads a `BuildPlan`. `ResolvedProfile`
+  lost its write-only `kind` field. cust-design.md §10/§17 +
+  V42D-15 / V44D-9 cross-references updated. This is the clean
+  signal that **every** generation/validation step is now a CMake
+  custom command — no driver-side pre-pass remains.
 
 ---
 

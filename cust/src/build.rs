@@ -21,58 +21,34 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::{
     clang::Clang,
     manifest::{CrateKind, Manifest},
-    modules::{self, Module},
+    modules::Module,
     plugin::Plugin,
-    profile::{ProfileKind, ResolvedProfile},
-    target_layout::{TargetLayout, TestOrigin},
+    target_layout::TargetLayout,
 };
 
-/// Inputs handed to driver entry points by the CLI layer.
+/// Inputs handed to the residual CMake-path prebuild by the
+/// workspace orchestrator. Since the incremental-check milestone
+/// (slice E) every generation/validation step is a `CMake` custom
+/// command, so the driver no longer runs any per-member surface or
+/// check pass — this carrier shrank to just what
+/// [`cmake_outputs_for`] and the test-build path's `BuildOutputs`
+/// synthesis still read.
 pub struct BuildPlan<'a> {
     pub manifest: &'a Manifest,
-    pub crate_root: &'a Path,
-    pub workspace_root: &'a Path,
-    pub profile_kind: ProfileKind,
-    pub clang: &'a Clang,
-    /// Discovered cust clang plugin, when present. v0.2 treats
-    /// "plugin missing" as a silent skip — the v0.1 plugin-less
-    /// code path still works for single-module / no-cross-import
-    /// crates.
-    pub plugin: Option<&'a Plugin>,
-    /// Names of dep crates this consumer is allowed to import via
-    /// `#cust use <name>;` (V3D-6). Validated against the
-    /// scanner's `UseDep` directives. Empty for a crate that
-    /// declares no `[dependencies]`. The workspace orchestrator
-    /// populates this from the resolved edge list.
-    pub deps: &'a [&'a str],
     /// What this crate produces (lib / bin / lib+bin). Computed
     /// by `Manifest::resolve_kind` at the workspace orchestrator
     /// (or CLI) layer.
     pub kind: CrateKind,
-    /// v0.3.2 (V32D-2 / V32D-3): when `true`, the lib half is
-    /// compiled with `-DCUST_TEST_BUILD=1` into a fresh
-    /// `target/<profile>/test/<crate>/` tree, the driver pre-pass
-    /// test scanner runs over every module, a generated
-    /// `cust_test_main.c` runner is concatenated + compiled, and
-    /// everything is linked into a test executable at
-    /// `target/<profile>/test/<crate>/<crate>`. The bin half is
-    /// **skipped** (V32D-11 — v0.3.2 only tests the library
-    /// half). No archive, no crate header, no
-    /// `compile_commands.json`, no `.cust-version` are emitted
-    /// in this mode (the non-test `cust build` owns those).
-    /// Ignored when `syntax_only` is true.
-    pub test_build: bool,
     /// v0.4.3 V43D-5: integration tests discovered under
-    /// `<crate>/tests/*.c` (one per file). Used in test-build
-    /// mode to rewrite + surface-pass + generate a runner TU per
-    /// file; also rewritten in build mode so the `CMakeLists`
-    /// `add_executable` source paths exist at configure time.
-    /// Empty for members without a `tests/` dir.
+    /// `<crate>/tests/*.c` (one per file). The test-build path
+    /// reads these to synthesise each `tests/<stem>.c` exe's
+    /// `IntegrationTestOutput`. Empty for members without a
+    /// `tests/` dir.
     pub integration_tests: &'a [crate::workspace::IntegrationTest],
 }
 
@@ -121,71 +97,14 @@ pub struct IntegrationTestOutput {
 
 // ─── v0.4.2 slice B: driver-side prebuild for the CMake path ─────
 //
-// Slice B (V42D-16) moves phase-2 codegen + link into CMake. The
-// driver still owns phase 1 (surface pass + crate header concat)
-// per V42D-2, plus the `#cust use` rewriting to disk so CMake has
-// post-rewrite sources to compile (V42D-13 layout —
-// `target/<profile>/.rewrite/<crate>/<rel>.c`). The two helpers
-// below are the entry points `workspace::build_workspace` calls
-// from the build / check paths.
-
-/// Run phase 1 for one workspace member: materialise prelude,
-/// surface-pass fixed-point over the lib half (if the plugin is
-/// loaded), concatenate the user-facing `<crate>.h`. Idempotent;
-/// safe to call before every `cmake --build` (V42D-17 — the
-/// driver owns fragment freshness).
-///
-/// Bin-half modules are NOT surface-passed because nothing reads
-/// their surface (bin has no downstream consumers). Matches the
-/// existing v0.4.0 behaviour.
-///
-/// incremental-check slice C: the check path stopped calling this
-/// (check is now a CMake-owned pass), leaving it without any
-/// caller. The function is deleted outright in slice E; the
-/// `allow` keeps `-D warnings` green in the interim.
-#[allow(dead_code)] // last caller removed in slice C; deleted in slice E
-pub fn run_phase1(plan: &BuildPlan<'_>) -> Result<()> {
-    let profile_override = match plan.profile_kind {
-        ProfileKind::Dev => plan.manifest.profile.dev.as_ref(),
-        ProfileKind::Release => plan.manifest.profile.release.as_ref(),
-    };
-    let profile = ResolvedProfile::resolve(plan.profile_kind, profile_override)?;
-    let layout = TargetLayout::for_workspace(plan.workspace_root, profile.kind);
-    layout.ensure_dirs()?;
-
-    let prelude_path = layout.prelude_path();
-    materialise_prelude(&prelude_path)?;
-
-    let crate_name = plan.manifest.package_name();
-    let crate_build_dir = layout.build_dir(crate_name);
-    fs::create_dir_all(&crate_build_dir)
-        .with_context(|| format!("creating `{}`", crate_build_dir.display()))?;
-
-    if let Some(lib_src) = plan.kind.lib_source() {
-        if !lib_src.is_file() {
-            bail!(
-                "library source `{}` not found (set `[lib] path` in Cust.toml to override)",
-                lib_src.display()
-            );
-        }
-        let lib_modules =
-            modules::discover(plan.crate_root, lib_src).context("discovering lib module graph")?;
-        if plan.plugin.is_some() {
-            surface_pass_fixed_point(
-                plan,
-                &profile,
-                &prelude_path,
-                &crate_build_dir,
-                &layout,
-                &lib_modules,
-            )?;
-            write_crate_header(&layout, crate_name, &lib_modules)?;
-        }
-    }
-    // No surface pass on the bin half (nothing downstream
-    // consumes bin module surfaces).
-    Ok(())
-}
+// Slice B (V42D-16) moves phase-2 codegen + link into CMake. As of
+// the incremental-check milestone (slice E) the driver no longer
+// runs *any* surface/check pre-pass: every generation + validation
+// step is a CMake custom command (rewrites + fragments + crate
+// headers + test sidecars/runners + the per-module check). The
+// driver's residual prebuild work is materialising the prelude
+// (`ensure_prelude`), preparing per-member dirs + dep symlinks, and
+// synthesising `BuildOutputs` (`cmake_outputs_for`).
 
 /// Write `bytes` to `path` only if the contents differ from
 /// what's already on disk (or the file doesn't exist yet). Saves
@@ -230,125 +149,7 @@ pub fn cmake_outputs_for(plan: &BuildPlan<'_>, layout: &TargetLayout) -> BuildOu
     }
 }
 
-/// Surface-extraction pass: compile every module with
-/// `-fsyntax-only` so the plugin can populate
-/// `target/<profile>/.h-fragments/<crate>/<qname>.cust.h` before
-/// the codegen pass needs to `#include` them. Tolerant of compile
-/// failures — cross-module references in this pass are *expected*
-/// to be unresolved on iter 1 (that's why we're emitting fragments
-/// in the first place); the codegen pass will fail loudly if any
-/// genuine errors remain.
-///
-/// `#cust use crate::X;` is lowered to an `#include` of `X`'s
-/// fragment header **iff that fragment already exists on disk** —
-/// otherwise blanked. On iter 1 of the fixed-point loop most
-/// sibling fragments are missing, so clang sees unresolved
-/// typedefs and falls back to implicit-int recovery (correct
-/// fragments arrive on iter 2). V40D-11 wraps this in a fixed-
-/// point loop; `surface_pass_fixed_point` is the entry point
-/// callers should use.
-/// Build the per-module [`SurfaceUnit`](crate::generate::SurfaceUnit)
-/// list for one crate's lib modules — the owned inputs the shared
-/// fixed-point loop ([`generate::surface_fixed_point`]) iterates.
-/// In test-build mode each unit's cflags additionally request the
-/// per-module test-discovery sidecar (V40D-6 / RQ-V40-2).
-fn build_surface_units(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    prelude: &Path,
-    crate_build_dir: &Path,
-    layout: &TargetLayout,
-    modules: &[Module],
-) -> Result<Vec<crate::generate::SurfaceUnit>> {
-    let crate_name = plan.manifest.package_name();
-    let frags_dir = layout.fragments_dir(crate_name);
-    let deps_root = layout.profile_root.join("deps");
-    let mut units = Vec::with_capacity(modules.len());
-    for m in modules {
-        let surface_path = crate_build_dir.join(format!("{}.surface.c", m.qualified_name));
-        let fragment_path = layout.fragment_path(crate_name, &m.qualified_name);
-
-        // V40D-6 + RQ-V40-2: in test-build mode, also request
-        // the per-module test-discovery sidecar. Always emit
-        // even when the module has zero tests (writer skips
-        // identical bytes, so empty stays empty). The driver
-        // reads these in `run_test_build` to populate
-        // __cust_tests[].
-        let sidecar_path = if plan.test_build {
-            let p = layout.test_sidecar_path(
-                crate_name,
-                TestOrigin::Unit {
-                    qualified_name: &m.qualified_name,
-                },
-            );
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating `{}`", parent.display()))?;
-            }
-            Some(p)
-        } else {
-            None
-        };
-
-        let original_dir = m.source_path.parent().unwrap_or(plan.crate_root);
-        let dummy_obj = crate_build_dir.join(format!("{}.surface.o", m.qualified_name));
-        let includes: [&Path; 1] = [original_dir];
-        let base_cflags = build_cflags(
-            plan,
-            profile,
-            prelude,
-            &surface_path,
-            &dummy_obj,
-            &includes,
-            PluginOutputs {
-                fragment: Some(&fragment_path),
-                test_sidecar: sidecar_path.as_deref(),
-                module: sidecar_path.as_ref().map(|_| m.qualified_name.as_str()),
-            },
-        );
-
-        units.push(crate::generate::SurfaceUnit {
-            qname: m.qualified_name.clone(),
-            source: m.source_path.clone(),
-            surface_out: surface_path,
-            fragment_out: fragment_path,
-            frags_dir: frags_dir.clone(),
-            deps_root: deps_root.clone(),
-            deps: plan.deps.iter().map(|s| (*s).to_string()).collect(),
-            base_cflags,
-        });
-    }
-    Ok(units)
-}
-
-/// V40D-11 fixed-point loop over the crate's lib modules. Builds
-/// the [`SurfaceUnit`](crate::generate::SurfaceUnit) list once and
-/// delegates the convergence iteration to the shared
-/// [`generate::surface_fixed_point`] (the same routine the
-/// `cust internal surface-cycle` leaf runs over a cyclic SCC —
-/// V45D-6, no logic fork V45D-8).
-///
-/// Empirically: acyclic crates (every cust crate today) converge
-/// in 1 iteration; a 2-cycle of `[[cust::pub_repr]]` types needs
-/// 2; longer cycles either converge in 3 or diverge (the cap
-/// catches the divergent case and surfaces the §4 verbatim
-/// error). Plugin-side `writeFragmentIfChanged` already skips
-/// identical bytes, so the per-iteration cost when nothing has
-/// changed is one stat + one read + memcmp per module — cheap.
-fn surface_pass_fixed_point(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    prelude: &Path,
-    crate_build_dir: &Path,
-    layout: &TargetLayout,
-    modules: &[Module],
-) -> Result<()> {
-    let cap = crate::generate::fixed_point_cap();
-    let units = build_surface_units(plan, profile, prelude, crate_build_dir, layout, modules)?;
-    crate::generate::surface_fixed_point(&units, plan.clang, cap)
-}
-
-/// Per-TU plugin output paths threaded through `build_cflags`.
+/// Per-TU plugin output paths threaded through `build_cflags_raw`.
 /// All fields are optional; the plugin treats absent paths as
 /// "skip that output." `module` is required whenever
 /// `test_sidecar` is `Some` (the plugin errors otherwise) so
@@ -361,52 +162,17 @@ pub struct PluginOutputs<'a> {
     pub module: Option<&'a str>,
 }
 
-/// Build the clang argv for a single TU. `extra_includes` is a
-/// list of dirs that become `-I<dir>` flags before the prelude
-/// `-include`. For lib compiles this is the original source dir
-/// only; for bin compiles in a lib+bin crate it's the lib's
-/// include dir followed by the bin source dir.
-/// `plugin_out` carries the per-TU plugin-arg flags (fragment
-/// header path, test-discovery sidecar path, module name).
-pub fn build_cflags(
-    plan: &BuildPlan<'_>,
-    profile: &ResolvedProfile,
-    prelude: &Path,
-    source: &Path,
-    object: &Path,
-    extra_includes: &[&Path],
-    plugin_out: PluginOutputs<'_>,
-) -> Vec<String> {
-    let std_flag = plan
-        .manifest
-        .clang
-        .std
-        .as_deref()
-        .unwrap_or_else(|| plan.clang.default_std());
-    // `mid_cflags` = profile cflags followed by manifest
-    // `[clang] extra-cflags`, in that order (V45D-15: the
-    // `surface-module` CLI leaf serialises the same list so its
-    // clang invocation is byte-identical).
-    let mut mid_cflags = profile.cflags();
-    mid_cflags.extend(plan.manifest.clang.extra_cflags.iter().cloned());
-    build_cflags_raw(
-        std_flag,
-        &mid_cflags,
-        plan.test_build,
-        plan.plugin,
-        prelude,
-        source,
-        object,
-        extra_includes,
-        plugin_out,
-    )
-}
-
-/// Primitive form of [`build_cflags`] taking only explicit values
-/// (no `BuildPlan` / `ResolvedProfile`) so the hidden
-/// `cust internal surface-module` leaf (V45D-2) can reproduce the
-/// exact same clang argv from its command-line arguments. `mid_cflags`
-/// is the profile cflags followed by `[clang] extra-cflags`.
+/// Build the clang argv for a single TU from explicit values (no
+/// `BuildPlan` / `ResolvedProfile`) so the hidden `cust internal
+/// surface-module` / `test-sidecar` leaves (V45D-2) can reproduce
+/// the exact same clang argv from their command-line arguments.
+/// `extra_includes` become `-I<dir>` flags before the prelude
+/// `-include`; `mid_cflags` is the profile cflags followed by
+/// `[clang] extra-cflags`; `plugin_out` carries the per-TU
+/// plugin-arg flags (fragment header, test-discovery sidecar,
+/// module name). The incremental-check emitter mirrors this shape
+/// for the per-module check argv (CHK-D-2), reusing the lib
+/// target's `compile_options` rather than this builder.
 #[allow(clippy::too_many_arguments)]
 pub fn build_cflags_raw(
     std_flag: &str,
@@ -511,46 +277,6 @@ pub fn write_version_stamp(path: &Path, clang: &Clang) -> Result<()> {
     );
     fs::write(path, contents).with_context(|| format!("writing `{}`", path.display()))?;
     Ok(())
-}
-
-/// Concatenate per-module fragment headers into the single user-
-/// facing crate header at `target/<profile>/include/<crate>.h`
-/// (cust-design.md §5).
-///
-/// v0.2 is **naive**: every fragment is included in declaration
-/// order, no de-duplication, no `pub` vs `pub(crate)` filtering
-/// (the plugin doesn't yet distinguish them in fragment output).
-/// The header is wrapped in a standard `#ifndef`/`extern "C"`
-/// guard pair so it's safe to `#include` from C and C++.
-///
-/// Missing fragments are skipped silently — a module with zero
-/// `[[cust::pub]]` decls produces no fragment, which is fine.
-///
-/// **Module order.** Modules are emitted in topological order
-/// over their intra-crate `#cust use crate::<mod>;` edges so any
-/// type or decl a module's fragment references is declared
-/// earlier in the concatenated header. Discovery order (DFS
-/// preorder, root first) breaks the moment a sibling module
-/// exports a typedef used by the root or by an earlier sibling
-/// — that's exactly the pattern cstd needs (types module
-/// exports `i32`/`u64`; math and lib use them). Cycles are
-/// impossible at this point: the discovery pass (`modules::
-/// discover`) already rejects intra-crate `#cust mod` cycles,
-/// and intra-crate fragment includes are forward-decl-only so
-/// they can't reintroduce one.
-fn write_crate_header(layout: &TargetLayout, crate_name: &str, modules: &[Module]) -> Result<()> {
-    let ordered = topo_order_modules(modules);
-    let frags: Vec<(String, PathBuf)> = ordered
-        .iter()
-        .map(|m| {
-            (
-                m.qualified_name.clone(),
-                layout.fragment_path(crate_name, &m.qualified_name),
-            )
-        })
-        .collect();
-    let out_path = layout.crate_header_path(crate_name);
-    crate::generate::write_crate_header_concat(crate_name, &out_path, &frags)
 }
 
 /// Order `modules` so any module appears after every module it

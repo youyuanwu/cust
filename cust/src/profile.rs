@@ -36,7 +36,6 @@ impl ProfileKind {
 /// A fully resolved profile, with all v0.1 defaults filled in.
 #[derive(Debug, Clone)]
 pub struct ResolvedProfile {
-    pub kind: ProfileKind,
     pub opt_level: OptLevel,
     pub debug: DebugInfo,
     pub sanitize: Vec<String>,
@@ -94,7 +93,6 @@ impl ResolvedProfile {
         };
 
         let mut p = Self {
-            kind,
             opt_level: default_opt,
             debug: default_debug,
             sanitize: Vec::new(),

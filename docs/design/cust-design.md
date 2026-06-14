@@ -606,7 +606,7 @@ plugin; the plugin (§10) layers extra semantics on top.
 | `-fsanitize-coverage=trace-pc-guard` | `cust fuzz` (later) |
 | `-fprofile-instr-generate` + `llvm-profdata` + `llvm-cov` | `cust test --coverage` |
 | `-ftime-trace` | `cust build --timings` (Chrome trace viewer) |
-| `-fsyntax-only` | `cust check` (fast no‑codegen pass); also drives §4 phase 1 surface extraction |
+| `-fsyntax-only` | `cust check` (per-module CMake-owned no‑codegen check pass, incremental-check.md); also drives §4 phase 1 surface extraction |
 | `-MMD -MF` | per‑module incremental dep tracking (fragment header invalidation) |
 | `-fdiagnostics-format=sarif` (or `-fdiagnostics-print-source-range-info`) | machine‑readable errors for IDEs |
 | `-fcolor-diagnostics` | pretty terminal output |
@@ -1395,8 +1395,15 @@ Roadmap bullets here are deliberately short:
     V42D-18). Phases 2–3 move under
     `cmake -G Ninja` + `cmake --build`; phase 1 + `#cust
     use` rewriting stay in the Rust driver. Single
-    workspace-level `CMakeLists.txt` per V42D-13. `cust
-    check` bypasses CMake entirely (V42D-15). See
+    workspace-level `CMakeLists.txt` per V42D-13. ~~`cust
+    check` bypasses CMake entirely (V42D-15).~~ **V42D-15
+    REVERSED** by the incremental-`cust check` milestone:
+    `cust check` is now a CMake-owned, incremental,
+    error-reporting pass (a per-module direct-clang
+    `-fsyntax-only` custom command with a `.checked` stamp);
+    it no longer silently tolerates type errors, and the
+    driver-side `run_phase1` pre-pass is gone. See
+    [incremental-check.md](incremental-check.md) and
     [v0.4.2.md](v0.4.2.md). The original v0.4.2 scope
     (build scripts) is reslotted to v0.4.8+.
   - **v0.4.3** — `tests/` integration tests (V43D-1 through
@@ -1420,8 +1427,11 @@ Roadmap bullets here are deliberately short:
     (V44D-8); `Cust.lock` unchanged (V44D-12). Deferred:
     `src/bin/<name>/main.c` subdirs (V44D-2), per-bin
     deps/config (V44D-11), strict `cust check` over bins (V44D-9
-    — `cust check` is a tolerant lib-surface pass, same finding
-    as V43D-13), `default-run` / `required-features` /
+    — the lib half is now error-reporting + incremental via the
+    incremental-`cust check` milestone, but the **bin** half stays
+    out of scope: wiring a check command over bin TUs is purely
+    additive, see [incremental-check.md](incremental-check.md)
+    RQ-CHK-3), `default-run` / `required-features` /
     bin-internal tests (RQ-V44-1/2/3). See [v0.4.4.md](v0.4.4.md).
   - **v0.4.5** — CMake-owned generation
     (`add_custom_command` codegen graph — V45D-1 through
