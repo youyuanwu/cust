@@ -776,32 +776,39 @@ fn run_check_path(
     Ok(WorkspaceBuildOutputs { per_member })
 }
 
-/// V42D-14: test-build pipeline lifted onto the `CMake` backend.
-/// Per-member phase 1 (with `plan.test_build = true` so the
-/// plugin writes test-discovery sidecars), then the runner-TU
-/// generator reads the sidecars + writes
-/// `target/<profile>/cmake/cust_test_main_<crate>.c`, then a
-/// single `cmake -G Ninja -DCUST_TEST_BUILD=ON` + `cmake --build
-/// --target <crate>__test ...` drives every member's test build
-/// in one `Ninja` graph. Test isolation (per-crate cwd, output
+/// V42D-14 + v0.4.6 V46D-5: test-build pipeline lifted fully onto
+/// the `CMake` backend. The driver no longer runs any pre-pass —
+/// it materialises the prelude, prepares each member's build dir +
+/// dep symlink, then a single `cmake -G Ninja` configure + `cmake
+/// --build --target <crate>__test …` drives every member's test
+/// build in one `Ninja` graph (the `-DCUST_TEST_BUILD=1` define is
+/// a per-target compile option, not a configure flag, so flipping
+/// between `cust build` and `cust test` never reconfigures). Every
+/// test artifact (sidecars, runner TUs, rewrites, fragments, crate
+/// header) is a `cust internal …` custom command produced lazily
+/// inside that build. Test isolation (per-crate cwd, output
 /// capture) still applies at runtime — the executable just lives
-/// under the V42D-14 `target/<profile>/test/<crate>/<crate>`
-/// path that the existing test runner code already expects.
+/// under the V42D-14 `target/<profile>/test/<crate>/<crate>` path
+/// the test runner already expects.
 fn run_test_build_path(
     ws: &Workspace,
     to_build: &[String],
     opts: &WorkspaceBuildOptions<'_>,
     layout: &TargetLayout,
 ) -> Result<WorkspaceBuildOutputs> {
-    // v0.4.6 V46D-3: every generated test artifact (unit + integration
-    // sidecars, runner TUs, integration rewrites) is now a CMake
-    // custom command, so the driver pre-pass collapses to the same
-    // residual work as the build/run path (V45D-14(b)): materialise
-    // the prelude, create each member's `build/<crate>/` dir, and
-    // refresh the dep-publish symlink. `run_phase1` stays for now —
-    // its eager fragments/header are redundant with the CMake
-    // commands but harmless (byte-skipped); slice D drops it and
-    // collapses this fully (V46D-5).
+    // v0.4.6 V46D-5: the test-build path now mirrors the build/run
+    // path exactly — emit + configure + build. Every generated test
+    // artifact (unit + integration sidecars, runner TUs, the lib/bin
+    // + integration rewrites, the surface fragments + crate header)
+    // is a CMake custom command produced lazily by Ninja inside the
+    // single `cmake --build`. The residual driver work is identical
+    // to the build path (V45D-14(b)): materialise the prelude once,
+    // create each member's `build/<crate>/` dir, refresh the
+    // dep-publish symlink, and synthesise `BuildOutputs` (here with
+    // the test exe paths plumbed in for the runner to spawn). No
+    // driver-side surface pass remains on the test path — `cust
+    // check` keeps `run_phase1` (V42D-15), `cust test` no longer
+    // calls it.
     build::ensure_prelude(layout).context("materialising prelude")?;
     let mut per_member: Vec<(String, BuildOutputs)> = Vec::with_capacity(to_build.len());
     for m in &ws.members {
@@ -809,7 +816,6 @@ fn run_test_build_path(
         std::fs::create_dir_all(layout.build_dir(name))
             .with_context(|| format!("creating build dir for member `{name}`"))?;
         with_plan(ws, m, opts, |plan| {
-            build::run_phase1(plan).with_context(|| format!("phase 1 for member `{name}`"))?;
             refresh_dep_symlink(layout, &m.name, &m.root)
                 .with_context(|| format!("publishing dep view for `{name}`"))?;
             // v0.4.6 V46D-2/V46D-3: the unit + integration runner

@@ -2570,6 +2570,102 @@ fn extra_cflag_change_refires_surface() {
     );
 }
 
+// ─── v0.4.6: slice D — no-op test + single-module incrementality ──
+
+#[test]
+fn noop_test_build_spawns_zero_internal_leaves() {
+    // V46D-8 (verification item 2): a second `cust test` with no
+    // source change must spawn zero `internal` codegen leaves —
+    // including the unit + integration test-sidecar / test-runner
+    // commands. The trace file named by `CUST_TRACE_INTERNAL` stays
+    // untouched on the second run.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_itests");
+    // Cold test build populates every sidecar / runner / fragment.
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+
+    // Second `cust test`: nothing changed → zero codegen leaves.
+    let trace = dir.join("target/debug/noop-test-trace.txt");
+    let _ = fs::remove_file(&trace);
+    let out = cust_env(&dir, ["test"], &[("CUST_TRACE_INTERNAL", &trace)]);
+    assert_success(&out);
+    assert!(
+        !trace.is_file(),
+        "no-op `cust test` spawned internal leaves (trace was written):\n{}",
+        fs::read_to_string(&trace).unwrap_or_default()
+    );
+}
+
+#[test]
+fn cust_build_runs_zero_test_generation() {
+    // V46D-4 (verification item 4): the test custom commands are
+    // anchored only by the `EXCLUDE_FROM_ALL` test targets, so a
+    // `cust build` (cold or no-op) must never fire a test-sidecar
+    // or test-runner leaf — even for a crate that has unit and
+    // integration tests.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_itests");
+    let trace = dir.join("target/debug/build-trace.txt");
+    let _ = fs::remove_file(&trace);
+    let out = cust_env(&dir, ["build"], &[("CUST_TRACE_INTERNAL", &trace)]);
+    assert_success(&out);
+    let traced = fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        !traced.contains("test-sidecar") && !traced.contains("test-runner"),
+        "cust build fired test-generation leaves:\n{traced}"
+    );
+}
+
+#[test]
+fn single_module_test_edit_refires_only_that_sidecar() {
+    // V46D-8 (verification item 3): editing one module's
+    // `[[cust::test]]` body reruns that module's `test-sidecar` +
+    // the crate `test-runner`, and not the sibling modules'
+    // sidecars. Observed via the trace file.
+    if plugin_path().is_none() {
+        eprintln!("plugin not built — skipping");
+        return;
+    }
+    let (_tmp, dir) = stage("with_itests");
+    let out = cust(&dir, ["test"]);
+    assert_success(&out);
+
+    // Append a new unit test to the lib module's source.
+    let lib = dir.join("src/lib.c");
+    let mut src = fs::read_to_string(&lib).expect("read src/lib.c");
+    src.push_str("\n[[cust::test]] int test_added_in_slice_d(void) { return 0; }\n");
+    fs::write(&lib, &src).expect("write src/lib.c");
+
+    let trace = dir.join("target/debug/edit-trace.txt");
+    let _ = fs::remove_file(&trace);
+    let out = cust_env(&dir, ["test"], &[("CUST_TRACE_INTERNAL", &trace)]);
+    assert_success(&out);
+    let traced = fs::read_to_string(&trace).unwrap_or_default();
+    // The edited module's sidecar re-fired…
+    assert!(
+        traced.contains("test-sidecar") && traced.contains("lib.cust.tests"),
+        "edited module's unit test-sidecar did not re-fire:\n{traced}"
+    );
+    // …and the crate runner re-aggregated.
+    assert!(
+        traced.contains("test-runner"),
+        "crate test-runner did not re-fire after a test edit:\n{traced}"
+    );
+    // The new test actually runs (the runner picked it up).
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("test_added_in_slice_d"),
+        "newly-added test was not discovered:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 // ─── v0.4.5: slice D — cyclic-SCC fallback (V45D-6) ──────────────
 
 #[test]
